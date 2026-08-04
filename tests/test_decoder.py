@@ -84,3 +84,24 @@ def test_no_matching_frames(tmp_path):
     dbc = load(str(p))
     series, stats = decode_channel(iter([]), dbc, channel=1)
     assert series == [] and stats.total_frames == 0
+
+
+def test_short_dlc_known_id_counts_as_unknown(tmp_path):
+    """已知 ID 但 DLC 短于 DBC 长度：DecodeError 计入未知帧，不中断解码。"""
+    from core.blf_reader import Frame
+
+    p = tmp_path / "t.dbc"
+    p.write_text(DBC_TXT, encoding="utf-8")
+    dbc = load(str(p))
+    short = Frame(channel=1, ts_seconds=0.5, arbitration_id=100,
+                  is_extended=False, is_fd=False, dlc=2,
+                  data=bytes([0xE8, 0x03]))
+    good = Frame(channel=1, ts_seconds=1.0, arbitration_id=100,
+                 is_extended=False, is_fd=False, dlc=8,
+                 data=bytes([0xE8, 0x03, 0x50, 0, 0, 0, 0, 0]))
+    series, stats = decode_channel(iter([short, good]), dbc, channel=1)
+    assert stats.total_frames == 2
+    assert stats.unknown_frames == 1
+    assert stats.unknown_ids == {100}
+    assert len(series) == 1
+    assert series[0].timestamps.tolist() == [1.0]

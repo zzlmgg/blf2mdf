@@ -4,6 +4,8 @@ from typing import Iterator
 
 import numpy as np
 
+from cantools.database.errors import DecodeError
+
 from core.blf_reader import Frame
 from core.dbc_loader import DbcDef
 
@@ -33,7 +35,7 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
         stats.total_frames += 1
         try:
             decoded = dbc.db.decode_message(fr.arbitration_id, fr.data)
-        except KeyError:
+        except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             continue
