@@ -59,7 +59,7 @@
 
 依赖 `python-can` 的 BLF reader（备选：`blf` 纯 Python 包；实现时以能正确处理样例文件为准则，两者可互换，接口不变）。
 
-- `list_channels(path) -> list[str]`：扫描 BLF，返回其中出现的通道标识列表（GUI 通道表数据源）。
+- `list_channels(path) -> list[str]`：扫描 BLF，返回其中出现的通道标识列表（GUI 通道表数据源）。BLF 内部只有数字通道号（1..16），不存通道名；显示名统一为 `CAN<n>`（与参考 MDF 的 CAN1..CAN16 命名一致）。
 - `iter_messages(path, channel) -> Iterator[Frame]`：流式产出指定通道的报文帧，仅 CAN/CANFD 报文对象（过滤错误帧、过载帧等非报文对象）。
 - `Frame`：`channel, ts_seconds(float), arbitration_id, is_extended, is_fd, dlc, data(bytes)`。
 - 时间戳统一换算为秒（float64），与 MDF 时间轴一致。
@@ -144,7 +144,7 @@
 
 ## 7. 测试与验证策略
 
-- **金标准对比**（最关键）：样例 BLF + VDCPublic 系列 DBC → 用 asammdf 读参考 `mdf/_T058.mdf` 对比：`Signal::` 通道集合覆盖、抽样信号数值容差内一致、时间跨度一致（对比时忽略参考文件中的 BusStatistic 部分）。
+- **金标准对比**（最关键）：样例 BLF + VDCPublic 系列 DBC → 用 asammdf 读参考 `mdf/_T058.mdf` 对比：`Signal::` 通道集合覆盖、抽样信号数值容差内一致、时间跨度一致（对比时忽略参考文件中的 BusStatistic 部分）。具体绑定 VDCPublic_CANFD1 还是 CANFD2，以实现时与参考文件信号集比对为准。
 - **单元测试**：13 个 DBC 全部可解析；decoder 构造已知帧验证物理值换算；blf_reader 通道枚举。
 - **端到端**：python-can 合成微型多通道 BLF → 完整流程 → 校验 MDF 结构与值。
 - **GUI 冒烟**：手动走加载 → 绑定 → 转换全流程。
