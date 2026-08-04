@@ -151,7 +151,7 @@
 
 ## 8. 交付与环境
 
-- 技术栈：Python 3.11 + `cantools` + `python-can` + `asammdf` + `PySide6` + `numpy`。
+- 技术栈：Python 3.12（conda 环境 `blfmdf`）+ `cantools` + `python-can` + `asammdf` + `PySide6` + `numpy`；安装：`pip install cantools python-can asammdf PySide6 numpy`。
 - 项目结构：
 
 ```
@@ -167,6 +167,6 @@ blf_dbc/
 └─ requirements.txt
 ```
 
-- 环境：当前机器无可用 Python（PATH 仅有 WindowsApps 占位符），实现第一步安装 Python 3.11。
+- 环境：使用现有 conda 环境 `blfmdf`（Python 3.12）；PATH 中的 WindowsApps 占位符不可用，命令统一通过 conda 环境执行。
 - 分发：PyInstaller 打包单文件 `blf2mdf.exe`（约 80-100MB）。
 - 版本管理：初始化 git 仓库，数据文件（blf/、mdf/、dbc/、outputs/、raw_inputs.7z）加入 .gitignore。

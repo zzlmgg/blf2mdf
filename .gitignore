@@ -4,6 +4,7 @@ mdf/
 dbc/
 outputs/
 raw_inputs.7z
+.claude
 
 # Python
 __pycache__/
