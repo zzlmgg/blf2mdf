@@ -105,3 +105,35 @@ def test_short_dlc_known_id_counts_as_unknown(tmp_path):
     assert stats.unknown_ids == {100}
     assert len(series) == 1
     assert series[0].timestamps.tolist() == [1.0]
+
+
+def test_enum_signal_named_choice_unwraps_to_numeric(tmp_path):
+    """VAL_ 枚举信号：NamedSignalValue 解包为数值（.value）存入 float64 通道。"""
+    from core.blf_reader import Frame
+
+    enum_dbc = '''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 300 ECU: 8 ABC
+ SG_ State : 0|8@1+ (1,0) [0|255] "state" ECU
+
+VAL_ 300 State 0 "off" 1 "on" ;
+'''
+    p = tmp_path / "t.dbc"
+    p.write_text(enum_dbc, encoding="utf-8")
+    dbc = load(str(p))
+    on = Frame(channel=1, ts_seconds=1.0, arbitration_id=300,
+               is_extended=False, is_fd=False, dlc=8,
+               data=bytes([0x01, 0, 0, 0, 0, 0, 0, 0]))
+    other = Frame(channel=1, ts_seconds=2.0, arbitration_id=300,
+                  is_extended=False, is_fd=False, dlc=8,
+                  data=bytes([0x02, 0, 0, 0, 0, 0, 0, 0]))
+    series, stats = decode_channel(iter([on, other]), dbc, channel=1)
+    assert stats.total_frames == 2 and stats.unknown_frames == 0
+    assert series[0].values["State"].tolist() == pytest.approx([1.0, 2.0])
+    assert isinstance(series[0].values["State"][0], float)  # 数值而非 NamedSignalValue

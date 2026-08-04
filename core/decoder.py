@@ -5,6 +5,7 @@ from typing import Iterator
 import numpy as np
 
 from cantools.database.errors import DecodeError
+from cantools.database.namedsignalvalue import NamedSignalValue
 
 from core.blf_reader import Frame
 from core.dbc_loader import DbcDef
@@ -46,9 +47,10 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
         )
         bucket["ts"].append(fr.ts_seconds)
         for s in md.signals:
-            bucket["values"][s.name].append(
-                decoded.get(s.name, float("nan"))
-            )
+            v = decoded.get(s.name, float("nan"))
+            if isinstance(v, NamedSignalValue):
+                v = v.value
+            bucket["values"][s.name].append(v)
 
     series = []
     for msg_id, b in buckets.items():
