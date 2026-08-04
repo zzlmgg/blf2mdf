@@ -1,0 +1,6 @@
+cantools
+python-can
+asammdf
+PySide6
+numpy
+pytest
