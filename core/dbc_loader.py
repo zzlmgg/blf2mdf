@@ -31,7 +31,10 @@ class DbcDef:
 def load(path: str) -> DbcDef:
     import cantools
 
-    db = cantools.database.load_file(path)
+    try:
+        db = cantools.database.load_file(path)
+    except Exception as e:
+        raise ValueError(f"failed to parse DBC '{path}': {e}") from e
     messages = {}
     for msg in db.messages:
         messages[msg.frame_id] = MessageDef(

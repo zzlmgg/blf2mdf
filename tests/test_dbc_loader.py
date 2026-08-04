@@ -67,3 +67,11 @@ def test_load_inline_dbc(tmp_path):
 def test_all_real_dbc_parse(dbc_path):
     dbc = load(str(dbc_path))
     assert dbc.messages, f"{dbc_path.name} 解析后为空"
+
+
+def test_load_malformed_dbc_raises_with_path(tmp_path):
+    p = tmp_path / "bad.dbc"
+    p.write_text("garbage line 1\nstill not dbc\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        load(str(p))
+    assert str(p) in str(excinfo.value)
