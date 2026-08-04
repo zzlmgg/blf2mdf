@@ -1,5 +1,5 @@
 cantools
-python-can
+python-can>=4.0
 asammdf
 PySide6
 numpy

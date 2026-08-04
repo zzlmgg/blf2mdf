@@ -140,7 +140,7 @@ VAL_ 300 State 0 "off" 1 "on" ;
 
 
 def test_extended_id_normalization(tmp_path):
-    """扩展帧 id 归一化：29 位原始 id 与 EFF 位约定对齐（4 场景）。"""
+    """扩展帧 id 归一化：29 位原始 id 与 EFF 位约定对齐（5 场景）。"""
     from core.blf_reader import Frame
 
     ext_dbc = '''VERSION ""
@@ -176,9 +176,16 @@ BO_ 2147488308 M3: 8 ECU
     f_eff = Frame(channel=1, ts_seconds=4.0, arbitration_id=0x80000100,
                   is_extended=True, is_fd=False, dlc=8,
                   data=bytes([0x02, 0, 0, 0, 0, 0, 0, 0]))
-    series, stats = decode_channel(iter([f_ext_small, f_ext_big, f_std, f_eff]),
-                                   dbc, channel=1)
-    assert stats.total_frames == 4 and stats.unknown_frames == 0
+    # (5) 畸形标准帧 id=0x1234 > 0x7FF，与扩展报文 M3 同原始 id：
+    #     cantools 会无条件置 EFF 位而解码成功，但 loader 键不含 0x1234 → 必须计未知帧而非 KeyError
+    f_std_big = Frame(channel=1, ts_seconds=5.0, arbitration_id=0x1234,
+                      is_extended=False, is_fd=False, dlc=8,
+                      data=bytes([0x09, 0, 0, 0, 0, 0, 0, 0]))
+    series, stats = decode_channel(
+        iter([f_ext_small, f_ext_big, f_std, f_eff, f_std_big]),
+        dbc, channel=1)
+    assert stats.total_frames == 5 and stats.unknown_frames == 1
+    assert stats.unknown_ids == {0x1234}
     by_name = {s.message_name: s for s in series}
     # (1)(4) 扩展 0x100 帧与已带 EFF 位帧都落到 M2
     assert by_name["M2"].values["B"].tolist() == pytest.approx([7.0, 2.0])

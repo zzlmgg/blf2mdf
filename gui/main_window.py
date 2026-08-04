@@ -264,3 +264,19 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self.progress.setValue(0)
         self.stage_label.setText("")
+
+    def closeEvent(self, event):
+        thread = self.worker_thread
+        if thread is not None and thread.isRunning():
+            ans = QMessageBox.question(
+                self, "确认关闭",
+                "转换仍在进行中，关闭窗口将等待其完成后丢弃结果。\n确定要关闭吗？")
+            if ans != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            # convert() 无法中途取消：先退出事件循环再等待线程结束，
+            # 避免销毁仍在运行的 QThread（Qt 会 abort）。
+            # wait() 期间主线程阻塞，_on_done/_on_error 的 _finish() 不会并发执行。
+            thread.quit()
+            thread.wait()
+        event.accept()

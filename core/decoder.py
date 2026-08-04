@@ -41,7 +41,14 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             continue
-        md = dbc.messages[arb]
+        md = dbc.messages.get(arb)
+        if md is None:
+            # cantools 对 >0x7FF 的 id 无条件置 EFF 位：畸形标准帧（id 超出 11 位）
+            # 可能成功解码到同原始 id 的扩展报文，但 loader 键（含 EFF 位）不含此键
+            # → 按未知帧计数，不中断解码。
+            stats.unknown_frames += 1
+            stats.unknown_ids.add(fr.arbitration_id)
+            continue
         bucket = buckets.setdefault(
             arb,
             {"ts": [], "values": {s.name: [] for s in md.signals}},
