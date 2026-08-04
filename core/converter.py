@@ -1,6 +1,7 @@
 """转换编排：多通道聚合 → 单个 MDF。"""
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -99,8 +100,11 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     try:
         mdf_writer.write_mdf(all_series, raw_groups, out_path)
     except Exception:
-        if os.path.exists(out_path):
-            os.remove(out_path)  # 删除半成品
+        # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
+        # save 失败留 .mf4，rename 失败两者都在，半成品都要清。
+        for p in (out_path, Path(out_path).with_suffix(".mf4")):
+            if os.path.exists(p):
+                os.remove(p)
         raise
     if progress_cb:
         progress_cb("完成", 100)

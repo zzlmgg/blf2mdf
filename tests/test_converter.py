@@ -86,3 +86,21 @@ def test_convert_no_channels_raises(tmp_path, blf_and_dbc):
     blf, _ = blf_and_dbc
     with pytest.raises(ValueError):
         convert(blf, {}, str(tmp_path / "x.mdf"))
+
+
+def test_convert_write_failure_cleans_partial_files(tmp_path, blf_and_dbc, monkeypatch):
+    """写 MDF 失败：异常上抛，且 <out>.mf4 半成品与 out_path 都被清理。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "out.mdf"
+    mf4 = tmp_path / "out.mf4"
+
+    def boom(*args, **kwargs):
+        # 模拟 asammdf save 写出 .mf4 后、rename 前失败
+        mf4.write_bytes(b"partial")
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr("core.converter.mdf_writer.write_mdf", boom)
+    with pytest.raises(OSError):
+        convert(blf, {1: load(dbc_path)}, str(out))
+    assert not out.exists(), "out_path 不应残留"
+    assert not mf4.exists(), "半成品 .mf4 应被删除"
