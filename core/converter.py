@@ -1,0 +1,110 @@
+"""转换编排：多通道聚合 → 单个 MDF。"""
+import os
+from dataclasses import dataclass
+
+import numpy as np
+
+from core import blf_reader, mdf_writer
+from core.decoder import decode_channel
+from core.dbc_loader import DbcDef
+
+
+@dataclass
+class ChannelSummary:
+    channel: int
+    bound: bool
+    decoded_frames: int = 0
+    signal_count: int = 0
+    unknown_frames: int = 0
+    unknown_ids: int = 0
+    raw_frames: int = 0
+    warning: str = ""
+
+
+@dataclass
+class ConversionResult:
+    summaries: list[ChannelSummary]
+    duration_seconds: float
+
+
+def _collect_raw(frames, channel: int) -> mdf_writer.RawGroup:
+    ts, ids, dlcs, datas, is_ext, is_fd = [], [], [], [], [], []
+    max_dlc = 0
+    for fr in frames:
+        ts.append(fr.ts_seconds)
+        ids.append(fr.arbitration_id)
+        dlcs.append(fr.dlc)
+        datas.append(fr.data)
+        is_ext.append(bool(fr.is_extended))
+        is_fd.append(bool(fr.is_fd))
+        max_dlc = max(max_dlc, fr.dlc)
+    n = len(ts)
+    data_array = np.zeros((n, max_dlc), dtype=np.uint8) if n else np.zeros((0, 1), dtype=np.uint8)
+    for i, d in enumerate(datas):
+        data_array[i, : len(d)] = np.frombuffer(d, dtype=np.uint8)
+    return mdf_writer.RawGroup(
+        channel=channel,
+        timestamps=np.asarray(ts, dtype=np.float64),
+        ids=np.asarray(ids, dtype=np.uint32),
+        dlcs=np.asarray(dlcs, dtype=np.uint8),
+        data_array=data_array,
+        is_extended=np.asarray(is_ext, dtype=bool),
+        is_fd=np.asarray(is_fd, dtype=bool),
+    )
+
+
+def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
+            progress_cb=None) -> ConversionResult:
+    channels = sorted(bindings)
+    if not channels:
+        raise ValueError("未选择任何通道")
+    total = len(channels)
+    all_series, raw_groups, summaries = [], [], []
+    min_ts, max_ts = float("inf"), float("-inf")
+
+    def note_range(ts_arr):
+        nonlocal min_ts, max_ts
+        if len(ts_arr):
+            min_ts = min(min_ts, float(ts_arr[0]))
+            max_ts = max(max_ts, float(ts_arr[-1]))
+
+    for i, ch in enumerate(channels):
+        if progress_cb:
+            progress_cb(f"处理 CAN{ch}", 10 + 80 * i / total)
+        dbc = bindings.get(ch)
+        frames = blf_reader.iter_messages(blf_path, ch)
+        if dbc is not None:
+            series, stats = decode_channel(frames, dbc, ch)
+            for s in series:
+                note_range(s.timestamps)
+            summary = ChannelSummary(
+                channel=ch, bound=True,
+                decoded_frames=stats.total_frames - stats.unknown_frames,
+                signal_count=sum(len(s.signal_names) for s in series),
+                unknown_frames=stats.unknown_frames,
+                unknown_ids=len(stats.unknown_ids),
+            )
+            if not series:
+                summary.warning = "该通道无匹配帧"
+            all_series.extend(series)
+        else:
+            raw = _collect_raw(frames, ch)
+            note_range(raw.timestamps)
+            raw_groups.append(raw)
+            summary = ChannelSummary(channel=ch, bound=False, raw_frames=len(raw.timestamps))
+        summaries.append(summary)
+
+    if progress_cb:
+        progress_cb("写 MDF", 95)
+    try:
+        mdf_writer.write_mdf(all_series, raw_groups, out_path)
+    except Exception:
+        if os.path.exists(out_path):
+            os.remove(out_path)  # 删除半成品
+        raise
+    if progress_cb:
+        progress_cb("完成", 100)
+    return ConversionResult(
+        summaries=summaries,
+        duration_seconds=(max_ts - min_ts) if min_ts <= max_ts else 0.0,
+    )
