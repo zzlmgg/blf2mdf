@@ -20,5 +20,14 @@
 ## 打包
 
 ```bash
-conda run -n blfmdf pyinstaller --noconfirm --onefile --windowed --name blf2mdf --collect-all PySide6 main.py
+conda run -n blfmdf pip install pyinstaller
+conda run -n blfmdf pyinstaller --noconfirm --onefile --windowed --name blf2mdf --collect-all PySide6 \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\ffi-8.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libbz2.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libcrypto-3-x64.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libexpat.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\liblzma.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libssl-3-x64.dll;." \
+  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\sqlite3.dll;." \
+  main.py
 ```
