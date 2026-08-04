@@ -137,3 +137,52 @@ VAL_ 300 State 0 "off" 1 "on" ;
     assert stats.total_frames == 2 and stats.unknown_frames == 0
     assert series[0].values["State"].tolist() == pytest.approx([1.0, 2.0])
     assert isinstance(series[0].values["State"][0], float)  # 数值而非 NamedSignalValue
+
+
+def test_extended_id_normalization(tmp_path):
+    """扩展帧 id 归一化：29 位原始 id 与 EFF 位约定对齐（4 场景）。"""
+    from core.blf_reader import Frame
+
+    ext_dbc = '''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 256 M1: 8 ECU
+ SG_ A : 0|8@1+ (1,0) [0|255] "" ECU
+
+BO_ 2147483904 M2: 8 ECU
+ SG_ B : 0|8@1+ (1,0) [0|255] "" ECU
+
+BO_ 2147488308 M3: 8 ECU
+ SG_ C : 0|8@1+ (1,0) [0|255] "" ECU
+'''
+    # 2147483904 = 0x80000100（扩展 0x100），2147488308 = 0x80001234（扩展 0x1234 > 0x7FF）
+    p = tmp_path / "t.dbc"
+    p.write_text(ext_dbc, encoding="utf-8")
+    dbc = load(str(p))
+    f_ext_small = Frame(channel=1, ts_seconds=1.0, arbitration_id=0x100,
+                        is_extended=True, is_fd=False, dlc=8,
+                        data=bytes([0x07, 0, 0, 0, 0, 0, 0, 0]))
+    f_ext_big = Frame(channel=1, ts_seconds=2.0, arbitration_id=0x1234,
+                      is_extended=True, is_fd=False, dlc=8,
+                      data=bytes([0x08, 0, 0, 0, 0, 0, 0, 0]))
+    f_std = Frame(channel=1, ts_seconds=3.0, arbitration_id=0x100,
+                  is_extended=False, is_fd=False, dlc=8,
+                  data=bytes([0x01, 0, 0, 0, 0, 0, 0, 0]))
+    f_eff = Frame(channel=1, ts_seconds=4.0, arbitration_id=0x80000100,
+                  is_extended=True, is_fd=False, dlc=8,
+                  data=bytes([0x02, 0, 0, 0, 0, 0, 0, 0]))
+    series, stats = decode_channel(iter([f_ext_small, f_ext_big, f_std, f_eff]),
+                                   dbc, channel=1)
+    assert stats.total_frames == 4 and stats.unknown_frames == 0
+    by_name = {s.message_name: s for s in series}
+    # (1)(4) 扩展 0x100 帧与已带 EFF 位帧都落到 M2
+    assert by_name["M2"].values["B"].tolist() == pytest.approx([7.0, 2.0])
+    # (2) 扩展 id > 0x7FF 正常解码
+    assert by_name["M3"].values["C"].tolist() == pytest.approx([8.0])
+    # (3) 标准/扩展共用原始 id 0x100：各归各的系列，无覆盖/NaN 污染
+    assert by_name["M1"].values["A"].tolist() == pytest.approx([1.0])

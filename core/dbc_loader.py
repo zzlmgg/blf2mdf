@@ -1,5 +1,8 @@
 """DBC 解析：一次一个文件，不合并。"""
+import logging
 from dataclasses import dataclass, field
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,8 +39,15 @@ def load(path: str) -> DbcDef:
     except Exception as e:
         raise ValueError(f"failed to parse DBC '{path}': {e}") from e
     messages = {}
+    seen_ids = set()
     for msg in db.messages:
-        messages[msg.frame_id] = MessageDef(
+        key = msg.frame_id | (0x80000000 if msg.is_extended_frame else 0)
+        if msg.frame_id in seen_ids:
+            LOGGER.warning(
+                "标准/扩展报文共用原始 id 0x%X，按 EFF 位归一化键后各自保留", msg.frame_id
+            )
+        seen_ids.add(msg.frame_id)
+        messages[key] = MessageDef(
             name=msg.name,
             sender_node=msg.senders[0] if msg.senders else "Unknown",
             signals=[

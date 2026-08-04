@@ -24,16 +24,19 @@ def blf_and_dbc(tmp_path):
 
     blf = tmp_path / "two_ch.blf"
     with can.BLFWriter(str(blf)) as w:
-        # 通道 1：匹配 DBC 的帧
-        w.on_message_received(can.Message(arbitration_id=100, data=bytes([0xE8, 0x03, 0, 0, 0, 0, 0, 0]),
+        # 通道 1：匹配 DBC 的帧（python-can 4.6.1 Message 默认 is_extended_id=True，须显式标准帧）
+        w.on_message_received(can.Message(arbitration_id=100, is_extended_id=False,
+                                          data=bytes([0xE8, 0x03, 0, 0, 0, 0, 0, 0]),
                                           channel=1, timestamp=1784716800.0))
-        w.on_message_received(can.Message(arbitration_id=100, data=bytes([0x88, 0x13, 0, 0, 0, 0, 0, 0]),
+        w.on_message_received(can.Message(arbitration_id=100, is_extended_id=False,
+                                          data=bytes([0x88, 0x13, 0, 0, 0, 0, 0, 0]),
                                           channel=1, timestamp=1784716801.0))
         # 通道 1：未知 ID
-        w.on_message_received(can.Message(arbitration_id=999, data=bytes(8), channel=1, timestamp=1784716802.0))
+        w.on_message_received(can.Message(arbitration_id=999, is_extended_id=False,
+                                          data=bytes(8), channel=1, timestamp=1784716802.0))
         # 通道 2：原始帧
-        w.on_message_received(can.Message(arbitration_id=0x456, data=b"\xAA\xBB",
-                                          channel=2, timestamp=1784716803.0))
+        w.on_message_received(can.Message(arbitration_id=0x456, is_extended_id=False,
+                                          data=b"\xAA\xBB", channel=2, timestamp=1784716803.0))
     dbc = tmp_path / "t.dbc"
     dbc.write_text(INLINE_DBC, encoding="utf-8")
     return str(blf), str(dbc)

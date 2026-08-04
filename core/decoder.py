@@ -34,15 +34,16 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
     buckets = {}  # msg_id -> {"ts": [], "values": {name: []}}
     for fr in frames:
         stats.total_frames += 1
+        arb = fr.arbitration_id | (0x80000000 if fr.is_extended else 0)
         try:
-            decoded = dbc.db.decode_message(fr.arbitration_id, fr.data)
+            decoded = dbc.db.decode_message(arb, fr.data)
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             continue
-        md = dbc.messages[fr.arbitration_id]
+        md = dbc.messages[arb]
         bucket = buckets.setdefault(
-            fr.arbitration_id,
+            arb,
             {"ts": [], "values": {s.name: [] for s in md.signals}},
         )
         bucket["ts"].append(fr.ts_seconds)
