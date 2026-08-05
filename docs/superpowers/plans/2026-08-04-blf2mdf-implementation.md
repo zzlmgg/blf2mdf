@@ -37,7 +37,7 @@
 - Consumes: 无（首个任务）
 - Produces: 测试路径工具函数 `sample_blf()`、`all_dbc_files()`（后续所有测试任务使用）
 
-- [ ] **Step 1: 创建依赖与配置文件**
+- [x] **Step 1: 创建依赖与配置文件**
 
 `requirements.txt`：
 ```
@@ -82,7 +82,7 @@ def all_dbc_files() -> list[Path]:
 
 `core/__init__.py`、`gui/__init__.py`：空文件。
 
-- [ ] **Step 2: 验证环境与空测试通过**
+- [x] **Step 2: 验证环境与空测试通过**
 
 ```bash
 conda run -n blfmdf python -c "import cantools, can, asammdf, PySide6, numpy; print('env OK')"
@@ -91,7 +91,7 @@ conda run -n blfmdf python -m pytest
 
 Expected: 输出 `env OK`；pytest 无测试收集，退出码 0。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add requirements.txt pytest.ini tests/conftest.py core/__init__.py gui/__init__.py
@@ -113,7 +113,7 @@ git commit -m "chore: 项目骨架与测试基础设施"
   - `list_channels(path: str) -> list[int]`（升序）
   - `iter_messages(path: str, channel: int) -> Iterator[Frame]`（只产该通道报文，时间戳秒）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_blf_reader.py`：
 ```python
@@ -170,7 +170,7 @@ def test_iter_messages_fields_on_sample():
     print(f"前 200 帧中 CANFD: {fd_count}")
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_blf_reader.py -v
@@ -178,7 +178,7 @@ conda run -n blfmdf python -m pytest tests/test_blf_reader.py -v
 
 Expected: FAIL（`ModuleNotFoundError: core.blf_reader`）。
 
-- [ ] **Step 3: 探测样例 BLF，确认 python-can 的 BLF 读取能力**
+- [x] **Step 3: 探测样例 BLF，确认 python-can 的 BLF 读取能力**
 
 先写一个一次性探测脚本 `outputs/probe_blf.py`（不入库，outputs/ 已 gitignore）：
 
@@ -218,7 +218,7 @@ conda run -n blfmdf pip install blf
 ```
 `blf` 包映射：`from blf.parser import BLFParser`；`obj.channel`、`obj.timestamp`（秒）、`obj.arbitration_id`、`obj.flags`（扩展位/错误位按包文档）、`obj.dlc`、`bytes(obj.data)`；CanFdMessage / CanFdMessage64 均为可读对象。Step 4 的 `_decode` 实现相应改为该包的对象映射，其余接口不变。
 
-- [ ] **Step 4: 实现最小可用代码**
+- [x] **Step 4: 实现最小可用代码**
 
 `core/blf_reader.py`：
 ```python
@@ -271,7 +271,7 @@ def iter_messages(path: str, channel: int) -> Iterator[Frame]:
             yield _decode(msg)
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_blf_reader.py -v
@@ -279,7 +279,7 @@ conda run -n blfmdf python -m pytest tests/test_blf_reader.py -v
 
 Expected: 3 个测试 PASS（样例测试打印通道数与 FD 占比，目测合理即可）。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add core/blf_reader.py tests/test_blf_reader.py
@@ -302,7 +302,7 @@ git commit -m "feat: blf_reader 通道枚举与按通道流式读取"
   - `DbcDef(path, db, messages: dict[int, MessageDef])` — `db` 为 cantools Database，供解码
   - `load(path: str) -> DbcDef`（解析失败抛异常，错误信息含文件路径）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_dbc_loader.py`：
 ```python
@@ -377,7 +377,7 @@ def test_all_real_dbc_parse(dbc_path):
     assert dbc.messages, f"{dbc_path.name} 解析后为空"
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_dbc_loader.py -v
@@ -385,7 +385,7 @@ conda run -n blfmdf python -m pytest tests/test_dbc_loader.py -v
 
 Expected: FAIL（`ModuleNotFoundError: core.dbc_loader`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/dbc_loader.py`：
 ```python
@@ -445,7 +445,7 @@ def load(path: str) -> DbcDef:
     return DbcDef(path=path, db=db, messages=messages)
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_dbc_loader.py -v
@@ -453,7 +453,7 @@ conda run -n blfmdf python -m pytest tests/test_dbc_loader.py -v
 
 Expected: inline 测试 PASS + 13 个真实 DBC 全部解析 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core/dbc_loader.py tests/test_dbc_loader.py
@@ -475,7 +475,7 @@ git commit -m "feat: dbc_loader 单文件 DBC 解析"
   - `DecodeStats(total_frames: int, unknown_frames: int, unknown_ids: set[int])`
   - `decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int) -> tuple[list[SignalSeries], DecodeStats]`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_decoder.py`：
 ```python
@@ -566,7 +566,7 @@ def test_no_matching_frames(tmp_path):
     assert series == [] and stats.total_frames == 0
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_decoder.py -v
@@ -574,7 +574,7 @@ conda run -n blfmdf python -m pytest tests/test_decoder.py -v
 
 Expected: FAIL（`ModuleNotFoundError: core.decoder`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/decoder.py`：
 ```python
@@ -648,7 +648,7 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
     return series, stats
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_decoder.py -v
@@ -656,7 +656,7 @@ conda run -n blfmdf python -m pytest tests/test_decoder.py -v
 
 Expected: 3 个测试 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core/decoder.py tests/test_decoder.py
@@ -677,7 +677,7 @@ git commit -m "feat: decoder 帧到信号物理值聚合（含 mux NaN、未知 
   - `RawGroup(channel: int, timestamps: np.ndarray, ids: np.ndarray, dlcs: np.ndarray, data_array: np.ndarray, is_extended: np.ndarray, is_fd: np.ndarray)`
   - `write_mdf(signal_series_list: list[SignalSeries], raw_groups: list[RawGroup], out_path: str) -> None`（MDF 4.10；同名 `Signal::<节点>` 组冲突时第二个加 `CAN<n>::` 前缀；写失败异常上抛）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_mdf_writer.py`：
 ```python
@@ -754,7 +754,7 @@ def test_same_node_across_channels_dedupe(tmp_path):
     assert names == ["CAN5::Signal::ECU1", "Signal::ECU1"]
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_mdf_writer.py -v
@@ -762,7 +762,7 @@ conda run -n blfmdf python -m pytest tests/test_mdf_writer.py -v
 
 Expected: FAIL（`ModuleNotFoundError: core.mdf_writer`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/mdf_writer.py`：
 ```python
@@ -822,7 +822,7 @@ def write_mdf(signal_series_list: list[SignalSeries],
     mdf.save(out_path, overwrite=True)
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_mdf_writer.py -v
@@ -830,7 +830,7 @@ conda run -n blfmdf python -m pytest tests/test_mdf_writer.py -v
 
 Expected: 3 个测试 PASS（若 `m.get("Data")` 数组形状断言失败，说明 asammdf 对 2D uint8 通道的读回形状不同，按实际形状调整断言——值必须一致）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core/mdf_writer.py tests/test_mdf_writer.py
@@ -855,7 +855,7 @@ git commit -m "feat: mdf_writer 写出 MDF4.10（信号组/原始组/重名消�
     - 绑定通道无匹配帧 → summary.warning 置"该通道无匹配帧"，跳过该组
     - 写 MDF 失败 → 删除半成品文件后重新抛出异常
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_converter.py`：
 ```python
@@ -949,7 +949,7 @@ def test_convert_no_channels_raises(tmp_path, blf_and_dbc):
         convert(blf, {}, str(tmp_path / "x.mdf"))
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_converter.py -v
@@ -957,7 +957,7 @@ conda run -n blfmdf python -m pytest tests/test_converter.py -v
 
 Expected: FAIL（`ModuleNotFoundError: core.converter`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/converter.py`：
 ```python
@@ -1073,7 +1073,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     )
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_converter.py -v
@@ -1081,7 +1081,7 @@ conda run -n blfmdf python -m pytest tests/test_converter.py -v
 
 Expected: 4 个测试 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core/converter.py tests/test_converter.py
@@ -1102,7 +1102,7 @@ git commit -m "feat: converter 多通道编排（进度回调/半成品清理/�
 
 **说明**：通道表**没有勾选框**——按设计所有通道全部导出（绑定→信号，未绑定→原始）。界面仅在通道行状态列显示"已绑定 / 原始"。
 
-- [ ] **Step 1: 实现主窗口**
+- [x] **Step 1: 实现主窗口**
 
 `gui/main_window.py`：
 ```python
@@ -1395,7 +1395,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: 语法与导入检查**
+- [x] **Step 2: 语法与导入检查**
 
 ```bash
 conda run -n blfmdf python -c "import main; from gui.main_window import MainWindow; print('GUI OK')"
@@ -1403,7 +1403,7 @@ conda run -n blfmdf python -c "import main; from gui.main_window import MainWind
 
 Expected: 打印 `GUI OK`（无 Qt 平台错误；Windows 下若报 `could not load platform plugin` 说明 PySide6 安装不完整，先 `conda run -n blfmdf pip install --force-reinstall PySide6`）。
 
-- [ ] **Step 3: GUI 冒烟（手动）**
+- [x] **Step 3: GUI 冒烟（手动）**
 
 ```bash
 conda run -n blfmdf python main.py
@@ -1418,7 +1418,7 @@ conda run -n blfmdf python main.py
 6. 再次转换（覆盖确认弹窗出现）→ 点"是"正常继续。
 7. 故意把 BLF 路径改错（浏览选一个非 BLF 文件）→ 弹"BLF 读取失败"。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add gui/main_window.py main.py
@@ -1435,7 +1435,7 @@ git commit -m "feat: PySide6 主窗口与程序入口"
 **Interfaces:**
 - Consumes: `sample_blf`/`MDF_DIR`/`OUTPUTS_DIR`（conftest）、`list_channels`（Task 2）、`load`（Task 3）、`convert`（Task 6）
 
-- [ ] **Step 1: 写测试**
+- [x] **Step 1: 写测试**
 
 `tests/test_golden.py`：
 ```python
@@ -1529,7 +1529,7 @@ def test_golden_duration():
         f"时长异常: {result.duration_seconds:.1f}s（参考文件为 10 分钟）"
 ```
 
-- [ ] **Step 2: 运行金标准测试**
+- [x] **Step 2: 运行金标准测试**
 
 ```bash
 conda run -n blfmdf python -m pytest tests/test_golden.py -v -m golden
@@ -1540,7 +1540,7 @@ Expected:
 - `test_golden_signal_coverage_and_values` PASS 且打印覆盖率（预期 ≥90%）。
 - 若覆盖率 <90%：打印结果会显示两个候选 DBC 各自的覆盖率，据实调整 `candidates` 元组（例如改用 `VDCPublic_CANFD2.dbc` 优先、或补充其他 DBC 文件）；若数值对比失败，优先检查参考 MDF 时间基（CANoe 输出的时间可能不是自 0 起）——若参考与我们的时间戳存在固定偏移，把对比逻辑改为"窗口内最近邻"即可，值断言本身不变。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_golden.py
@@ -1554,7 +1554,7 @@ git commit -m "test: 金标准对比（样例 BLF vs _T058.mdf）"
 **Files:**
 - Create: `README.md`
 
-- [ ] **Step 1: 打包**
+- [x] **Step 1: 打包**
 
 ```bash
 cd e:/projects/blf_dbc
@@ -1564,11 +1564,11 @@ conda run -n blfmdf pyinstaller --noconfirm --onefile --windowed --name blf2mdf 
 
 Expected: `dist/blf2mdf.exe` 生成（体积约 80-100MB）。
 
-- [ ] **Step 2: 验证 exe 可启动**
+- [x] **Step 2: 验证 exe 可启动**
 
 双击 `dist/blf2mdf.exe`，窗口正常打开；走一遍冒烟清单（Task 7 Step 3 的 1-5 步）。
 
-- [ ] **Step 3: 写 README**
+- [x] **Step 3: 写 README**
 
 `README.md`：
 ```markdown
@@ -1598,7 +1598,7 @@ conda run -n blfmdf pyinstaller --noconfirm --onefile --windowed --name blf2mdf 
 ```
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md
@@ -1627,3 +1627,29 @@ git commit -m "docs: README 使用说明与打包命令"
 **类型一致性核对**：`Frame`（Task 2）→ `decode_channel(frames, dbc, channel)`（Task 4）→ `SignalSeries`（Task 4，含 channel/units）→ `write_mdf(series, raw_groups, out)`（Task 5）→ `convert(blf, bindings, out, progress_cb)`（Task 6）→ GUI（Task 7）与金标准（Task 8）按同名签名调用，无跨任务改名。
 
 **已知偏差（相对 spec 的 GUI 示意图）**：spec 中通道表示意图带勾选框，但确认后的导出模型是"所有通道全部导出"，故 GUI 无勾选框，状态列只显示"已绑定/原始"。已在 Task 7 开头注明。
+
+---
+
+## 执行记录（2026-08-05 更新）
+
+**状态：9 个任务全部完成**。在 master 分支执行（用户批准直接在 master 上开发），最终全分支评审通过。
+
+- 提交区间：`a61a334..424f6b5`（16 个提交，全部在 master 上）
+- 测试：`pytest tests/` 34/34 通过（含 golden：信号覆盖率 100.0%、时长 599.986s、抽样零偏差）
+- 最终评审（Opus）：无 Critical；3 项 Important 已修复并经 scoped 复核通过（decoder EFF 边界 KeyError、GUI `closeEvent` 守卫、python-can 版本下限）
+
+**与计划文本的偏差（实现期按实测修正，均已评审）**：
+
+- Task 2/6：python-can 4.6.1 API 为 `on_message_received`（非 `w.on_message`）；`Message` 默认 `is_extended_id=True`，fixture 须显式置标准帧。
+- Task 3/4/6：fixture 修正（BO_ 字段序、Mux 标记、Speed 字节解出的值、时间戳须在 1990 年后）。
+- Task 4：DecodeError（DLC 过短）计入未知帧；枚举信号 NamedSignalValue 解包 `.value` 存数值；追加 EFF 位归一化（标准/扩展帧同 raw id 各自保留，`f20efc1`）。
+- Task 5：asammdf 8.8.22 无 `group_name` API → 用 `acq_name` + 每组一次 append + `os.replace` 桥接 `.mf4` 后缀；测试仅改 3 处组名断言。
+- Task 6：converter 写失败清理补删 `.mf4` 半成品。
+- Task 8：金标准用全通道 ID 匹配 BINDING + 按信号时间偏移对齐 + 枚举信号跳过数值抽样。
+- Task 9：打包命令为验证可用的 7×`--add-binary` 版本（README 已同步）；exe 约 274.5MB。
+
+**遗留（人工验收项）**：
+
+- Task 7 Step 3 手动冒烟清单（交互项，offscreen 自动化冒烟已通过）。
+- Task 9 Step 2 exe 双击冒烟。
+- 若需精简 exe 体积（`--collect-all PySide6` 打包了全部 Qt 模块）。
