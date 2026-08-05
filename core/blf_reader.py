@@ -65,6 +65,20 @@ def iter_messages(path: str, channel: int) -> Iterator[Frame]:
             yield _decode(msg)
 
 
+def iter_all_messages(path: str) -> Iterator[Frame]:
+    """单遍全量帧流（每帧带 channel 字段，供单遍扫描管线路由用）。
+
+    性能优化（方案 A）：convert 只做一次全文件遍历，把帧路由到各通道
+    解码器与统计收集器，替代按通道逐遍重复解析整个文件（python-can 的
+    BLFReader 无索引，每次迭代都要从头解析全部帧）。
+    """
+    import can
+
+    with can.BLFReader(path) as reader:
+        for msg in reader:
+            yield _decode(msg)
+
+
 def scan_channels(path: str) -> dict[int, tuple]:
     """一次全文件扫描：每通道的统计输入（修复项 4）。
 

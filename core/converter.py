@@ -1,12 +1,13 @@
 """转换编排：多通道聚合 → 单个 MDF。"""
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from core import blf_reader, mdf_writer
-from core.decoder import decode_channel
+from core.decoder import ChannelDecoder
 from core.dbc_loader import DbcDef
 from core import stats as stats_mod
 
@@ -105,13 +106,46 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     dbcs = [d for d in bindings.values() if d is not None]
     known_ids = set().union(*(d.messages.keys() for d in dbcs)) if dbcs else None
 
+    # 时间基准对齐 CANoe（修复项 2）：以 BLF 文件头测量开始时间归零
+    # （与解码帧无关，实测 CANoe 基准 = 文件头 start_timestamp；
+    # 若用最早解码帧会整体偏移——样例首解码帧晚于测量开始 2ms）；
+    # 绝对起始时间（整秒）由 write_mdf 写入 MDF 头部 start_time 保留。
+    # BLFReader 初始化只读文件头，此处开销可忽略。
+    abs_start_epoch = int(blf_reader.read_start_time(blf_path))
+
+    # 性能优化（方案 A）：单遍全文件扫描——一次遍历完成 解码输入路由 +
+    # 统计输入收集，替代按通道逐遍重复解析整个文件（旧实现每绑定通道
+    # 一遍 + scan_channels 一遍，实测 11 遍 × ~13s ≈ 58% 转换耗时）。
+    # 逐帧语义与旧流程完全一致：解码走 ChannelDecoder（= 原 decode_channel
+    # 逻辑），统计输入逐通道列表（= 原 scan_channels 输出）。
+    decoders = {ch: ChannelDecoder(dbc, ch)
+                for ch, dbc in bindings.items() if dbc is not None}
+    raw_bufs = {ch: [] for ch, dbc in bindings.items() if dbc is None} \
+        if raw_export else {}
+    stats_bufs = defaultdict(lambda: ([], [], [], []))  # ch -> (ts, ext, remote, err)
+
+    if progress_cb:
+        progress_cb("读取 BLF", 5)
+    for fr in blf_reader.iter_all_messages(blf_path):
+        ch = fr.channel
+        if stats_export:
+            t, e, r, er = stats_bufs[ch]
+            t.append(fr.ts_seconds - abs_start_epoch)
+            e.append(fr.is_extended)
+            r.append(fr.is_remote)
+            er.append(fr.is_error)
+        dec = decoders.get(ch)
+        if dec is not None:
+            dec.feed(fr)
+        elif raw_export and ch in raw_bufs:
+            raw_bufs[ch].append(fr)
+
     for i, ch in enumerate(channels):
-        if progress_cb:
-            progress_cb(f"处理 CAN{ch}", 10 + 80 * i / total)
         dbc = bindings.get(ch)
-        frames = blf_reader.iter_messages(blf_path, ch)
         if dbc is not None:
-            series, stats = decode_channel(frames, dbc, ch)
+            if progress_cb:
+                progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
+            series, stats = decoders[ch].finish()
             for s in series:
                 note_range(s.timestamps)
             summary = ChannelSummary(
@@ -126,7 +160,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             all_series.extend(series)
         else:
             if raw_export:
-                raw, unk_frames, unk_ids = _collect_raw(frames, ch, known_ids)
+                raw, unk_frames, unk_ids = _collect_raw(raw_bufs[ch], ch, known_ids)
                 if len(raw.timestamps):
                     note_range(raw.timestamps)
                     raw_groups.append(raw)
@@ -138,39 +172,36 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     summary.warning = "全部原始帧未匹配 DBC"
             else:
                 # 修复项 5：原始帧导出默认关闭（与 CANoe 一致）——
-                # 未绑定通道跳过 _collect_raw 收集，不迭代帧数据。
+                # 未绑定通道不存储帧数据（单遍扫描中仅路由，不收集）。
                 summary = ChannelSummary(channel=ch, bound=False)
         summaries.append(summary)
 
-    # 时间基准对齐 CANoe（修复项 2）：以 BLF 文件头测量开始时间归零
-    # （与解码帧无关，实测 CANoe 基准 = 文件头 start_timestamp；
-    # 若用最早解码帧会整体偏移——样例首解码帧晚于测量开始 2ms）；
-    # 绝对起始时间（整秒）由 write_mdf 写入 MDF 头部 start_time 保留。
-    abs_start_epoch = int(blf_reader.read_start_time(blf_path))
     for s in all_series:
         s.timestamps = s.timestamps - abs_start_epoch
     for rg in raw_groups:
         rg.timestamps = rg.timestamps - abs_start_epoch
 
     # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
-    # 无帧通道输出全 0；一次全文件扫描收集全部通道（scan_channels），
-    # BLF 中不存在的通道直接全 0（不扫描）。
+    # 无帧通道输出全 0；输入已在单遍扫描中收集（stats_bufs），
+    # BLF 中不存在的通道直接全 0。
     stats_groups = []
     if stats_export:
         if progress_cb:
-            progress_cb("收集总线统计", 92)
-        collected = blf_reader.scan_channels(blf_path)
+            progress_cb("聚合总线统计", 92)
         global_end = 0.0
         for ch in stats_mod.STAT_CHANNELS:
-            ts = collected.get(ch, (np.empty(0), None, None, None))[0]
-            if len(ts):
-                global_end = max(global_end, float(ts.max()))
+            ts = stats_bufs.get(ch, ((), None, None, None))[0]
+            if ts:
+                global_end = max(global_end, max(ts))
         end_rounded = round(global_end, 3)
         for ch in stats_mod.STAT_CHANNELS:
-            t, e, r, er = collected.get(
-                ch, (np.empty(0), np.empty(0, dtype=bool),
-                     np.empty(0, dtype=bool), np.empty(0, dtype=bool)))
-            stats_groups.append(stats_mod.aggregate_channel(t, e, r, er, end_rounded))
+            t, e, r, er = stats_bufs.get(ch, ((), (), (), ()))
+            stats_groups.append(stats_mod.aggregate_channel(
+                np.asarray(t, dtype=np.float64),
+                np.asarray(e, dtype=bool),
+                np.asarray(r, dtype=bool),
+                np.asarray(er, dtype=bool),
+                end_rounded))
 
     if progress_cb:
         progress_cb("写 MDF", 95)

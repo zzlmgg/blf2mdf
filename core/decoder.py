@@ -57,27 +57,39 @@ class DecodeStats:
     unknown_ids: set[int] = field(default_factory=set)
 
 
-def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
-    stats = DecodeStats()
-    buckets = {}  # msg_id -> {"ts": [], "values": {name: []}}
-    for fr in frames:
+class ChannelDecoder:
+    """增量式通道解码器：单遍扫描管线按帧 feed，收齐后 finish 产出系列。
+
+    逐帧语义与 decode_channel 完全一致（decode_message/未知帧分类/分桶/
+    值累积），仅把「逐帧处理」与「收尾 numpy 转换」拆成两个阶段——
+    多通道单遍扫描时各通道解码器并行积累，不必逐通道重复全文件扫描。
+    """
+
+    def __init__(self, dbc: DbcDef, channel: int):
+        self.dbc = dbc
+        self.channel = channel
+        self.stats = DecodeStats()
+        self.buckets = {}  # msg_id -> {"ts": [], "values": {name: []}}
+
+    def feed(self, fr: Frame) -> None:
+        stats = self.stats
         stats.total_frames += 1
         arb = fr.arbitration_id | (0x80000000 if fr.is_extended else 0)
         try:
-            decoded = dbc.db.decode_message(arb, fr.data)
+            decoded = self.dbc.db.decode_message(arb, fr.data)
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
-            continue
-        md = dbc.messages.get(arb)
+            return
+        md = self.dbc.messages.get(arb)
         if md is None:
             # cantools 对 >0x7FF 的 id 无条件置 EFF 位：畸形标准帧（id 超出 11 位）
             # 可能成功解码到同原始 id 的扩展报文，但 loader 键（含 EFF 位）不含此键
             # → 按未知帧计数，不中断解码。
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
-            continue
-        bucket = buckets.setdefault(
+            return
+        bucket = self.buckets.setdefault(
             arb,
             {"ts": [], "values": {s.name: [] for s in md.signals}},
         )
@@ -87,41 +99,50 @@ def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
         for s in md.signals:
             bucket["values"][s.name].append(decoded.get(s.name, float("nan")))
 
-    series = []
-    for msg_id, b in buckets.items():
-        md = dbc.messages[msg_id]
-        timestamps = np.asarray(b["ts"], dtype=np.float64)
-        values = {}
-        for s in md.signals:
-            vals = b["values"][s.name]
-            kind = _signal_kind(s, vals)
-            if kind == "text":
-                # 表内值：DBC value table 文本 verbatim（UTF-8 bytes，含分号/尾空格）；
-                # 表外原始值：CANoe 存空字节（实测 FanPWMSt）。bytes 列表 → |S 定宽（=最长观察值）
-                values[s.name] = np.asarray([
-                    str(v).encode("utf-8") if isinstance(v, NamedSignalValue) else b""
-                    for v in vals])
-            elif kind == "int":
-                # 原始整型（最小 dtype）；mux 非活跃信号 cantools 返回 nan → 按原始 0 存储
-                values[s.name] = np.asarray(
-                    [v if isinstance(v, (int, np.integer)) else 0 for v in vals],
-                    dtype=_int_dtype(s.length, s.is_signed))
-            else:
-                # float64 物理值；物理变换+choices 信号（存在表外值）的表内值存 nan
-                # （CANoe 实测：HVAC_DriverTempSelect 表内 31 → nan，表外 0 → 18.0）
-                values[s.name] = np.asarray(
-                    [float("nan") if isinstance(v, NamedSignalValue) else v
-                     for v in vals], dtype=np.float64)
-        units = {s.name: s.unit for s in md.signals}
-        series.append(
-            SignalSeries(
-                channel=channel,
-                message_name=md.name,
-                node=md.sender_node,
-                signal_names=[s.name for s in md.signals],
-                timestamps=timestamps,
-                values=values,
-                units=units,
+    def finish(self) -> tuple[list[SignalSeries], DecodeStats]:
+        series = []
+        for msg_id, b in self.buckets.items():
+            md = self.dbc.messages[msg_id]
+            timestamps = np.asarray(b["ts"], dtype=np.float64)
+            values = {}
+            for s in md.signals:
+                vals = b["values"][s.name]
+                kind = _signal_kind(s, vals)
+                if kind == "text":
+                    # 表内值：DBC value table 文本 verbatim（UTF-8 bytes，含分号/尾空格）；
+                    # 表外原始值：CANoe 存空字节（实测 FanPWMSt）。bytes 列表 → |S 定宽（=最长观察值）
+                    values[s.name] = np.asarray([
+                        str(v).encode("utf-8") if isinstance(v, NamedSignalValue) else b""
+                        for v in vals])
+                elif kind == "int":
+                    # 原始整型（最小 dtype）；mux 非活跃信号 cantools 返回 nan → 按原始 0 存储
+                    values[s.name] = np.asarray(
+                        [v if isinstance(v, (int, np.integer)) else 0 for v in vals],
+                        dtype=_int_dtype(s.length, s.is_signed))
+                else:
+                    # float64 物理值；物理变换+choices 信号（存在表外值）的表内值存 nan
+                    # （CANoe 实测：HVAC_DriverTempSelect 表内 31 → nan，表外 0 → 18.0）
+                    values[s.name] = np.asarray(
+                        [float("nan") if isinstance(v, NamedSignalValue) else v
+                         for v in vals], dtype=np.float64)
+            units = {s.name: s.unit for s in md.signals}
+            series.append(
+                SignalSeries(
+                    channel=self.channel,
+                    message_name=md.name,
+                    node=md.sender_node,
+                    signal_names=[s.name for s in md.signals],
+                    timestamps=timestamps,
+                    values=values,
+                    units=units,
+                )
             )
-        )
-    return series, stats
+        return series, self.stats
+
+
+def decode_channel(frames: Iterator[Frame], dbc: DbcDef, channel: int):
+    """帧流 → 按报文聚合的信号物理值（ChannelDecoder 的流式包装）。"""
+    dec = ChannelDecoder(dbc, channel)
+    for fr in frames:
+        dec.feed(fr)
+    return dec.finish()
