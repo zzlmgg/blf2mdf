@@ -37,6 +37,20 @@ def list_channels(path: str) -> list[int]:
     return sorted(channels)
 
 
+def read_start_time(path: str) -> float:
+    """BLF 文件头记录的测量开始时间（UTC 秒）。
+
+    修复项 2：CANoe 导出以该时刻归零（实测参考 _T058.mdf 的 t 轴
+    = 帧绝对时间 − 文件头 start_timestamp，与哪些帧被解码无关——
+    样例中首解码帧晚于测量开始 2ms，若以首帧归零会整体偏移 2ms）。
+    python-can 写出的 BLF 该值为首帧时间（截断 3ms），语义等价。
+    """
+    import can
+
+    with can.BLFReader(path) as reader:
+        return float(reader.start_timestamp)
+
+
 def iter_messages(path: str, channel: int) -> Iterator[Frame]:
     import can
 

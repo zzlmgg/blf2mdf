@@ -50,7 +50,8 @@ def blf_and_dbc(tmp_path):
 def test_convert_mixed_channels(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "out.mdf"
-    result = convert(blf, {1: load(dbc_path), 2: None}, str(out))
+    result = convert(blf, {1: load(dbc_path), 2: None}, str(out),
+                     raw_export=True)
 
     assert result.duration_seconds == pytest.approx(3.0)  # 1784716800.0s → 1784716803.0s（0x456 帧被过滤不入组）
     by_ch = {s.channel: s for s in result.summaries}
@@ -66,10 +67,57 @@ def test_convert_mixed_channels(tmp_path, blf_and_dbc):
     m = MDF(str(out))
     speed = m.get("Speed")
     assert np.allclose(speed.samples, [10.0, 50.0])   # 0x03E8→10.0, 0x1388→50.0
-    assert {g.channel_group.acq_name for g in m.groups} == {"Signal::ECU", "Raw::CAN2"}
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC", "Raw::CAN2"}
     data = m.get("Data")
     assert data.samples.tolist() == [[0xAA, 0xBB]]    # 只保留 DBC 已知 ID 的帧
     assert m.get("ID").samples.tolist() == [100]
+
+
+def test_convert_raw_export_off_by_default(tmp_path, blf_and_dbc):
+    """修复项 5：原始帧导出默认关闭（与 CANoe 一致）——未绑定通道不产出
+    Raw:: 组，摘要 raw_frames=0；输出组数 = 解码组数。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "no_raw.mdf"
+    result = convert(blf, {1: load(dbc_path), 2: None}, str(out))
+
+    by_ch = {s.channel: s for s in result.summaries}
+    s2 = by_ch[2]
+    assert not s2.bound and s2.raw_frames == 0 and s2.unknown_frames == 0
+    m = MDF(str(out))
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC"}
+    # 解码数据不受影响
+    assert np.allclose(m.get("Speed").samples, [10.0, 50.0])
+
+
+def test_convert_raw_export_off_skips_collection(tmp_path, blf_and_dbc):
+    """raw_export=False 显式指定：未绑定通道完全跳过原始帧收集（不迭代帧）。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "no_raw2.mdf"
+    result = convert(blf, {1: load(dbc_path), 2: None}, str(out),
+                     raw_export=False)
+    s2 = next(s for s in result.summaries if s.channel == 2)
+    assert s2.raw_frames == 0 and s2.unknown_frames == 0
+    m = MDF(str(out))
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC"}
+
+
+def test_convert_relative_timestamps_and_start_time(tmp_path, blf_and_dbc):
+    """修复项 2：时间基准对齐 CANoe——时间轴相对（全局首帧归零），
+    绝对起始时间写入 MDF 头部 start_time（naive UTC 整秒，与参考 _T058.mdf 一致）。"""
+    from datetime import datetime
+
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "rel.mdf"
+    convert(blf, {1: load(dbc_path), 2: None}, str(out), raw_export=True)
+
+    m = MDF(str(out))
+    # 解码组：最早帧 1784716800.0 归零 → 0.0 / 1.0（原绝对时间戳）
+    assert np.allclose(m.get("t", group=0).samples, [0.0, 1.0])
+    # 原始帧组：1784716803.0 保留帧 → 3.0（0x456 未知 ID 帧被过滤，跨组同一基准）
+    assert np.allclose(m.get("t", group=1).samples, [3.0])
+    # MDF 头部绝对起始时间：floor(min_ts) = 2026-07-22 10:40:00（UTC 整秒，与 CANoe 一致）
+    assert m.header.start_time == datetime(2026, 7, 22, 10, 40)
+    assert m.header.abs_time == 1784716800000000000
 
 
 def test_convert_progress_callback(tmp_path, blf_and_dbc):
@@ -85,7 +133,8 @@ def test_convert_progress_callback(tmp_path, blf_and_dbc):
 def test_convert_no_matching_frames_warns(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "empty.mdf"
-    result = convert(blf, {1: None, 3: load(dbc_path)}, str(out))
+    result = convert(blf, {1: None, 3: load(dbc_path)}, str(out),
+                     raw_export=True)
     s3 = next(s for s in result.summaries if s.channel == 3)
     assert s3.warning == "该通道无匹配帧"
     # 通道 1 原始帧：DBC 存在时按 ID 过滤（ID 100 保留 ×2，ID 999 丢弃）
@@ -100,7 +149,7 @@ def test_convert_raw_without_dbc_keeps_all_frames(tmp_path, blf_and_dbc):
     """无任何 DBC 参与转换：原始导出不过滤，全部帧保留。"""
     blf, _ = blf_and_dbc
     out = tmp_path / "all_raw.mdf"
-    result = convert(blf, {1: None}, str(out))
+    result = convert(blf, {1: None}, str(out), raw_export=True)
     s1 = result.summaries[0]
     assert s1.raw_frames == 3  # ID 100 ×2 + ID 999
     assert s1.unknown_frames == 0
@@ -112,12 +161,13 @@ def test_convert_raw_all_unknown_frames_skipped(tmp_path, blf_and_dbc):
     """原始通道帧全部无 DBC 定义：过滤后为空，组不写入并给出警告。"""
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "filtered.mdf"
-    result = convert(blf, {4: None, 1: load(dbc_path)}, str(out))
+    result = convert(blf, {4: None, 1: load(dbc_path)}, str(out),
+                     raw_export=True)
     s4 = next(s for s in result.summaries if s.channel == 4)
     assert s4.raw_frames == 0 and s4.unknown_frames == 1
     assert s4.warning == "全部原始帧未匹配 DBC"
     m = MDF(str(out))
-    assert {g.channel_group.acq_name for g in m.groups} == {"Signal::ECU"}  # Raw::CAN4 空组不写入
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC"}  # Raw::CAN4 空组不写入
 
 
 def test_convert_no_channels_raises(tmp_path, blf_and_dbc):

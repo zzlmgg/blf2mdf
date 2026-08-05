@@ -76,7 +76,12 @@ def _collect_raw(frames, channel: int,
 
 
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
-            progress_cb=None) -> ConversionResult:
+            progress_cb=None, raw_export: bool = False) -> ConversionResult:
+    """多通道 BLF → 单个 MDF。
+
+    raw_export=False（默认，与 CANoe 一致）：未绑定 DBC 的通道不导出原始帧，
+    只保留解码信号组；True 时未绑定通道收集为 Raw::CANn 组（见 _collect_raw）。
+    """
     channels = sorted(bindings)
     if not channels:
         raise ValueError("未选择任何通道")
@@ -115,22 +120,38 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 summary.warning = "该通道无匹配帧"
             all_series.extend(series)
         else:
-            raw, unk_frames, unk_ids = _collect_raw(frames, ch, known_ids)
-            if len(raw.timestamps):
-                note_range(raw.timestamps)
-                raw_groups.append(raw)
-            summary = ChannelSummary(
-                channel=ch, bound=False, raw_frames=len(raw.timestamps),
-                unknown_frames=unk_frames, unknown_ids=len(unk_ids),
-            )
-            if unk_frames and not len(raw.timestamps):
-                summary.warning = "全部原始帧未匹配 DBC"
+            if raw_export:
+                raw, unk_frames, unk_ids = _collect_raw(frames, ch, known_ids)
+                if len(raw.timestamps):
+                    note_range(raw.timestamps)
+                    raw_groups.append(raw)
+                summary = ChannelSummary(
+                    channel=ch, bound=False, raw_frames=len(raw.timestamps),
+                    unknown_frames=unk_frames, unknown_ids=len(unk_ids),
+                )
+                if unk_frames and not len(raw.timestamps):
+                    summary.warning = "全部原始帧未匹配 DBC"
+            else:
+                # 修复项 5：原始帧导出默认关闭（与 CANoe 一致）——
+                # 未绑定通道跳过 _collect_raw 收集，不迭代帧数据。
+                summary = ChannelSummary(channel=ch, bound=False)
         summaries.append(summary)
+
+    # 时间基准对齐 CANoe（修复项 2）：以 BLF 文件头测量开始时间归零
+    # （与解码帧无关，实测 CANoe 基准 = 文件头 start_timestamp；
+    # 若用最早解码帧会整体偏移——样例首解码帧晚于测量开始 2ms）；
+    # 绝对起始时间（整秒）由 write_mdf 写入 MDF 头部 start_time 保留。
+    abs_start_epoch = int(blf_reader.read_start_time(blf_path))
+    for s in all_series:
+        s.timestamps = s.timestamps - abs_start_epoch
+    for rg in raw_groups:
+        rg.timestamps = rg.timestamps - abs_start_epoch
 
     if progress_cb:
         progress_cb("写 MDF", 95)
     try:
-        mdf_writer.write_mdf(all_series, raw_groups, out_path)
+        mdf_writer.write_mdf(all_series, raw_groups, out_path,
+                             abs_start_epoch=abs_start_epoch)
     except Exception:
         # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
         # save 失败留 .mf4，rename 失败两者都在，半成品都要清。

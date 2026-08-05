@@ -30,8 +30,8 @@ BINDING = {
 def _signal_names(mdf: MDF) -> set[str]:
     """收集解码信号通道名。
 
-    参考 MDF 按报文名分组（'1s' 为总线统计组），自产 MDF 用 Signal:: 组；
-    均排除时间通道（参考为 't'，自产为 'time'）与原始组（Raw::）。
+    两侧均按报文名分组（'1s' 为 CANoe 总线统计组，Raw:: 为自产原始帧组）；
+    排除时间通道（修复项 6 后两侧均为 't'；保留 'time' 以兼容旧自产文件）。
     """
     names = set()
     for g in mdf.groups:
@@ -78,10 +78,14 @@ def test_golden_signal_coverage_and_values():
     print(f"信号覆盖 {len(ours & ref_names)}/{len(ref_names)} = {overlap:.2%}")
     assert overlap >= 0.9, f"信号覆盖率不足: {overlap:.2%}（参考 {len(ref_names)} 个信号）"
 
-    # 抽样数值对比：3 个共同信号，每个取参考前 100 个采样点
+    # 抽样对比：数值信号前 3 个 × 前 100 点 + 枚举文本信号前 2 个 × 前 100 点
+    # （修复项 3+8：两侧均按 DBC 定义存储——float64 物理值/最小整型/枚举文本）
     common = sorted(ours & ref_names)
     checked = 0
-    for name in common[:3]:
+    num_picked, txt_picked = 0, 0
+    for name in common:
+        if num_picked >= 3 and txt_picked >= 2:
+            break
         ours_sig = _first_signal(m, name)
         theirs = _first_signal(ref, name)
         if ours_sig is None or theirs is None or len(theirs.samples) == 0:
@@ -90,19 +94,34 @@ def test_golden_signal_coverage_and_values():
         v_ref = np.asarray(theirs.samples)
         t_our = np.asarray(ours_sig.timestamps)
         v_our = np.asarray(ours_sig.samples)
-        if not (np.issubdtype(v_ref.dtype, np.number)
+        # 修复项 2：两侧均为相对时间（自产以全局首帧归零，与 CANoe 一致），
+        # 无需偏移；首点时间差在窗口内即可直接逐点最近邻对比
+        assert abs(float(t_our[0]) - float(t_ref[0])) < 1e-3, \
+            f"{name} 时间轴不一致: 自产 {t_our[0]} vs 参考 {t_ref[0]}"
+        if v_ref.dtype.kind in ("S", "O", "U"):
+            if txt_picked >= 2:
+                continue
+            # 枚举信号：文本逐值比对（两侧均存 DBC value table 文本，UTF-8 bytes）
+            for i in range(min(100, len(t_ref))):
+                idx = int(np.argmin(np.abs(t_our - t_ref[i])))
+                if abs(t_our[idx] - t_ref[i]) > 1e-3:
+                    continue  # 时间无对应采样点则跳过
+                assert bytes(v_our[idx]).rstrip(b"\x00") == bytes(v_ref[i]).rstrip(b"\x00"), \
+                    f"{name} t={t_ref[i]:.3f}: 期望 {v_ref[i]!r} 实际 {v_our[idx]!r}"
+                checked += 1
+            txt_picked += 1
+        elif (np.issubdtype(v_ref.dtype, np.number)
                 and np.issubdtype(v_our.dtype, np.number)):
-            continue  # 枚举信号参考存文本（如 b'Valid'）、自产存数值，跳过数值对比
-        # BLF 绝对时间戳 vs CANoe 相对时间戳：先消除固定偏移，再窗口内最近邻
-        offset = float(t_our[0]) - float(t_ref[0])
-        t_our = t_our - offset
-        for i in range(min(100, len(t_ref))):
-            idx = int(np.argmin(np.abs(t_our - t_ref[i])))
-            if abs(t_our[idx] - t_ref[i]) > 1e-3:
-                continue  # 时间无对应采样点则跳过
-            assert abs(float(v_our[idx]) - float(v_ref[i])) <= max(1e-6, 1e-6 * abs(float(v_ref[i]))), \
-                f"{name} t={t_ref[i]:.3f}: 期望 {v_ref[i]} 实际 {v_our[idx]}"
-            checked += 1
+            if num_picked >= 3:
+                continue
+            for i in range(min(100, len(t_ref))):
+                idx = int(np.argmin(np.abs(t_our - t_ref[i])))
+                if abs(t_our[idx] - t_ref[i]) > 1e-3:
+                    continue  # 时间无对应采样点则跳过
+                assert abs(float(v_our[idx]) - float(v_ref[i])) <= max(1e-6, 1e-6 * abs(float(v_ref[i]))), \
+                    f"{name} t={t_ref[i]:.3f}: 期望 {v_ref[i]} 实际 {v_our[idx]}"
+                checked += 1
+            num_picked += 1
     assert checked > 0, "未能找到可对比的采样点"
 
 

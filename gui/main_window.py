@@ -4,16 +4,16 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core import blf_reader
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
 
-UNBOUND = "不绑定（导出原始帧）"
+UNBOUND = "不绑定"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -56,17 +56,19 @@ class ConvertWorker(QObject):
     done = Signal(object)
     error = Signal(str)
 
-    def __init__(self, blf_path, bindings, out_path):
+    def __init__(self, blf_path, bindings, out_path, raw_export):
         super().__init__()
         self.blf_path = blf_path
         self.bindings = bindings
         self.out_path = out_path
+        self.raw_export = raw_export
 
     @Slot()
     def run(self):
         try:
             result = convert(self.blf_path, self.bindings, self.out_path,
-                             progress_cb=lambda s, p: self.progress.emit(s, p))
+                             progress_cb=lambda s, p: self.progress.emit(s, p),
+                             raw_export=self.raw_export)
             self.done.emit(result)
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
@@ -122,6 +124,11 @@ class MainWindow(QMainWindow):
         self.table.verticalScrollBar().rangeChanged.connect(
             lambda *_: self._fit_table_width())
         right_col.addWidget(self.table, 1)
+        # 修复项 5：原始帧导出选项化，默认关闭（与 CANoe 导出一致）；
+        # 勾选后未绑定 DBC 的通道以 Raw::CANn 组导出（converter.raw_export）
+        self.raw_check = QCheckBox("导出未绑定通道的原始帧")
+        self.raw_check.setChecked(False)
+        right_col.addWidget(self.raw_check)
         middle.addLayout(right_col, 0)  # 右栏：通道表（总宽=三列列宽之和，余宽全给左侧 DBC 列表）
         v.addLayout(middle, 11)  # 第二排合计垂直额外空间 11/12
 
@@ -334,7 +341,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.summary.clear()
         self.worker_thread = QThread()
-        self.worker = ConvertWorker(self.blf_path, bindings, out)
+        self.worker = ConvertWorker(self.blf_path, bindings, out,
+                                    self.raw_check.isChecked())
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
@@ -364,9 +372,12 @@ class MainWindow(QMainWindow):
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")
             else:
-                line = f"CAN{s.channel} 未绑定: 原始帧 {s.raw_frames} 帧"
-                if s.unknown_frames:
-                    line += f" · DBC 未匹配丢弃 {s.unknown_frames} 帧 ({s.unknown_ids} 个 ID)"
+                if self.worker.raw_export:
+                    line = f"CAN{s.channel} 未绑定: 原始帧 {s.raw_frames} 帧"
+                    if s.unknown_frames:
+                        line += f" · DBC 未匹配丢弃 {s.unknown_frames} 帧 ({s.unknown_ids} 个 ID)"
+                else:
+                    line = f"CAN{s.channel} 未绑定: 原始帧导出关闭"
                 lines.append(line)
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")

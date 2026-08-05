@@ -1,6 +1,7 @@
 """MDF 4.10 写出：信号组 + 原始帧组。"""
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -20,38 +21,59 @@ class RawGroup:
     is_fd: np.ndarray        # bool (N,)
 
 
+# asammdf v4_constants.SYNC_TYPE_TIME：主时间通道同步类型，单位 "s"
+_MASTER_TIME = ("t", 1)
+
+
 def write_mdf(signal_series_list: list[SignalSeries],
-              raw_groups: list[RawGroup], out_path: str) -> None:
+              raw_groups: list[RawGroup], out_path: str,
+              abs_start_epoch: float | None = None) -> None:
     # asammdf 8.8：append 无 group_name 参数，组名 = ChannelGroup.acq_name；
     # 每次 append 新建一组，同一组的所有信号须一次传入（列表）。
+    # 主时间通道名由首信号的 master_metadata 决定（默认 "time"），
+    # 统一传 ("t", SYNC_TYPE_TIME) 与 CANoe 一致（修复项 6）。
     mdf = MDF(version="4.10")
+    if abs_start_epoch is not None:
+        # 修复项 2：MDF 头部 start_time = 绝对测量起始（naive UTC 整秒）。
+        # asammdf setter 对 naive datetime 按 UTC 计算 abs_time 并置
+        # FLAG_HD_LOCAL_TIME / tz_offset=0——与 CANoe 参考 _T058.mdf 逐字段一致
+        # （实测 roundtrip：abs_time/flags/tz 全同；时间戳数据不受影响）。
+        mdf.header.start_time = (
+            datetime.fromtimestamp(int(abs_start_epoch), tz=timezone.utc)
+            .replace(tzinfo=None))
     used_groups = set()
 
     for s in signal_series_list:
-        group = f"Signal::{s.node}"
+        # 组名 = 报文名（与 CANoe 一致）；跨通道同名报文加 CAN<ch>:: 前缀兜底
+        group = s.message_name
         if group in used_groups:
-            group = f"CAN{s.channel}::Signal::{s.node}"
+            group = f"CAN{s.channel}::{s.message_name}"
         used_groups.add(group)
-        mdf.append(
-            [
-                Signal(
-                    samples=s.values[name].astype(np.float64),
-                    timestamps=s.timestamps,
-                    name=name,
-                    unit=s.units.get(name, ""),
-                )
-                for name in s.signal_names
-            ],
-            acq_name=group,
-        )
+        signals = []
+        for name in s.signal_names:
+            samples = s.values[name]
+            kwargs = {}
+            if samples.dtype.kind in ("S", "O", "U"):
+                # 枚举文本：|Sn 定宽 bytes（修复项 3）；asammdf 需 encoding 元数据
+                kwargs["encoding"] = "utf-8"
+            signals.append(Signal(
+                samples=samples,           # 按解码 dtype 原样写出（整型/文本/float64，修复项 8）
+                timestamps=s.timestamps,
+                name=name,
+                unit=s.units.get(name, ""),
+                **kwargs,
+            ))
+        signals[0].master_metadata = _MASTER_TIME
+        mdf.append(signals, acq_name=group)
 
     for rg in raw_groups:
         group = f"Raw::CAN{rg.channel}"
         ts = rg.timestamps.astype(np.float64)
+        # 时间戳数据由主时间通道 t 承载，不再单独建 Time 通道
         mdf.append(
             [
-                Signal(samples=ts, timestamps=ts, name="Time", unit="s"),
-                Signal(samples=rg.ids.astype(np.uint32), timestamps=ts, name="ID"),
+                Signal(samples=rg.ids.astype(np.uint32), timestamps=ts, name="ID",
+                       master_metadata=_MASTER_TIME),
                 Signal(samples=rg.dlcs.astype(np.uint8), timestamps=ts, name="DLC"),
                 Signal(samples=rg.data_array, timestamps=ts, name="Data"),
                 Signal(samples=rg.is_extended.astype(np.uint8), timestamps=ts,
@@ -62,5 +84,7 @@ def write_mdf(signal_series_list: list[SignalSeries],
             acq_name=group,
         )
 
-    mdf.save(out_path, overwrite=True)  # asammdf 8.8 的 save 强制 .mf4 后缀
+    # compression=2（转置 + deflate）：参考 CANoe 高压缩输出（修复项 7，计划实测 326 MB → 4 MB 量级）；
+    # 压缩透明，读回自动解压。asammdf 8.8 的 save 强制 .mf4 后缀。
+    mdf.save(out_path, overwrite=True, compression=2)
     os.replace(Path(out_path).with_suffix(".mf4"), out_path)
