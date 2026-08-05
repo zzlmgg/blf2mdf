@@ -116,6 +116,23 @@ def test_compression_shrinks_output(tmp_path):
     assert np.allclose(speed.samples, 10.0)
 
 
+def test_compression_level_matches_canoe(tmp_path):
+    """修复项 9：压缩级别对齐 CANoe（asammdf 默认 COMPRESSION_LEVEL=1，
+    渐变数据实测 301KB；level 9 后 137KB。真实样例：7.13MB → 5.44MB ≈ CANoe 5.65MB）。"""
+    n = 200_000
+    ts = np.linspace(0.0, 10.0, n)
+    v = np.linspace(0.0, 1.0, n)  # 渐变值：低熵但非恒定，能区分 deflate 级别
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], ts, {"Speed": v})
+    out = tmp_path / "lvl.mdf"
+    write_mdf([s], [], str(out))
+    size = out.stat().st_size
+    assert size < 200_000, f"压缩级别未对齐 CANoe（应 <200KB，实际 {size / 1e3:.0f} KB）"
+    m = MDF(str(out))
+    speed = m.get("Speed")
+    assert len(speed.samples) == n
+    assert np.allclose(speed.samples, v)
+
+
 def test_write_raw_group(tmp_path):
     n = 2
     rg = RawGroup(

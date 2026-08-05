@@ -1,4 +1,4 @@
-"""MDF 4.10 写出：信号组 + 原始帧组。"""
+"""MDF 4.10 写出：信号组 + 原始帧组 + 总线统计组。"""
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +8,14 @@ import numpy as np
 from asammdf import MDF, Signal
 
 from core.decoder import SignalSeries
+from core.stats import ChannelStats, STAT_NAMES
+
+# 修复项 9：asammdf 默认 COMPRESSION_LEVEL=1（zlib 最快、压缩率最低，
+# 真实样例 7.13MB vs CANoe 5.65MB）；提升到 9 与 CANoe 高压缩输出一致
+# （实测同数据 5.44MB ≈ 5.65MB，耗时 ~4s 无感）。save 不暴露该参数，
+# 只能改 v4_blocks 模块常量（DZ 块构造时读取）。
+import asammdf.blocks.v4_blocks as _v4_blocks
+_v4_blocks.COMPRESSION_LEVEL = 9
 
 
 @dataclass
@@ -27,7 +35,8 @@ _MASTER_TIME = ("t", 1)
 
 def write_mdf(signal_series_list: list[SignalSeries],
               raw_groups: list[RawGroup], out_path: str,
-              abs_start_epoch: float | None = None) -> None:
+              abs_start_epoch: float | None = None,
+              stats_groups: list[ChannelStats] | None = None) -> None:
     # asammdf 8.8：append 无 group_name 参数，组名 = ChannelGroup.acq_name；
     # 每次 append 新建一组，同一组的所有信号须一次传入（列表）。
     # 主时间通道名由首信号的 master_metadata 决定（默认 "time"），
@@ -83,6 +92,17 @@ def write_mdf(signal_series_list: list[SignalSeries],
             ],
             acq_name=group,
         )
+
+    # 修复项 4：总线统计 1s 组（阶段 1，CANoe 语义：10 项 × 16 通道，组名 '1s'，
+    # 每组 = 统计信号 + 主时间通道 t）。写在文件尾部（不改变既有组序；
+    # full_compare 按信号名匹配组，不依赖组序）。
+    for cs in stats_groups or []:
+        for name in STAT_NAMES:
+            mdf.append(
+                [Signal(samples=cs.values[name], timestamps=cs.t, name=name,
+                        master_metadata=_MASTER_TIME)],
+                acq_name="1s",
+            )
 
     # compression=2（转置 + deflate）：参考 CANoe 高压缩输出（修复项 7，计划实测 326 MB → 4 MB 量级）；
     # 压缩透明，读回自动解压。asammdf 8.8 的 save 强制 .mf4 后缀。

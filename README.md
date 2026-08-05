@@ -20,6 +20,12 @@
 开始时间归零）；绝对测量起始时间（整秒，UTC）写入 MDF 头部 `start_time`，
 两者相加可得绝对时间戳。
 
+输出包含与 CANoe 一致的 `1s` 总线统计组（默认开启，10 项 × 全部 16 个通道：
+StdData/ExtData/StdRemote/ExtRemote/ErrorFrames 及各自 Rate，逐秒聚合，
+周期 1s；未绑定/无数据通道输出全 0）。统计语义按 CANoe 参考文件实测校准
+（首窗 1.1s、帧时间戳毫秒网格等，见 `docs/2026-08-05-mdf-differences-fix-plan.md`
+§11 修复项 4 执行记录）。
+
 ## 开发
 
 依赖：`pip install -r requirements.txt`（Python 3.12，conda 环境 blfmdf）

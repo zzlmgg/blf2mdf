@@ -51,7 +51,7 @@ def test_convert_mixed_channels(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "out.mdf"
     result = convert(blf, {1: load(dbc_path), 2: None}, str(out),
-                     raw_export=True)
+                     raw_export=True, stats_export=False)
 
     assert result.duration_seconds == pytest.approx(3.0)  # 1784716800.0s → 1784716803.0s（0x456 帧被过滤不入组）
     by_ch = {s.channel: s for s in result.summaries}
@@ -78,7 +78,7 @@ def test_convert_raw_export_off_by_default(tmp_path, blf_and_dbc):
     Raw:: 组，摘要 raw_frames=0；输出组数 = 解码组数。"""
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "no_raw.mdf"
-    result = convert(blf, {1: load(dbc_path), 2: None}, str(out))
+    result = convert(blf, {1: load(dbc_path), 2: None}, str(out), stats_export=False)
 
     by_ch = {s.channel: s for s in result.summaries}
     s2 = by_ch[2]
@@ -94,7 +94,7 @@ def test_convert_raw_export_off_skips_collection(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "no_raw2.mdf"
     result = convert(blf, {1: load(dbc_path), 2: None}, str(out),
-                     raw_export=False)
+                     raw_export=False, stats_export=False)
     s2 = next(s for s in result.summaries if s.channel == 2)
     assert s2.raw_frames == 0 and s2.unknown_frames == 0
     m = MDF(str(out))
@@ -134,7 +134,7 @@ def test_convert_no_matching_frames_warns(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "empty.mdf"
     result = convert(blf, {1: None, 3: load(dbc_path)}, str(out),
-                     raw_export=True)
+                     raw_export=True, stats_export=False)
     s3 = next(s for s in result.summaries if s.channel == 3)
     assert s3.warning == "该通道无匹配帧"
     # 通道 1 原始帧：DBC 存在时按 ID 过滤（ID 100 保留 ×2，ID 999 丢弃）
@@ -149,7 +149,7 @@ def test_convert_raw_without_dbc_keeps_all_frames(tmp_path, blf_and_dbc):
     """无任何 DBC 参与转换：原始导出不过滤，全部帧保留。"""
     blf, _ = blf_and_dbc
     out = tmp_path / "all_raw.mdf"
-    result = convert(blf, {1: None}, str(out), raw_export=True)
+    result = convert(blf, {1: None}, str(out), raw_export=True, stats_export=False)
     s1 = result.summaries[0]
     assert s1.raw_frames == 3  # ID 100 ×2 + ID 999
     assert s1.unknown_frames == 0
@@ -162,7 +162,7 @@ def test_convert_raw_all_unknown_frames_skipped(tmp_path, blf_and_dbc):
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "filtered.mdf"
     result = convert(blf, {4: None, 1: load(dbc_path)}, str(out),
-                     raw_export=True)
+                     raw_export=True, stats_export=False)
     s4 = next(s for s in result.summaries if s.channel == 4)
     assert s4.raw_frames == 0 and s4.unknown_frames == 1
     assert s4.warning == "全部原始帧未匹配 DBC"
@@ -192,3 +192,31 @@ def test_convert_write_failure_cleans_partial_files(tmp_path, blf_and_dbc, monke
         convert(blf, {1: load(dbc_path)}, str(out))
     assert not out.exists(), "out_path 不应残留"
     assert not mf4.exists(), "半成品 .mf4 应被删除"
+
+
+def test_convert_stats_export_default_ones_groups(tmp_path, blf_and_dbc):
+    """修复项 4：stats_export 默认开——输出 10 项 × 16 通道 = 160 个 '1s' 统计组，
+    覆盖 0-15 全部通道（无数据通道全 0），与 DBC 绑定无关。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "out.mdf"
+    convert(blf, {1: load(dbc_path)}, str(out))
+    m = MDF(str(out))
+    ones = [g for g in m.groups if g.channel_group.acq_name == "1s"]
+    assert len(ones) == 160
+    # 统计组在文件尾部（解码组 1 个 + 统计 160 个），组序 = 通道 × 统计项：
+    # ch1 的 StdData = 组 1 + 1*10 + 0；ch1（绑定，3 帧 @ 0/1/2s）累计 C[1]=帧'<1.109=2
+    std = m.get("StdData", group=1 + 10)
+    assert std.samples.dtype == np.int32
+    assert std.samples.tolist()[:3] == [0, 2, 3]
+    # ch15（无数据通道）的 StdDataRate 全 0（组 1 + 15*10 + 1）
+    rate = m.get("StdDataRate", group=1 + 15 * 10 + 1)
+    assert np.all(rate.samples == 0.0)
+
+
+def test_convert_stats_export_off_no_ones_groups(tmp_path, blf_and_dbc):
+    """stats_export=False：不输出 '1s' 统计组。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "out.mdf"
+    convert(blf, {1: load(dbc_path)}, str(out), stats_export=False)
+    m = MDF(str(out))
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC"}

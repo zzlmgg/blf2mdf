@@ -12,6 +12,8 @@ class Frame:
     is_fd: bool
     dlc: int
     data: bytes
+    is_remote: bool = False
+    is_error: bool = False
 
 
 def _decode(msg) -> Frame:
@@ -24,6 +26,8 @@ def _decode(msg) -> Frame:
         is_fd=bool(getattr(msg, "is_fd", False)),
         dlc=int(msg.dlc),
         data=bytes(msg.data),
+        is_remote=bool(getattr(msg, "is_remote_frame", False)),
+        is_error=bool(getattr(msg, "is_error_frame", False)),
     )
 
 
@@ -59,3 +63,31 @@ def iter_messages(path: str, channel: int) -> Iterator[Frame]:
             if int(msg.channel) != channel:
                 continue
             yield _decode(msg)
+
+
+def scan_channels(path: str) -> dict[int, tuple]:
+    """一次全文件扫描：每通道的统计输入（修复项 4）。
+
+    返回 {channel: (相对时间戳 float64, is_extended, is_remote, is_error)}，
+    数组等长；未出现的通道不在字典中。供总线统计收集使用（避免逐通道
+    重复全文件扫描）。
+    """
+    from collections import defaultdict
+
+    import can
+    import numpy as np
+
+    data = defaultdict(lambda: ([], [], [], []))
+    with can.BLFReader(path) as reader:
+        start = int(reader.start_timestamp)
+        for msg in reader:
+            ts, ext, rem, err = data[int(msg.channel)]
+            ts.append(float(msg.timestamp) - start)
+            ext.append(bool(msg.is_extended_id))
+            rem.append(bool(getattr(msg, "is_remote_frame", False)))
+            err.append(bool(getattr(msg, "is_error_frame", False)))
+    return {
+        ch: (np.asarray(ts, dtype=np.float64), np.asarray(ext, dtype=bool),
+             np.asarray(rem, dtype=bool), np.asarray(err, dtype=bool))
+        for ch, (ts, ext, rem, err) in data.items()
+    }

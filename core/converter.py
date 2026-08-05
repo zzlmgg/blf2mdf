@@ -8,6 +8,7 @@ import numpy as np
 from core import blf_reader, mdf_writer
 from core.decoder import decode_channel
 from core.dbc_loader import DbcDef
+from core import stats as stats_mod
 
 
 @dataclass
@@ -76,11 +77,15 @@ def _collect_raw(frames, channel: int,
 
 
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
-            progress_cb=None, raw_export: bool = False) -> ConversionResult:
+            progress_cb=None, raw_export: bool = False,
+            stats_export: bool = True) -> ConversionResult:
     """多通道 BLF → 单个 MDF。
 
     raw_export=False（默认，与 CANoe 一致）：未绑定 DBC 的通道不导出原始帧，
     只保留解码信号组；True 时未绑定通道收集为 Raw::CANn 组（见 _collect_raw）。
+
+    stats_export=True（默认，与 CANoe 一致）：输出 1s 总线统计组（修复项 4
+    阶段 1，10 项 × 16 通道，覆盖 0-15 全部通道与 DBC 绑定无关）。
     """
     channels = sorted(bindings)
     if not channels:
@@ -147,11 +152,32 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     for rg in raw_groups:
         rg.timestamps = rg.timestamps - abs_start_epoch
 
+    # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
+    # 无帧通道输出全 0；一次全文件扫描收集全部通道（scan_channels），
+    # BLF 中不存在的通道直接全 0（不扫描）。
+    stats_groups = []
+    if stats_export:
+        if progress_cb:
+            progress_cb("收集总线统计", 92)
+        collected = blf_reader.scan_channels(blf_path)
+        global_end = 0.0
+        for ch in stats_mod.STAT_CHANNELS:
+            ts = collected.get(ch, (np.empty(0), None, None, None))[0]
+            if len(ts):
+                global_end = max(global_end, float(ts.max()))
+        end_rounded = round(global_end, 3)
+        for ch in stats_mod.STAT_CHANNELS:
+            t, e, r, er = collected.get(
+                ch, (np.empty(0), np.empty(0, dtype=bool),
+                     np.empty(0, dtype=bool), np.empty(0, dtype=bool)))
+            stats_groups.append(stats_mod.aggregate_channel(t, e, r, er, end_rounded))
+
     if progress_cb:
         progress_cb("写 MDF", 95)
     try:
         mdf_writer.write_mdf(all_series, raw_groups, out_path,
-                             abs_start_epoch=abs_start_epoch)
+                             abs_start_epoch=abs_start_epoch,
+                             stats_groups=stats_groups)
     except Exception:
         # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
         # save 失败留 .mf4，rename 失败两者都在，半成品都要清。

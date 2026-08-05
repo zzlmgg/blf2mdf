@@ -1,11 +1,82 @@
-"""全量对比：按信号集合匹配组 → 采样数/时间/首尾值/单位，再抽样数值对比。"""
+"""全量对比：按信号集合匹配组 → 采样数/时间/首尾值/单位，再抽样数值对比。
+
+用法：
+    python tools/full_compare.py <自产.mdf> <参考.mdf> [--outdir outputs/mdf_compare] [--no-report]
+默认同时打印到终端，并把详细报告写入 outputs/mdf_compare/compare_<时间戳>.md。
+"""
+import argparse
+import contextlib
+import os
 import sys
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from asammdf import MDF
 
+
+class _Tee:
+    """同时写多个流（终端 + 报告文件）。"""
+
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, s):
+        for f in self.files:
+            f.write(s)
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
 TIME_CHANNELS = {"t", "time"}
+
+# 修复项 4：阶段 1 统计项（10 项）与参考组内偏移（参考每组 22 项）
+STAT_NAMES = ("StdData", "StdDataRate", "ExtData", "ExtDataRate",
+              "StdRemote", "StdRemoteRate", "ExtRemote", "ExtRemoteRate",
+              "ErrorFrames", "ErrorFrameRate")
+REF_STAT_IDX = {"StdData": 4, "StdDataRate": 5, "ExtData": 6, "ExtDataRate": 7,
+                "StdRemote": 8, "StdRemoteRate": 9, "ExtRemote": 10,
+                "ExtRemoteRate": 11, "ErrorFrames": 12, "ErrorFrameRate": 13}
+
+
+def compare_stats(a, b):
+    """1s 总线统计组对比（修复项 4 验收：160 组 × 601 点逐秒一致）。
+
+    自产组序 = 通道 × 统计项（'1s' 组在文件尾部）；参考组序 = 通道 × 22 项（头部）。
+    """
+    print("\n=== 1s 总线统计组对比（修复项 4，阶段 1：10 项 × 16 通道）===")
+    ones_a = [gi for gi, g in enumerate(a.groups)
+              if (g.channel_group.acq_name or "") == "1s"]
+    ones_b = [gi for gi, g in enumerate(b.groups)
+              if (g.channel_group.acq_name or "") == "1s"]
+    print(f"  '1s' 组数: 自产 {len(ones_a)} vs 参考 {len(ones_b)}（参考另含 12 项未实现统计）")
+    if len(ones_a) != 160:
+        print("  （自产非 160 组，跳过逐点对比）")
+        return
+    bad_total = 0
+    for ch in range(16):
+        for i, name in enumerate(STAT_NAMES):
+            ga = ones_a[ch * 10 + i]
+            gb = ones_b[ch * 22 + REF_STAT_IDX[name]]
+            va = np.asarray(a.get(name, group=ga).samples)
+            vb = np.asarray(b.get(name, group=gb).samples)
+            if len(va) != len(vb):
+                bad_total += 1
+                print(f"  ch{ch} {name}: 采样数 {len(va)} vs {len(vb)}")
+                continue
+            if np.issubdtype(va.dtype, np.integer):
+                bad = int(np.sum(va != vb))
+            else:
+                bad = int(np.sum(np.abs(va - vb) > 1e-9))
+            if bad:
+                bad_total += bad
+                print(f"  ch{ch} {name}: {bad} 点不一致")
+    if bad_total == 0:
+        print("  （160 组 × 601 点逐点全部一致）")
+    else:
+        print(f"  （共 {bad_total} 点不一致）")
 
 
 def index_groups(mdf):
@@ -34,7 +105,7 @@ def summarize_signal(mdf, gi, name):
             samples[0], samples[-1], str(sig.unit))
 
 
-def main(path_a, path_b):
+def _run(path_a, path_b):
     with MDF(path_a) as a, MDF(path_b) as b:
         ia = index_groups(a)
         ib = index_groups(b)
@@ -228,6 +299,38 @@ def main(path_a, path_b):
             print(f"  {s_name} (offset={offset:.3f}s): {status}")
             npairs += 1
 
+        # 6) 1s 总线统计组对比（修复项 4）
+        compare_stats(a, b)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="全量对比两个 MDF（自产 vs CANoe 参考）")
+    parser.add_argument("path_a", help="自产 MDF 路径")
+    parser.add_argument("path_b", help="参考 MDF 路径")
+    parser.add_argument("--outdir", default="outputs/mdf_compare",
+                        help="报告输出目录（默认 outputs/mdf_compare）")
+    parser.add_argument("--no-report", action="store_true",
+                        help="只打印终端，不写报告文件")
+    args = parser.parse_args()
+
+    if args.no_report:
+        _run(args.path_a, args.path_b)
+        return
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name_a = Path(args.path_a).stem
+    name_b = Path(args.path_b).stem
+    report = outdir / f"compare_{name_a}_vs_{name_b}_{ts}.md"
+    with open(report, "w", encoding="utf-8") as fp:
+        fp.write(f"# MDF 对比报告\n\n- 自产: `{args.path_a}`\n- 参考: `{args.path_b}`\n"
+                 f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        tee = _Tee(sys.stdout, fp)
+        with contextlib.redirect_stdout(tee):
+            _run(args.path_a, args.path_b)
+    print(f"\n[报告已写入] {report}")
+
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main()

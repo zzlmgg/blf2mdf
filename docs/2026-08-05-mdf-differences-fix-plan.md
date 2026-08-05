@@ -249,7 +249,7 @@ class SignalDef:
 
 ---
 
-## 8. 修复项 4：总线统计 352 组（P2，需决策）
+## 8. 修复项 4：总线统计 352 组（P2，需决策）✅ 已完成（2026-08-05，阶段 1）
 
 ### 现状与根因
 CANoe 输出 352 个 `1s` 统计组 = 22 种统计量 × 16 通道（Busload/BusloadAvg/BusloadMin/BusloadMax、StdData/StdDataRate、ExtData/ExtDataRate、StdRemote/StdRemoteRate、ExtRemote/ExtRemoteRate、ErrorFrames/ErrorFrameRate、ChipState/ChipStateTxErr/ChipStateRxErr、MinSendDist、BurstTime、FramesPerBurst、TransceiverErrors、Bursts）。本工具无统计导出。属功能范围差异。
@@ -305,12 +305,47 @@ CANoe 输出 352 个 `1s` 统计组 = 22 种统计量 × 16 通道（Busload/Bus
 |---|---|---|
 | D1 | 时间基准默认相对（修复项 2） | ✅ 已定：A. 默认相对 + 元数据记录绝对时间（修复项 2 已按此实施，见 §11） |
 | D2 | 原始帧导出（修复项 5） | ✅ 已定：B. 选项化，默认关（用户决策：与 CANoe 导出一致；计划原推荐 A 未采纳，见 §11） |
-| D3 | 总线统计范围（修复项 4） | A. 阶段 1 起步，后续按需扩展 |
+| D3 | 总线统计范围（修复项 4） | ✅ 已定：A. 阶段 1 起步（帧计数类 10 项），阶段 2/3 不立项；统计默认开启（与 CANoe 一致），见 §11 |
 | D4 | 枚举未知值的存储形式（修复项 3） | ✅ 已定：空字节 `b''`（实测 `FanPWMSt` raw=0 ∉ {255:...} 全部存 b''） |
 
 ---
 
 ## 11. 执行记录
+
+### 修复项 4：总线统计 1s 组（P2，阶段 1）✅ 已完成（2026-08-05）
+
+- **决策（D3）**：定为 **A. 仅阶段 1**（帧计数类 10 项：StdData/ExtData/StdRemote/ExtRemote/ErrorFrames + 各自 Rate = 10 项 × 16 通道 = 160 组；参考 352 组中的其余 12 项——Busload*/ChipState*/MinSendDist/BurstTime/FramesPerBurst/TransceiverErrors/Bursts——不立项，阶段 2 需波特率配置、阶段 3 信息源存疑）。**统计默认开启**（`stats_export=True`，与 CANoe 一致）。
+- **统计语义（参考 `_T058.mdf` 实测校准，13 通道 × 601 点逐点命中后才实现）**：
+  - 帧时间戳 **round 到 1ms**（CANoe 毫秒网格；BLF float32 时间戳经 float64 提升，1.10899996 → 1.109 边界帧归属由 round 决定，这是全量对齐的关键）；
+  - 窗界 R = [0, 1.1, 2.0, 3.0, ..., N]，**首窗 1.1s**、其后每秒整秒对齐（N = ceil(全局末帧 round3)，样例 600 窗 → 601 点）；
+  - 累计 **C[k] = 帧' < (R[k] + 0.009)**（严格小于；9ms 为 CANoe 输出时刻偏置，C 界为 float64 浮点加法）；
+  - **Rate[1] = 帧' < 1.099 / 1.1**（首窗截止提前 1ms、分母 1.1s）；**Rate[k≥2] = (帧' < R[k] − 帧' < R[k−1]) / 窗长**（窗长：窗 1 = 0.9、其后 1.0）；**末点 Rate[N] = Rate[N−1]（复制）**；
+  - t 轴 = [0, 1.109, 2.009, ..., N−1+0.009, round(末帧, 3)]（与参考有 ≤1ulp 差异，见偏差 4）；
+  - 覆盖 **0-15 全部 16 通道**（与 DBC 绑定无关），无数据通道全 0；
+  - 分类：扩展 ID → ExtData、远程帧 → StdRemote/ExtRemote（按扩展位）、错误帧 → ErrorFrames、其余（**含 CAN-FD 帧**）→ StdData（样例 97% FD 帧全部计入 StdData，与参考一致）；
+  - dtype：计数 int32、Rate float64（与参考一致）。
+- **改动**：
+  - [core/stats.py](core/stats.py)（新增）：`aggregate_channel()`（按上述语义聚合单通道）+ `STAT_NAMES`/`STAT_CHANNELS`；`ChannelStats`（t 轴 + 10 项数组）。
+  - [core/blf_reader.py](core/blf_reader.py)：`Frame` 扩展 `is_remote`/`is_error`（python-can `is_remote_frame`/`is_error_frame`）；新增 `scan_channels()`——**一次全文件扫描**收集全部通道的 (时间戳, 分类掩码)，避免统计逐通道重复扫描。
+  - [core/converter.py](core/converter.py)：`convert()` 新增 `stats_export: bool = True`（默认开，与 CANoe 一致）；统计收集用 `scan_channels()`，`global_end = round(全部通道末帧, 3)`，无帧通道全 0。
+  - [core/mdf_writer.py](core/mdf_writer.py)：`write_mdf()` 新增 `stats_groups` 参数，按**通道 × 统计项**序写出 `'1s'` 组（每组 = 统计信号 + 主时间通道 t，复用 `_MASTER_TIME` 机制）；统计组写在**文件尾部**（不改变既有解码/原始组序，full_compare 按信号名匹配不依赖组序）。
+  - [tests/test_stats.py](tests/test_stats.py)（新增，TDD 先红后绿）：空通道全 0 + t 轴、窗界累计、首窗/末窗 Rate 特例、1ms round、分类掩码、N 由全局末帧决定。
+  - [tests/test_converter.py](tests/test_converter.py)：新增统计默认开启（160 个 '1s' 组、ch1 累计值、无数据通道全 0）与 `stats_export=False`（无统计组）测试；6 个聚焦原始帧/解码行为的既有测试显式传 `stats_export=False`（同修复项 5 对 raw 测试的先例）。
+  - [tools/full_compare.py](tools/full_compare.py)：新增 §9.3 建议维度——**1s 统计组逐秒对比**（160 组 × 601 点，自产组序 = 通道×项、参考组序 = 通道×22 项）。
+- **测试**：全量 pytest **53/53 通过**（含金标准 2 个；TDD 先红后绿：stats 测试 ModuleNotFoundError → 6 个全过；集成测试先断言 160 组失败）。
+- **验收**（金标准 BINDING 全量转换 `outputs/verify_fix4.mdf` → `tools/full_compare.py` 对比参考 `_T058.mdf`）：
+  - **1s 统计组：160 组 × 601 点逐点全部一致**（含 ch0/ch3/ch6/ch8/ch9/ch10/ch11/ch12/ch13/ch14 十通道非零数据；无数据通道全 0 一致；Rate 逐点一致含末点复制）；
+  - **不回归**：组名/采样数/时间范围 103/103、dtype 60 信号、枚举文本 2000 点、抽样数值 8 信号全部一致（修复项 1/2/3+8/6/7 验收不回归）；
+  - **体积**：`verify_fix4.mdf` **6.63 MB**（统计 160 组仅增 ~0.6 MB，参考 5.4 MB 量级；验收线 < 10 MB 保持）。
+  - **性能**：全量转换 **280.9s**（scan_channels 单次扫描收集统计；若逐通道扫描 16 次全文件会慢 2.4 倍，见偏差 3）。
+- **偏差**（6 处，均有实测依据）：
+  1. **验收"5 组"修正为 10 项**：计划 §8 验收写"16 通道 × 5 组帧计数统计（StdData 等）"——实际帧计数类 = 5 个计数 + 5 个 Rate = **10 项**（计划 §8 方案阶段 1 列表即 10 项，验收措辞"5 组"系笔误），按 10 项实施与验收。
+  2. **Rate 首窗分子界 = 1.099（1.1 − 1ms）、末点 = Rate[N−1] 复制**：计划未明示（风险项"CANoe 秒窗对齐/计数语义需实测校准"的落实）。实测：首窗 Rate 截止提前 1ms（ch3 有 1.100000 帧被排除）；Rate[N] 恒等于 Rate[N−1]（6 通道抽查全等，CANoe 末窗复制）。
+  3. **统计收集用一次全文件扫描（scan_channels）而非逐通道扫描**：计划未涉及实现路径。绑定通道仍被解码二次扫描（decode_channel 消费生成器无法复用帧），总扫描 = 1（统计）+ 解码通道数；实测 280.9s 可接受。
+  4. **t 轴与参考有 ≤1ulp 差异（部分点）**：参考 t[k]（如 t[2] = 2.0090000000000003）比 k + 0.009 浮点加法（2.0090000000000001）高 1ulp（k = 2, 3, 63, 120, 121 等），成因是 CANoe 内部 9ms 偏置的浮点表示（float32 域），无法从 BLF 数据反推精确复刻。1ulp ≈ 4e-16s，full_compare 数值对比容差 1e-9 不受影响；t 轴按 C 界（k + 0.009）生成。
+  5. **统计组写在文件尾部而非参考的头部**：参考文件 '1s' 组在前 352 组；我们的统计组追加在解码/原始组之后（避免改变既有组索引语义）。full_compare 按信号名匹配不依赖组序，验收不受影响。
+  6. **未实现项（12 项）输出缺失而非全 0**：阶段 1 不写 Busload*/ChipState*/MinSendDist/BurstTime/FramesPerBurst/TransceiverErrors/Bursts 的占位组（参考侧这些组数值非 0，写全 0 会误导且无法对齐；full_compare 明确显示"参考另含 12 项未实现统计"）。
+- **遗留（待办）**：代码改动尚未提交（工作区，与修复项 1、2、3+8、5、6、7 叠加）；GUI 无统计相关控件（阶段 1 无需配置，stats_export 仅 CLI/API 参数）；`scan_channels` 与解码的重复扫描（绑定通道）留待后续优化（如需）。
 
 ### 修复项 5：原始帧组选项化（P1）✅ 已完成（2026-08-05）
 
