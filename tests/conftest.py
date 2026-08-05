@@ -1,9 +1,9 @@
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BLF_DIR = PROJECT_ROOT / "blf"
-DBC_DIR = PROJECT_ROOT / "dbc"
-MDF_DIR = PROJECT_ROOT / "mdf"
+BLF_DIR = PROJECT_ROOT / "inputs" / "blf"
+DBC_DIR = PROJECT_ROOT / "inputs" / "dbc"
+MDF_DIR = PROJECT_ROOT / "inputs" / "mdf"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 

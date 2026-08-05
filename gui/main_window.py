@@ -249,7 +249,12 @@ class MainWindow(QMainWindow):
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")
             else:
-                lines.append(f"CAN{s.channel} 未绑定: 原始帧 {s.raw_frames} 帧")
+                line = f"CAN{s.channel} 未绑定: 原始帧 {s.raw_frames} 帧"
+                if s.unknown_frames:
+                    line += f" · DBC 未匹配丢弃 {s.unknown_frames} 帧 ({s.unknown_ids} 个 ID)"
+                lines.append(line)
+                if s.warning:
+                    lines.append(f"  警告: {s.warning}")
         self.summary.setPlainText("\n".join(lines))
 
     @Slot(str)

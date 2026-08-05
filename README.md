@@ -4,30 +4,18 @@
 
 ## 使用
 
-双击 `blf2mdf.exe`（或 `conda run -n blfmdf python main.py`）：
+运行 `conda run -n blfmdf python main.py`：
 
 1. 选择 .blf 文件（自动列出其中记录的总线通道）
 2. "添加 DBC…" 导入 .dbc 矩阵
 3. 为每个通道选择一个 DBC；不选则导出原始帧
 4. 点"转换"，输出单个 .mdf（所有通道数据）
 
+未绑定 DBC 的通道导出原始帧时，仅保留本次转换中任一已绑定 DBC 有报文定义的帧；
+其余帧（DBC 中无对应信号名的未知信号）在摘要中计数并丢弃。完全不使用 DBC 时不过滤。
+
 ## 开发
 
 依赖：`pip install -r requirements.txt`（Python 3.12，conda 环境 blfmdf）
 测试：`conda run -n blfmdf python -m pytest`
 金标准对比：`conda run -n blfmdf python -m pytest -m golden`
-
-## 打包
-
-```bash
-conda run -n blfmdf pip install pyinstaller
-conda run -n blfmdf pyinstaller --noconfirm --onefile --windowed --name blf2mdf --collect-all PySide6 \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\ffi-8.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libbz2.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libcrypto-3-x64.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libexpat.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\liblzma.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\libssl-3-x64.dll;." \
-  --add-binary "C:\ProgramData\anaconda3\envs\blfmdf\Library\bin\sqlite3.dll;." \
-  main.py
-```
