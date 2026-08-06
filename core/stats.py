@@ -63,6 +63,10 @@ def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
     - global_end_rounded：全局测量结束时刻（round 到 1ms，全部通道最大值）
     """
     ts = np.round(np.asarray(timestamps, dtype=np.float64), 3)
+    # 方案 B：searchsorted 要求输入有序。BLF 帧按时间序写入（round 后仍单调，
+    # 子序列仍单调），正常路径无须排序；乱序输入在分类掩码应用后对掩码取值
+    # 排序（掩码已固定，排序 tsm 不改变 sum(x < b) 结果，等价成立）。
+    ts_monotonic = len(ts) <= 1 or bool(np.all(ts[:-1] <= ts[1:]))
     ext = np.asarray(is_extended, dtype=bool)
     remote = np.asarray(is_remote, dtype=bool)
     err = np.asarray(is_error, dtype=bool)
@@ -94,10 +98,16 @@ def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
     rates = {}
     for i, (cn, rn) in enumerate(zip(_COUNT_NAMES, _RATE_NAMES)):
         mask = classes[i]
+        # 方案 B（性能）：逐窗界全量扫描 O(N)/界 → np.searchsorted O(log N)/界。
+        # sum(x < b) ≡ searchsorted(x, b, 'left')，严格小于语义一致，结果等价；
+        # ts 单调时 ts[mask] 为有序子序列可直接用，乱序输入对掩码取值排序兜底。
+        tsm = ts[mask]
+        if not ts_monotonic:
+            tsm = np.sort(tsm)
         # C[k] = 帧' < (R[k] + 0.009)
-        cum = np.array([np.sum(ts[mask] < b) for b in c_bound], dtype=np.int64)
+        cum = np.searchsorted(tsm, c_bound, side="left").astype(np.int64)
         # Rate：界序列 rb（累计），分母 = 窗长（R 差）
-        cum_r = np.array([np.sum(ts[mask] < b) for b in rb], dtype=np.int64)
+        cum_r = np.searchsorted(tsm, rb, side="left").astype(np.int64)
         rate = np.zeros(n_points)
         for k in range(1, n_windows):
             rate[k] = (cum_r[k] - cum_r[k - 1]) / (r[k] - r[k - 1])
