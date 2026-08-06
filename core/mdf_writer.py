@@ -73,7 +73,10 @@ def write_mdf(signal_series_list: list[SignalSeries],
                 **kwargs,
             ))
         signals[0].master_metadata = _MASTER_TIME
-        mdf.append(signals, acq_name=group)
+        # 方案 E：组内各信号时间戳为同一数组对象（构造保证），
+        # common_timebase=True 跳过 asammdf 逐信号 O(N) array_equal 比较
+        # （默认路径比较全同后同样取 t_，输出逐位一致）。
+        mdf.append(signals, acq_name=group, common_timebase=True)
 
     for rg in raw_groups:
         group = f"Raw::CAN{rg.channel}"
@@ -91,6 +94,7 @@ def write_mdf(signal_series_list: list[SignalSeries],
                        name="IsFD"),
             ],
             acq_name=group,
+            common_timebase=True,
         )
 
     # 修复项 4：总线统计 1s 组（阶段 1，CANoe 语义：10 项 × 16 通道，组名 '1s'，

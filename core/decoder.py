@@ -47,7 +47,7 @@ def _extract_bits(data64: np.ndarray, pos: int, length: int,
     if byte_order == "big_endian":
         data64 = data64.view(">u8")   # 字节组内位序反转：位 p = 字 (p//64) 的位 (63 - p%64)
     hi = data64[:, w]
-    mask = (np.uint64(1) << length) - 1
+    mask = np.uint64((1 << length) - 1)
     if byte_order == "big_endian":
         if o + length <= 64:
             return (hi >> (64 - o - length)) & mask

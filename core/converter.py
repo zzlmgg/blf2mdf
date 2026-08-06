@@ -6,10 +6,13 @@ from pathlib import Path
 
 import numpy as np
 
-from core import blf_reader, mdf_writer
+from core import blf_reader, mdf_writer, mp_finish
 from core.decoder import ChannelDecoder
 from core.dbc_loader import DbcDef
 from core import stats as stats_mod
+
+# 方案 G：并行解码的桶内存阈值（估算，超阈值回退串行，env 可覆盖；见 §5.7）
+_MP_MEM_THRESHOLD = float(os.environ.get("BLF_MP_MEM_THRESHOLD", 1.5e9))
 
 
 @dataclass
@@ -79,7 +82,7 @@ def _collect_raw(frames, channel: int,
 
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             progress_cb=None, raw_export: bool = False,
-            stats_export: bool = True) -> ConversionResult:
+            stats_export: bool = True, parallel: bool = False) -> ConversionResult:
     """多通道 BLF → 单个 MDF。
 
     raw_export=False（默认，与 CANoe 一致）：未绑定 DBC 的通道不导出原始帧，
@@ -124,101 +127,132 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         if raw_export else {}
     stats_bufs = defaultdict(lambda: ([], [], [], []))  # ch -> (ts, ext, remote, err)
 
-    if progress_cb:
-        progress_cb("读取 BLF", 5)
-    for fr in blf_reader.iter_all_messages(blf_path):
-        ch = fr.channel
-        if stats_export:
-            t, e, r, er = stats_bufs[ch]
-            t.append(fr.ts_seconds - abs_start_epoch)
-            e.append(fr.is_extended)
-            r.append(fr.is_remote)
-            er.append(fr.is_error)
-        dec = decoders.get(ch)
-        if dec is not None:
-            dec.feed(fr)
-        elif raw_export and ch in raw_bufs:
-            raw_bufs[ch].append(fr)
+    # 方案 G：多进程并行解码（可选，默认关）。池在 feed 前创建 + 预热
+    # （spawn 成本藏在扫描期，原型实测 8 worker ~1.7s）；单通道短路；
+    # 池创建失败（环境/杀软等）→ 自动回退串行，正确性零损失（§5.7）。
+    pool = None
+    if parallel and len(decoders) >= 2:
+        try:
+            pool = mp_finish.make_pool(sorted(decoders))
+        except Exception:
+            pool = None
 
-    for i, ch in enumerate(channels):
-        dbc = bindings.get(ch)
-        if dbc is not None:
-            if progress_cb:
-                progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
-            series, stats = decoders[ch].finish()
-            for s in series:
-                note_range(s.timestamps)
-            summary = ChannelSummary(
-                channel=ch, bound=True,
-                decoded_frames=stats.total_frames - stats.unknown_frames,
-                signal_count=sum(len(s.signal_names) for s in series),
-                unknown_frames=stats.unknown_frames,
-                unknown_ids=len(stats.unknown_ids),
-            )
-            if not series:
-                summary.warning = "该通道无匹配帧"
-            all_series.extend(series)
-        else:
-            if raw_export:
-                raw, unk_frames, unk_ids = _collect_raw(raw_bufs[ch], ch, known_ids)
-                if len(raw.timestamps):
-                    note_range(raw.timestamps)
-                    raw_groups.append(raw)
-                summary = ChannelSummary(
-                    channel=ch, bound=False, raw_frames=len(raw.timestamps),
-                    unknown_frames=unk_frames, unknown_ids=len(unk_ids),
-                )
-                if unk_frames and not len(raw.timestamps):
-                    summary.warning = "全部原始帧未匹配 DBC"
-            else:
-                # 修复项 5：原始帧导出默认关闭（与 CANoe 一致）——
-                # 未绑定通道不存储帧数据（单遍扫描中仅路由，不收集）。
-                summary = ChannelSummary(channel=ch, bound=False)
-        summaries.append(summary)
-
-    for s in all_series:
-        s.timestamps = s.timestamps - abs_start_epoch
-    for rg in raw_groups:
-        rg.timestamps = rg.timestamps - abs_start_epoch
-
-    # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
-    # 无帧通道输出全 0；输入已在单遍扫描中收集（stats_bufs），
-    # BLF 中不存在的通道直接全 0。
-    stats_groups = []
-    if stats_export:
-        if progress_cb:
-            progress_cb("聚合总线统计", 92)
-        global_end = 0.0
-        for ch in stats_mod.STAT_CHANNELS:
-            ts = stats_bufs.get(ch, ((), None, None, None))[0]
-            if ts:
-                global_end = max(global_end, max(ts))
-        end_rounded = round(global_end, 3)
-        for ch in stats_mod.STAT_CHANNELS:
-            t, e, r, er = stats_bufs.get(ch, ((), (), (), ()))
-            stats_groups.append(stats_mod.aggregate_channel(
-                np.asarray(t, dtype=np.float64),
-                np.asarray(e, dtype=bool),
-                np.asarray(r, dtype=bool),
-                np.asarray(er, dtype=bool),
-                end_rounded))
-
-    if progress_cb:
-        progress_cb("写 MDF", 95)
     try:
-        mdf_writer.write_mdf(all_series, raw_groups, out_path,
-                             abs_start_epoch=abs_start_epoch,
-                             stats_groups=stats_groups)
-    except Exception:
-        # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
-        # save 失败留 .mf4，rename 失败两者都在，半成品都要清。
-        for p in (out_path, Path(out_path).with_suffix(".mf4")):
-            if os.path.exists(p):
-                os.remove(p)
-        raise
-    if progress_cb:
-        progress_cb("完成", 100)
-    return ConversionResult(
-        summaries=summaries,
-        duration_seconds=(max_ts - min_ts) if min_ts <= max_ts else 0.0,
-    )
+        if progress_cb:
+            progress_cb("读取 BLF", 5)
+        for fr in blf_reader.iter_all_messages(blf_path):
+            ch = fr.channel
+            if stats_export:
+                t, e, r, er = stats_bufs[ch]
+                t.append(fr.ts_seconds - abs_start_epoch)
+                e.append(fr.is_extended)
+                r.append(fr.is_remote)
+                er.append(fr.is_error)
+            dec = decoders.get(ch)
+            if dec is not None:
+                dec.feed(fr)
+            elif raw_export and ch in raw_bufs:
+                raw_bufs[ch].append(fr)
+
+        # 内存阈值回退（方案 G §5.7）：feed 后桶内存估算超阈值 → 转串行。
+        # 池已预热但未提交任务，shutdown 无副作用。
+        if pool is not None and \
+                mp_finish.bucket_bytes(decoders, sorted(decoders)) > _MP_MEM_THRESHOLD:
+            pool.shutdown(wait=True, cancel_futures=True)
+            pool = None
+
+        # ── 解码阶段：并行（方案 G，per-bucket）或串行（现状语义）──
+        if pool is not None:
+            results = mp_finish.finish_all(decoders, sorted(decoders),
+                                           progress_cb=progress_cb, pool=pool)
+        else:
+            results = {}
+            for i, ch in enumerate(sorted(decoders)):
+                if progress_cb:
+                    progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
+                results[ch] = decoders[ch].finish()
+
+        for i, ch in enumerate(channels):
+            dbc = bindings.get(ch)
+            if dbc is not None:
+                series, stats = results[ch]
+                for s in series:
+                    note_range(s.timestamps)
+                summary = ChannelSummary(
+                    channel=ch, bound=True,
+                    decoded_frames=stats.total_frames - stats.unknown_frames,
+                    signal_count=sum(len(s.signal_names) for s in series),
+                    unknown_frames=stats.unknown_frames,
+                    unknown_ids=len(stats.unknown_ids),
+                )
+                if not series:
+                    summary.warning = "该通道无匹配帧"
+                all_series.extend(series)
+            else:
+                if raw_export:
+                    raw, unk_frames, unk_ids = _collect_raw(raw_bufs[ch], ch, known_ids)
+                    if len(raw.timestamps):
+                        note_range(raw.timestamps)
+                        raw_groups.append(raw)
+                    summary = ChannelSummary(
+                        channel=ch, bound=False, raw_frames=len(raw.timestamps),
+                        unknown_frames=unk_frames, unknown_ids=len(unk_ids),
+                    )
+                    if unk_frames and not len(raw.timestamps):
+                        summary.warning = "全部原始帧未匹配 DBC"
+                else:
+                    # 修复项 5：原始帧导出默认关闭（与 CANoe 一致）——
+                    # 未绑定通道不存储帧数据（单遍扫描中仅路由，不收集）。
+                    summary = ChannelSummary(channel=ch, bound=False)
+            summaries.append(summary)
+
+        for s in all_series:
+            s.timestamps = s.timestamps - abs_start_epoch
+        for rg in raw_groups:
+            rg.timestamps = rg.timestamps - abs_start_epoch
+
+        # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
+        # 无帧通道输出全 0；输入已在单遍扫描中收集（stats_bufs），
+        # BLF 中不存在的通道直接全 0。
+        stats_groups = []
+        if stats_export:
+            if progress_cb:
+                progress_cb("聚合总线统计", 92)
+            global_end = 0.0
+            for ch in stats_mod.STAT_CHANNELS:
+                ts = stats_bufs.get(ch, ((), None, None, None))[0]
+                if ts:
+                    global_end = max(global_end, max(ts))
+            end_rounded = round(global_end, 3)
+            for ch in stats_mod.STAT_CHANNELS:
+                t, e, r, er = stats_bufs.get(ch, ((), (), (), ()))
+                stats_groups.append(stats_mod.aggregate_channel(
+                    np.asarray(t, dtype=np.float64),
+                    np.asarray(e, dtype=bool),
+                    np.asarray(r, dtype=bool),
+                    np.asarray(er, dtype=bool),
+                    end_rounded))
+
+        if progress_cb:
+            progress_cb("写 MDF", 95)
+        try:
+            mdf_writer.write_mdf(all_series, raw_groups, out_path,
+                                 abs_start_epoch=abs_start_epoch,
+                                 stats_groups=stats_groups)
+        except Exception:
+            # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
+            # save 失败留 .mf4，rename 失败两者都在，半成品都要清。
+            for p in (out_path, Path(out_path).with_suffix(".mf4")):
+                if os.path.exists(p):
+                    os.remove(p)
+            raise
+        if progress_cb:
+            progress_cb("完成", 100)
+        return ConversionResult(
+            summaries=summaries,
+            duration_seconds=(max_ts - min_ts) if min_ts <= max_ts else 0.0,
+        )
+    finally:
+        # 池生命周期：正常/异常路径均回收（feed 异常、write 异常等）
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
