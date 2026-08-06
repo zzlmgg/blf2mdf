@@ -75,3 +75,36 @@ def test_load_malformed_dbc_raises_with_path(tmp_path):
     with pytest.raises(ValueError) as excinfo:
         load(str(p))
     assert str(p) in str(excinfo.value)
+
+
+def test_signal_metadata_fields(tmp_path):
+    """SignalDef 扩展字段：byte_order/多路复用信息（方案C向量化解码需要）。"""
+    dbc_txt = '''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 100 M1: 8 ECU
+ SG_ Sel M : 0|8@1+ (1,0) [0|255] "" ECU
+ SG_ A m0 : 8|8@1+ (1,0) [0|255] "" ECU
+ SG_ B m1 : 8|8@0+ (1,0) [0|255] "" ECU
+
+BO_ 200 M2: 8 ECU
+ SG_ C : 16|16@0+ (1,0) [0|65535] "" ECU
+
+VAL_ 200 C 0 "off" 1 "on" ;
+'''
+    p = tmp_path / "meta.dbc"
+    p.write_text(dbc_txt, encoding="utf-8")
+    dbc = load(str(p))
+    m1 = dbc.messages[100]
+    sel, a, b = m1.signals
+    assert sel.is_multiplexer and sel.multiplexer_ids is None
+    assert a.multiplexer_ids == [0] and a.byte_order == "little_endian"
+    assert b.multiplexer_ids == [1] and b.byte_order == "big_endian"
+    m2 = dbc.messages[200]
+    assert m2.signals[0].byte_order == "big_endian"
+    assert m2.signals[0].choices == {0: "off", 1: "on"}

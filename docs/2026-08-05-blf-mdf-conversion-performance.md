@@ -1,7 +1,7 @@
 # BLF→MDF 转换性能分析报告与提速方案
 
 日期：2026-08-05
-状态：分析完成；**方案 A ✅ 已完成（实测 245.1s → 130.2s，1.88×）、方案 B ✅ 已完成（聚合 17.7s → 0.56s）**，方案 C-G 待实施（见 §4 状态与 §6 执行记录）
+状态：分析完成；**方案 A ✅ 已完成（实测 245.1s → 130.2s，1.88×）、方案 B ✅ 已完成（聚合 17.7s → 0.56s）、方案 C ✅ 已完成（实测 130.2s → 37.8s，解码阶段 74s → ≤12.7s）**；方案 D 已并入方案 C（feed 键查预检），E-G 待实施（见 §4 状态与 §6 执行记录）
 范围：转换慢的根因调查 + 保证数据质量前提下的提速方案
 
 ## 1. 目标与范围
@@ -67,7 +67,7 @@
 
 → 全文件被纯 Python 解析器从头解析了 11 遍，约 **143s（58%）**。现实现为 [converter.py:129](core/converter.py#L129) 的单遍扫描（11 遍 → 1 遍），扫描成本已并入转换总量 ~13s。
 
-### 根因 2（30%）：逐帧 cantools 解码 ⬜ 待方案 C（向量化）/ D（未知 ID 预检）
+### 根因 2（30%）：逐帧 cantools 解码 ✅ 已由方案 C 修复（向量化，2026-08-06）；方案 D 并入
 
 [decoder.py:79](core/decoder.py#L79) 每帧调用 `cantools.decode_message`（纯 Python 位运算），按信号逐个取位。成本与报文信号数成正比：CAN3（VDCCCU_CANFD2.dbc，报文信号极多）单帧 ~83µs，49.8 万帧 → 41.5s；CAN6 ~52µs → 16.4s。
 
@@ -91,8 +91,8 @@
 |---|---|---|---|---|---|
 | A | 单次全文件扫描（合并 11 遍为 1 遍） | ✅ 已完成 | 实测 115s | 零（已对拍） | 见 §6 执行记录 |
 | B | stats 聚合改 `np.searchsorted` | ✅ 已完成 | 实测 17.1s | 零（已对拍） | 见 §6 执行记录 |
-| C | 解码向量化（numpy 批量位提取） | ⬜ 待实施 | ~65s | 需对拍校验 | **先跑 full_compare 对拍再上线** |
-| D | 未知 ID 预检（跳过无效解码+异常） | ⬜ 待实施 | ~2-4s | 零 | 单测 |
+| C | 解码向量化（numpy 批量位提取） | ✅ 已完成 | 实测 9.8s（解码 finish） | 零（已对拍） | 见 §6 执行记录 |
+| D | 未知 ID 预检（跳过无效解码+异常） | ✅ 已并入方案C（feed 键查预检） | ~0（并入） | 零 | 见 §6 执行记录 |
 | E | `append` 传 `common_timebase=True` | ⬜ 待实施 | 1-3s | 零 | 单测 |
 | F | GUI 启动：`list_channels` 缓存/后台化 | ⬜ 待实施 | 启动 ~13s → ~0 | 零 | 手动 |
 | G | 可选：多进程并行解码 | ⬜ 待实施 | 30-40s | 零 | 内存 ×2，性价比一般 |
@@ -119,21 +119,21 @@
 
 **验收（已完成）**：现成 `tools/full_compare.py` 的 160 组 × 601 点逐点对比直接验证；耗时 33.6s → ~13s（仅剩扫描）。
 
-### 方案 C：解码向量化（收益最大，风险最高，需对拍把关）
+### 方案 C：解码向量化 ✅ 已完成（2026-08-06，执行记录见 §6）
 
-**现状**：[core/decoder.py:67](core/decoder.py#L67) 每帧一次纯 Python 位提取。
+**现状（实施前）**：[core/decoder.py:67](core/decoder.py#L67) 每帧一次纯 Python 位提取。
 
-**方案**：按 (通道, 报文 ID) 分桶后，将帧数据收集为 `(N, L)` uint8 数组（参考 [core/converter.py:61](core/converter.py#L61) `_collect_raw` 既有模式），用 numpy 位运算批量提取每个信号（start_bit/length/字节序与 cantools 一致的小端位约定），scale/offset、choices 映射全部向量化；mux 信号按切换值分桶后向量化。
+**方案（已实施）**：按 (通道, 报文 ID) 分桶后，将帧数据收集为 `(N, L)` uint8 数组（参考 [core/converter.py:61](core/converter.py#L61) `_collect_raw` 既有模式），用 numpy 位运算批量提取每个信号（start_bit/length/字节序与 cantools 一致的小端位约定），scale/offset、choices 映射全部向量化；mux 信号按切换值分桶后向量化；无法向量化的报文（选择信号带变换/choices 的 mux）回退逐帧 cantools 解码。feed 仅按桶收集原始字节，未知 ID 键查即预检（方案 D 顺带完成）。
 
 **风险**：DBC 位序约定、符号扩展、浮点、mux 边界为易错点。**必须**先与优化前输出做全量 diff（`tools/full_compare.py` 已具备逐点对比能力）再上线；36 个测试作回归基线。
 
-**验收**：对拍零差异；CAN3 解码 41.5s → <1s。
+**验收（已完成）**：属性对拍零差异（随机 30 轮 + 13 真实 DBC × 5 轮 + mux 40 轮）；全量 pytest 82/82 通过（含 golden 2 项）；`tools/full_compare.py` 160 组 × 601 点逐点全部一致；实测解码阶段 74s → **≤12.7s**（≥5.8×，验收口径 ≤15s 达标；其中向量化 finish 9.8s = 7.5×），总耗时 130.2s → **37.8s**（3.4×）；CAN3 解码 finish 实测 4.62s。
 
-### 方案 D：未知 ID 预检
+### 方案 D：未知 ID 预检 ✅ 已并入方案C（feed 键查预检）
 
 **现状**：[core/decoder.py:68](core/decoder.py#L68) 未知帧先 `decode_message` 抛异常再计数。
 
-**方案**：在解码前先查 `arb in dbc.messages`，未知直接计 unknown 跳过（现代码 `dbc.messages.get(arb)` 键查本就在解码之后，可前移）。
+**方案（已并入方案C）**：在解码前先查 `arb in dbc.messages`，未知直接计 unknown 跳过（现代码 `dbc.messages.get(arb)` 键查本就在解码之后，可前移）。方案C 的 feed 重写已将其前移为桶键查预检（见 §6 方案C 执行记录）。
 
 **质量影响**：零——分类结果与现在完全一致。
 
@@ -163,6 +163,7 @@
 | A（已实施，实测） | **130.2s** | **1.88×** |
 | A + B + D + E（低风险项） | ~110s | ~2.2× |
 | A + B + C + D + E（含向量化） | ~50-70s | ~3.5-5× |
+| A + B + C（已实施，实测） | **37.8s** | **6.5×（vs 现状）/ 3.4×（vs 方案A）** |
 
 实施顺序建议：A → B → D/E（独立小项）→ C（需对拍）。每项独立可验收、可回退。
 
@@ -192,3 +193,32 @@
   - 全量 pytest **59/59 通过**（基线 55 + 新增 4；含 golden 全量转换与 CANoe 参考验证）；
   - `tools/full_compare.py` 对拍（golden.mdf vs _T058.mdf）：**160 组 × 601 点逐点全部一致**，103 组解码组结构/顺序/值、dtype、文本枚举抽查全部一致。
 - **实施中发现并修复的隐患**：初版实现将排序错误地作用于整 ts（未同步重排分类掩码），乱序输入下会错配掩码-帧（错误帧被计入 ExtRemote）；随机等价性测试当场捕获。修复为掩码应用后对 tsm 排序。真实 BLF 单调故不受影响，但乱序文件曾会产生错误输出——现已回归锁定。
+
+### 方案C：解码向量化 + 0x7DF 溢出截断 ✅ 已完成（2026-08-06）
+
+- **涉及文件**：
+  - `core/decoder.py`：`feed` 改为按 (通道, 报文 ID) 分桶收集原始字节（未知 ID 键查即预检，方案 D 顺带完成）；`finish` 新增向量化路径 `_extract_bits`/`_sign_extend`/`_extract_signal`（大端/小端/跨界/符号/浮点/>64 位截断）、`_bucket_data_array`/`_choices_lookup`/`_signal_kind_vec`/`_physical`/`_text_array`/`_store_signal`/`_mux_plan`/`_finish_bucket_vectorized`；无法向量化的报文（选择信号带变换/choices 的 mux）回退逐帧参考 `_decode_bucket_reference`；新增 `_clamped_int_array`（0x7DF 溢出截断）；`ChannelDecoder.feed()/finish()` 接口不变（converter 零改动）；
+  - `core/dbc_loader.py`：`SignalDef` 扩展 `byte_order`/`is_multiplexer`/`multiplexer_ids` 三个字段（cantools Signal 元数据透传，带默认值不破坏既有构造点）；
+  - `tests/test_decoder_vectorized.py`：新建（位提取单元 + 逐帧参考实现常驻 + 属性对拍 + 真实 DBC 对拍 + mux 对拍 + 溢出回归）；
+  - `tests/test_dbc_loader.py`：新增 `test_signal_metadata_fields`。
+- **实测耗时**（10 绑定 = golden BINDING ch 1,2,3,6,8,9,10,11,12,13；样例 BLF 35MB / 2,377,398 帧）：
+  - **总耗时 130.2s → 37.8s**（相对方案A 3.4×，相对现状 245.1s 6.5×）；
+  - 阶段分布：单遍读取+feed+统计收集 19.98s（纯 BLF 解析 17.10s，feed 帧路由+统计收集 ≈2.9s）、解码 finish 合计 **9.84s**（CAN3 4.62s / CAN6 2.67s / CAN1 0.71s / CAN8 0.63s / 其余 <0.4s）、统计聚合 0.59s、MDF 写出 7.13s；
+  - **解码阶段（feed+finish）≤12.7s（上界），相对方案A基线 ~74s ≥5.8× 加速（验收口径 ≤15s 达标）**；向量化 finish 本身 9.84s = 7.5×；
+  - 时长 600.0s（参考文件 10 分钟）；各通道 decoded/unknown 帧数与方案B 基线完全一致（如 CAN3 433,754/64,150、CAN6 251,205/67,362）。
+- **质量验证**：
+  - 属性对拍：随机信号 DBC × 随机帧 30 轮、13 个真实 DBC × 5 轮、mux 随机帧 40 轮——dtype/值/nan/未知帧计数/unknown_ids 全部零差异；
+  - 全量 pytest：常规套件（不含 golden）**80/80 通过**（37.35s）；全量含 golden **82/82 通过**（122.47s）；golden 2 项 **2/2 通过**（86.47s）；
+  - `tools/full_compare.py` 对拍（golden.mdf vs CANoe `_T058.mdf`）：**160 组 × 601 点逐点全部一致**；103 组匹配组组名/结构/顺序一致，dtype 抽查 60 信号、枚举文本 10 信号 × 200 点共 2000 点、数值 8 信号 × 200 点全部一致；自产侧 2 组未匹配（CCU_VCU_7/CCU_VCU_4，与 CANoe 信号命名差异的既有已知项，参考侧 0 组未匹配）。
+- **新增测试清单**：`tests/test_decoder_vectorized.py` 22 项——`test_extract_bits_random_matches_bit_reference[big_endian/little_endian]`（随机逐位对拍 ×200×6 数据规模）、`test_extract_signal_signed_and_float`、`test_extract_signal_truncates_over_64_bits`、`test_vectorized_matches_reference_random`（30 轮）、`test_vectorized_matches_reference_real_dbc`（13 个真实 DBC × 5 轮）、`test_vectorized_mux_matches_reference_random`（40 轮）、`test_overflow_512bit_signal_truncates`/`test_overflow_signed_64bit_wraps`/`test_overflow_512bit_little_endian_truncates`；`tests/test_dbc_loader.py` 1 项（`test_signal_metadata_fields`）。
+- **0x7DF 修复说明**：512 位信号（`Fun_Diag_Request` 等 12 个）值 >2^64−1 时旧实现 `np.asarray([...], dtype=uint64)` 抛 `OverflowError` 崩溃（样例 BLF 无 0x7DF 帧，属潜伏 bug）。按用户决策顺带修复：**按模截断存储低 64 位**（MDF 整型通道最大 64 位），有符号按补码回绕；向量化路径（提取低 64 位）与参考路径（`_clamped_int_array` 按模截断）输出一致，3 项溢出回归锁定。
+- **关键偏离（对计划草稿的修正，均以参考对拍为准）**：
+  1. 大端位提取用 `data64.view(">u8")` 反转字节组内位序（位 p = 字 p//64 的位 63−p%64），大端/小端统一位流空间后再提取；
+  2. mux 未知帧计数：feed 对已知 ID **短帧直接计未知、不入桶**（短帧入桶会使该报文系列位置前移、与逐帧参考的系列顺序不符，真实 DBC 对拍失败后修正；finish 的 valid 掩码保留为防御）；finish 对**无子组的 mux 值帧**计未知（`decodable &= ~bad`），unknown_ids 按桶只加一次（set 去重后与参考等价）；
+  3. `_msg_vectorizable` 支持面判定保留：无 mux、或选择信号为 (1,0) 无 choices 的单级 mux 走向量化，其余（选择信号带变换/choices 的 mux）回退逐帧参考；
+  4. `BIG_DBC` 测试夹具修正为 `7|512@0`/`7|64@0`（大端 `@0` 的 start bit 0 实际在位流位置 7（sawtooth），只有 start_bit=7 才是位流起点 0）；
+  5. 随机信号 DBC 生成器三处修正：`if not free` 的 ndarray 多元素 bool 歧义（ValueError）、len_max 恒为 0（`rng.integers(1,1)` ValueError）、占用位集必须按 cantools 校验空间标记且**字节序标记与 cantools 内部语义相反**（@1 = little_endian、@0 = big_endian，cantools 42.0.3 `dbc.py:1599` 实测）；
+  6. `_physical` 守卫取 max(|min|, |max|)（全负大值 raw 时 |min| 才是上界，旧守卫低估会恒走快路径差 4 ulp）；`_choices_lookup` 键按符号取 int64/uint64 与 raw 同 dtype 空间（防跨空间经 float64 提升 ≥2^53 判等错配）；`_text_array` 定宽按 **UTF-8 字节数**（按字符数定宽会对非 ASCII 文本（GBK 中文）截断）；
+  7. >64 位信号截断位序：大端取位流**末 64 位**（`pos += length−64`）、小端从 pos 起 64 位（pos 不动），且仅 length>64 时调整（length≤64 时偏移为负会错取字边界）；
+  8. `_decode_bucket_reference` 用归一化键（含 EFF 位）调用 `decode_message`，与 feed/参考实现键契约一致；
+  9. 性能脚本：brief 的 `from tests.test_golden import BINDING` 因 test_golden 内部 `from conftest import ...`（conftest 非顶层模块）ImportError，改为 `sys.path.insert(0, "tests")` 后从 `test_golden` 导入**同一 BINDING 常量**；另叠加 `progress_cb` 阶段计时（回调 14 次，开销可忽略）以得到分阶段实测；golden BINDING 与 GUI 默认（ch15=VDCPublic_CANFD2）相比用 CAN2=VDCCIDC_CANFD（样例 BLF 有数据通道 0,1,2,3,6,8,9,10,11,12,13,14，CAN2 有数据而 CAN15 无），10 个绑定均为有数据通道。

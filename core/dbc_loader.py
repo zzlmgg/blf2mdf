@@ -16,6 +16,9 @@ class SignalDef:
     is_signed: bool = False
     is_float: bool = False
     choices: dict | None = None     # {原始值: 文本}（DBC value table，修复项 3）
+    byte_order: str = "big_endian"  # cantools: "little_endian"/"big_endian"（方案C 位提取）
+    is_multiplexer: bool = False    # 是否为 mux 选择信号（方案C）
+    multiplexer_ids: list[int] | None = None   # 子信号激活的 mux 值集合；None=常活跃（方案C）
 
 
 @dataclass
@@ -78,6 +81,10 @@ def load(path: str) -> DbcDef:
                     is_float=bool(s.is_float),
                     choices=({k: str(v) for k, v in s.choices.items()}
                              if s.choices else None),
+                    byte_order=str(s.byte_order),
+                    is_multiplexer=bool(s.is_multiplexer),
+                    multiplexer_ids=(sorted(s.multiplexer_ids)
+                                     if s.multiplexer_ids is not None else None),
                 )
                 for s in msg.signals
             ],
