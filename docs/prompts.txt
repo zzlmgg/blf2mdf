@@ -8,5 +8,18 @@
 ————————————————
 
 
-
-outputs 中的 golden... mdf  文件是什么？为什么有350MB这么大？inputs/mdf 中我用CANOE转换的 mdf 只有 5MB
+0、当前的dbc来源是 inputs/dbc，这部分dbc来源可以作废了，新方案的dbc来源是inputs/dbc_ccu3.0中各个项目文件夹（如AH8, A02...）目录中的dbc文件；
+1、当前需要手动从“DBC矩阵文件”中点击“添加DBC”来选择DBC。我要改为：
+直接从“ccu3.0项目”下拉框选择项目（项目在 inputs/dbc_ccu3.0 中的），即可把项目文件夹中的各个dbc文件全部读进来；
+2、从项目文件夹读入dbc文件后，按照以下的“通道——dbc”的映射关系进行映射：
+VDCCCU_CANFD1——CFCAN1——CAN13
+VDCCCU_CANFD2——CFCAN2——CAN3
+VDCCCU_CANFD3——CFCAN3——CAN6
+VDCCIDC_CANFD——IFCAN——CAN12
+VDCPublic_CANFD1——PFCAN1——CAN1
+VDCPublic_CANFD2——PFCAN2——CAN15
+VDCCZF_CANFD——ZFCANF——CAN8
+VDCCZL_CANFD——ZFCANL——CAN9
+VDCCZR_CANFD——ZFCANR——CAN10
+VDCCZT_CANFD——ZFCANT——CAN11
+1、我要把当前项目中 inputs/dbc 中的 dbc 映射到 inputs/dbc_ccu3.0 中各个项目

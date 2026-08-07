@@ -77,6 +77,15 @@ def test_load_malformed_dbc_raises_with_path(tmp_path):
     assert str(p) in str(excinfo.value)
 
 
+def test_load_dbc_with_trailing_nul_padding(tmp_path):
+    """固定缓冲导出的 DBC 尾部 NUL 填充应剥离后正常解析（A19G1/CFCAN2 场景：
+    尾部 734 个 \\x00，cantools 当文本解析报 Invalid syntax at line 4100）。"""
+    p = tmp_path / "padded.dbc"
+    p.write_bytes(INLINE_DBC.encode("utf-8") + b"\x00" * 734)
+    dbc = load(str(p))
+    assert 100 in dbc.messages
+
+
 def test_signal_metadata_fields(tmp_path):
     """SignalDef 扩展字段：byte_order/多路复用信息（方案C向量化解码需要）。"""
     dbc_txt = '''VERSION ""

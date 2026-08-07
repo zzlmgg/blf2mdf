@@ -14,3 +14,6 @@ venv/
 
 # 环境配置
 .vscode/
+
+# 文档
+*superpower*

@@ -37,12 +37,10 @@ class DbcDef:
     messages: dict[int, MessageDef] = field(default_factory=dict)
 
 
-def _detect_encoding(path: str) -> str:
+def _detect_encoding(raw: bytes) -> str:
     """DBC 文件编码探测：项目 DBC 含 GBK 中文（CANoe 按 GBK 解析出正确文本，
     cantools 默认 latin-1 会乱码，如 'Normal£»' 应为 'Normal；'）。
     UTF-8 可整体解码 → utf-8；否则按 GBK（GBK 的中文字节序列基本非法 UTF-8）。"""
-    with open(path, "rb") as f:
-        raw = f.read()
     try:
         raw.decode("utf-8")
         return "utf-8"
@@ -53,8 +51,13 @@ def _detect_encoding(path: str) -> str:
 def load(path: str) -> DbcDef:
     import cantools
 
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 兼容导出器固定缓冲写出的尾部 NUL 填充（实测 A19G1/CFCAN2.dbc 尾部
+    # 734 个 \x00；cantools 把 NUL 当文本解析会报 Invalid syntax at line N）
+    raw = raw.rstrip(b"\x00")
     try:
-        db = cantools.database.load_file(path, encoding=_detect_encoding(path))
+        db = cantools.database.load_string(raw.decode(_detect_encoding(raw)))
     except Exception as e:
         raise ValueError(f"failed to parse DBC '{path}': {e}") from e
     messages = {}

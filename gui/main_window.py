@@ -9,46 +9,34 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from core import blf_reader
+from core import blf_reader, project_loader
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
 
 UNBOUND = "不绑定"
 
+
+class DbcCombo(QComboBox):
+    """「DBC 矩阵」列下拉：忽略鼠标滚轮，防悬停误触改绑（滚轮事件冒泡给表格）。
+
+    下拉选择只应通过点击/键盘完成；滚轮悬停改选是误改绑定的常见来源。
+    """
+
+    def wheelEvent(self, event):
+        event.ignore()
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ccu3.0 DBC 数据源：inputs/dbc_ccu3.0/<项目>/*.dbc + 同目录映射文件
+CCU3_ROOT = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
+CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt"
+
+PROJECT_PLACEHOLDER = "选择项目…"  # 项目下拉首项（禁用占位，仅提示）
 
 # 调试用默认 BLF：启动时若文件存在则自动加载，免去每次手动选择
 DEFAULT_BLF = (r"E:\projects\blf_dbc\inputs\blf"
                r"\ACFCANPUB_20260722_104000_59489600"
                r"-ACFCANPUB_20260722_104930_59489619.blf")
-
-# 调试用默认 DBC：启动时自动加入「DBC 矩阵文件」列表（inputs/dbc 下，存在才加载）
-DEFAULT_DBCS = [
-    "VDCPublic_CANFD1.dbc",  # public_CANFD1
-    "VDCCCU_CANFD2.dbc",     # CCU_CANFD2
-    "VDCCCU_CANFD3.dbc",     # CCU_CANFD3
-    "VDCCZF_CANFD.dbc",      # CZF_CANFD
-    "VDCCZL_CANFD.dbc",      # CZL_CANFD
-    "VDCCZR_CANFD.dbc",      # CZR_CANFD
-    "VDCCZT_CANFD.dbc",      # CZT_CANFD
-    "VDCCIDC_CANFD.dbc",     # CCU_IDC_CANFD
-    "VDCCCU_CANFD1.dbc",     # CCU_CANFD1
-    "VDCPublic_CANFD2.dbc",  # public_CANFD2
-]
-
-# 调试用默认通道绑定：CANn → DBC 文件名（DBC 未加载或通道不存在时自动跳过）
-DEFAULT_BINDINGS = {
-    1: "VDCPublic_CANFD1.dbc",  # CAN1—public_CANFD1
-    3: "VDCCCU_CANFD2.dbc",     # CAN3—CCU_CANFD2
-    6: "VDCCCU_CANFD3.dbc",     # CAN6—CCU_CANFD3
-    8: "VDCCZF_CANFD.dbc",      # CAN8—CZF_CANFD
-    9: "VDCCZL_CANFD.dbc",      # CAN9—CZL_CANFD
-    10: "VDCCZR_CANFD.dbc",     # CAN10—CZR_CANFD
-    11: "VDCCZT_CANFD.dbc",     # CAN11—CZT_CANFD
-    12: "VDCCIDC_CANFD.dbc",    # CAN12—CCU_IDC_CANFD
-    13: "VDCCCU_CANFD1.dbc",    # CAN13—CCU_CANFD1
-    15: "VDCPublic_CANFD2.dbc", # CAN15—public_CANFD2
-}
 
 
 class ConvertWorker(QObject):
@@ -81,9 +69,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BLF → MDF 转换")
-        self.resize(760, 640)
+        # 启动默认 760×920；加载 BLF 后窗口高度自动贴合内容（_fit_window_height）：
+        # 通道匹配表格固定 = 表头 + 各行高 + 余量（「刚好 N 行多一丢丢」），
+        # 结果摘要固定 ≈46px（≈ 默认布局下 277px 的 1/6），不再抢高度
+        self.resize(760, 920)
         self.blf_path = None
+        # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
+        self.blf_channels: list[int] = []
         self.dbc_list: list[DbcDef] = []
+        # 当前项目的自动绑定建议 {通道: DBC 文件名}；未选项目为 None。
+        # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
+        self.auto_bind: dict[int, str] | None = None
+        self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
         self.worker_thread: QThread | None = None
 
         central = QWidget()
@@ -101,9 +98,14 @@ class MainWindow(QMainWindow):
         row.addWidget(btn_blf)
         v.addLayout(row)
 
-        # 第二排：左 = DBC 矩阵文件，右 = 通道匹配
+        # 第二排：左 = ccu3.0 项目 + DBC 矩阵文件，右 = 通道匹配
         middle = QHBoxLayout()
         left_col = QVBoxLayout()
+        # ccu3.0 项目：选项目 = 读入该项目全部 DBC 并按映射自动匹配通道
+        left_col.addWidget(QLabel("ccu3.0 项目"))
+        self.project_combo = QComboBox()
+        self.project_combo.currentTextChanged.connect(self._select_project)
+        left_col.addWidget(self.project_combo)
         left_col.addWidget(QLabel("DBC 矩阵文件"))
         self.dbc_list_widget = QListWidget()
         left_col.addWidget(self.dbc_list_widget, 1)
@@ -133,7 +135,9 @@ class MainWindow(QMainWindow):
         self.raw_check.setChecked(False)
         right_col.addWidget(self.raw_check)
         middle.addLayout(right_col, 0)  # 右栏：通道表（总宽=三列列宽之和，余宽全给左侧 DBC 列表）
-        v.addLayout(middle, 11)  # 第二排合计垂直额外空间 11/12
+        # 中排高度由固定高的通道表决定（_fit_table_height 按行数计算），
+        # 不参与额外空间分配；窗口高度在加载后由 _fit_window_height 贴合内容
+        v.addLayout(middle)
 
         # 输出路径
         out_row = QHBoxLayout()
@@ -159,15 +163,20 @@ class MainWindow(QMainWindow):
         self.stage_label = QLabel("")
         v.addWidget(self.stage_label)
 
-        # 摘要（只读，压缩到约 1/12 额外空间 = 原来的 1/4）
+        # 摘要（只读）：固定 ≈46px（默认布局下原 277px 的 1/6），不抢高度；
+        # 内容超出时内部滚动
         v.addWidget(QLabel("结果摘要"))
         self.summary = QPlainTextEdit()
         self.summary.setReadOnly(True)
-        v.addWidget(self.summary, 1)  # 额外空间分配 1/12
+        self.summary.setFixedHeight(46)
+        v.addWidget(self.summary)
 
-        # 便于调试：默认 DBC/BLF 存在则自动加载（不存在时静默跳过，不打断启动）；
-        # DBC 先加载，BLF 加载重建通道表时下拉框已含这些 DBC
-        self._load_default_dbcs()
+        # 项目下拉：占位首项禁用，列表 = dbc_ccu3.0 下含 DBC 的项目文件夹；
+        # BLF 便于调试自动加载（不存在时静默跳过，不打断启动）
+        self.project_combo.addItem(PROJECT_PLACEHOLDER)
+        self.project_combo.model().item(0).setEnabled(False)
+        for name in project_loader.list_projects(CCU3_ROOT):
+            self.project_combo.addItem(name)
         if Path(DEFAULT_BLF).exists():
             self._load_blf(DEFAULT_BLF)
 
@@ -191,6 +200,7 @@ class MainWindow(QMainWindow):
             return
         self.blf_path = path
         self.blf_edit.setText(path)
+        self.blf_channels = channels
         self._rebuild_channel_table(channels)
         self._set_default_output()
         self.convert_btn.setEnabled(True)
@@ -201,41 +211,63 @@ class MainWindow(QMainWindow):
         out_dir.mkdir(parents=True, exist_ok=True)
         self.out_edit.setText(str(out_dir / f"{datetime.now():%Y%m%d_%H%M%S}.mdf"))
 
-    def _rebuild_channel_table(self, channels: list[int]):
-        # 记录现有绑定选择，重建后恢复（添加/移除 DBC 时不丢失用户选择）
+    def _rebuild_channel_table(self, channels: list[int],
+                               auto: dict[int, str] | None = None,
+                               keep_prev: bool = True):
+        """重建通道表。绑定优先级：
+
+        1. auto（选项目时传入）：标准映射为准，覆盖旧选择——
+           选项目 = 重新套用该项目的自动匹配，用户事后微调；
+        2. prev（keep_prev=True 时记录）：添加/移除 DBC 不丢失用户选择；
+        3. self.auto_bind：已选项目但 BLF 后加载时的兜底（此时无 prev）。
+
+        行集合 = BLF 通道 ∪ 映射通道：映射是完整规格（如 PFCAN2—CAN15），
+        日志中无数据的映射通道也显示（状态「无数据」），不让匹配对静默缺失。
+        """
+        blf_channels = set(channels)
+        mapped = set(self.auto_bind or {})
+        all_channels = sorted(blf_channels | mapped)
         prev = {}
-        for r in range(self.table.rowCount()):
-            combo = self.table.cellWidget(r, 1)
-            if combo is not None and self.table.item(r, 0) is not None:
-                prev[self.table.item(r, 0).text()] = combo.currentText()
+        if keep_prev:
+            for r in range(self.table.rowCount()):
+                combo = self.table.cellWidget(r, 1)
+                if combo is not None and self.table.item(r, 0) is not None:
+                    prev[self.table.item(r, 0).text()] = combo.currentText()
         self.table.setRowCount(0)
-        for ch in channels:
+        for ch in all_channels:
             row = self.table.rowCount()
             self.table.insertRow(row)
             name = f"CAN{ch}"
             self.table.setItem(row, 0, QTableWidgetItem(name))
-            self.table.setItem(row, 2, QTableWidgetItem("原始"))
-            combo = QComboBox()
+            self.table.setItem(row, 2, QTableWidgetItem(
+                "无数据" if ch not in blf_channels else "原始"))
+            combo = DbcCombo()
             combo.addItem(UNBOUND)
             for dbc in self.dbc_list:
                 combo.addItem(Path(dbc.path).name)
-            if name in prev:
-                valid = [combo.itemText(i) for i in range(combo.count())]
-                if prev[name] in valid:
-                    combo.setCurrentText(prev[name])
-            else:
-                # 首次加载：套用调试默认绑定（DBC 已加载且该通道存在时）
-                default = DEFAULT_BINDINGS.get(ch)
-                if default:
-                    valid = [combo.itemText(i) for i in range(combo.count())]
-                    if default in valid:
-                        combo.setCurrentText(default)
+            valid = [combo.itemText(i) for i in range(combo.count())]
+            # auto/self.auto_bind 键为 int 通道号（与 auto_bindings 契约一致）；
+            # prev 键为 "CANn" 字符串（来自表格显示名）。键型不可混用。
+            if auto is not None and ch in auto and auto[ch] in valid:
+                combo.setCurrentText(auto[ch])
+            elif name in prev and prev[name] in valid:
+                combo.setCurrentText(prev[name])
+            elif self.auto_bind is not None and ch in self.auto_bind \
+                    and self.auto_bind[ch] in valid:
+                combo.setCurrentText(self.auto_bind[ch])
             self.table.setCellWidget(row, 1, combo)
             combo.currentIndexChanged.connect(
                 lambda _idx, r=row: self._update_status(r)
             )
-            self._update_status(row)
+            if ch not in blf_channels:
+                # 无数据行保持「无数据」；用户手动改下拉后由信号接管为绑定态
+                self.table.item(row, 2).setText("无数据")
+            else:
+                self._update_status(row)
         self._apply_column_widths()
+        self._fit_table_height()
+        if self.table.rowCount():
+            self._fit_window_height()
 
     def _apply_column_widths(self):
         """通道匹配列宽：原默认列宽（760px 面板下 100/100/261）按 0.7/2.0/0.3 缩放。
@@ -248,6 +280,26 @@ class MainWindow(QMainWindow):
         for i, (base, ratio) in enumerate(zip((100, 100, 261), (0.7, 2.0, 0.3))):
             hdr.resizeSection(i, max(1, int(base * ratio)))
         self._fit_table_width()
+
+    def _fit_table_height(self):
+        """通道表高度 = 表头 + 各行 + 少量余量（「刚好 N 行多一丢丢」）。
+
+        固定高度保证所有通道行完整可见、永不出垂直滚动条；行数变化
+        （不同 BLF/映射）时自动跟随。余量 8px ≈ 四分之一行高（行高 30px）。
+        """
+        content = (self.table.horizontalHeader().sizeHint().height()
+                   + sum(self.table.rowHeight(r) for r in range(self.table.rowCount()))
+                   + 2 * self.table.frameWidth())
+        self.table.setFixedHeight(content + 8)
+
+    def _fit_window_height(self):
+        """窗口高度贴合内容：表与摘要均固定后，布局最小高度即理想内容高。
+
+        底部不再有固定 920 窗口留下的空白；用户仍可手动拉高窗口（多余
+        空间留白），加载其他行数的 BLF 时自动重新贴合。
+        """
+        v = self.centralWidget().layout()
+        self.resize(self.width(), v.minimumSize().height())
 
     def _fit_table_width(self):
         """通道表总宽 = 三列列宽之和 + 行号表头 + 边框（垂直滚动条可见时再补其宽度）。
@@ -290,17 +342,28 @@ class MainWindow(QMainWindow):
                 self.dbc_list_widget.addItem(f"{Path(p).name}    {Path(p).parent}")
             except Exception as e:  # noqa: BLE001
                 QMessageBox.critical(self, "DBC 解析失败", f"{p}\n{e}")
-        channels = [int(self.table.item(r, 0).text()[3:])
-                    for r in range(self.table.rowCount())]
-        self._rebuild_channel_table(channels)
+        self._rebuild_channel_table(self.blf_channels)
 
-    def _load_default_dbcs(self):
-        """调试用：把 inputs/dbc 下的默认 DBC 自动加入列表（不存在的跳过）。"""
-        dbc_dir = PROJECT_ROOT / "inputs" / "dbc"
-        paths = [str(dbc_dir / name) for name in DEFAULT_DBCS
-                 if (dbc_dir / name).exists()]
-        if paths:
-            self._load_dbcs(paths)
+    def _select_project(self, name: str):
+        """选择 ccu3.0 项目：读入该项目全部 DBC（替换现有列表）→ 按映射自动匹配。
+
+        任一个 DBC 解析失败则整体放弃（列表保持不变），并回退下拉选择。
+        """
+        if not name or name == PROJECT_PLACEHOLDER:
+            return
+        try:
+            dbcs = project_loader.load_project(CCU3_ROOT, name)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "DBC 加载失败", f"{name}\n{e}")
+            self.project_combo.setCurrentIndex(0)
+            return
+        self.dbc_list = dbcs
+        self.dbc_list_widget.clear()
+        for d in dbcs:
+            self.dbc_list_widget.addItem(f"{Path(d.path).name}    {Path(d.path).parent}")
+        self.auto_bind = project_loader.auto_bindings(dbcs, self.mapping)
+        self._rebuild_channel_table(self.blf_channels, auto=self.auto_bind,
+                                    keep_prev=False)
 
     def _remove_dbc(self):
         row = self.dbc_list_widget.currentRow()
@@ -308,9 +371,7 @@ class MainWindow(QMainWindow):
             return
         self.dbc_list.pop(row)
         self.dbc_list_widget.takeItem(row)
-        channels = [int(self.table.item(r, 0).text()[3:])
-                    for r in range(self.table.rowCount())]
-        self._rebuild_channel_table(channels)
+        self._rebuild_channel_table(self.blf_channels)
 
     def _pick_out(self):
         path, _ = QFileDialog.getSaveFileName(self, "选择输出文件", "",
