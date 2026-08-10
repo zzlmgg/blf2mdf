@@ -149,8 +149,8 @@ def _dbc(path: str) -> DbcDef:
 def test_auto_bindings_standard():
     dbcs = [_dbc(fr"x\{k}.dbc") for k in EXPECTED_MAPPING]
     got = project_loader.auto_bindings(dbcs, EXPECTED_MAPPING)
-    # {通道: 文件名}，通道来自映射
-    assert got == {v: f"{k}.dbc" for k, v in EXPECTED_MAPPING.items()}
+    # {通道: 显示名}（含文件夹后缀），通道来自映射
+    assert got == {v: f"{k}.dbc（x）" for k, v in EXPECTED_MAPPING.items()}
 
 
 def test_auto_bindings_missing_dbc_file():
@@ -158,11 +158,11 @@ def test_auto_bindings_missing_dbc_file():
     dbcs = [_dbc(fr"x\{k}.dbc") for k in EXPECTED_MAPPING if k != "PFCAN2"]
     got = project_loader.auto_bindings(dbcs, EXPECTED_MAPPING)
     assert 15 not in got
-    assert got[13] == "CFCAN1.dbc"
+    assert got[13] == "CFCAN1.dbc（x）"
 
 
 def test_auto_bindings_unknown_dbc_ignored():
     """映射表之外的 DBC 读入列表但不参与自动绑定。"""
     dbcs = [_dbc(r"x\CFCAN1.dbc"), _dbc(r"x\NEWBUS.dbc")]
     got = project_loader.auto_bindings(dbcs, EXPECTED_MAPPING)
-    assert got == {13: "CFCAN1.dbc"}
+    assert got == {13: "CFCAN1.dbc（x）"}

@@ -27,26 +27,27 @@ def window(qapp):
 
 
 def _d(name: str) -> DbcDef:
-    return DbcDef(path=str(Path("x") / name), db=None)
+    # 显示名 = 文件名 + 所在文件夹（如 PFCAN1.dbc（A19G1））
+    return DbcDef(path=str(Path("A19G1") / name), db=None)
 
 
 def test_project_select_applies_auto_bindings(window):
     """选项目（auto=int 键映射）后，表格每行按映射选中对应 DBC。"""
     window.dbc_list = [_d("PFCAN1.dbc"), _d("CFCAN1.dbc")]
-    window._rebuild_channel_table([1, 13], auto={1: "PFCAN1.dbc",
-                                                 13: "CFCAN1.dbc"},
+    window._rebuild_channel_table([1, 13], auto={1: "PFCAN1.dbc（A19G1）",
+                                                 13: "CFCAN1.dbc（A19G1）"},
                                   keep_prev=False)
-    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc"
-    assert window.table.cellWidget(1, 1).currentText() == "CFCAN1.dbc"
+    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc（A19G1）"
+    assert window.table.cellWidget(1, 1).currentText() == "CFCAN1.dbc（A19G1）"
     assert window.table.item(0, 2).text() == "已绑定"
 
 
 def test_auto_bind_fallback_after_blf_load(window):
     """BLF 晚于项目加载：无 auto 参数时由 self.auto_bind（int 键）兜底。"""
     window.dbc_list = [_d("PFCAN1.dbc")]
-    window.auto_bind = {1: "PFCAN1.dbc"}
+    window.auto_bind = {1: "PFCAN1.dbc（A19G1）"}
     window._rebuild_channel_table([1])
-    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc"
+    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc（A19G1）"
 
 
 def test_prev_selection_preserved_on_rebuild(window):
@@ -54,15 +55,15 @@ def test_prev_selection_preserved_on_rebuild(window):
     window.dbc_list = [_d("PFCAN1.dbc"), _d("CFCAN1.dbc")]
     window._rebuild_channel_table([1])
     combo = window.table.cellWidget(0, 1)
-    combo.setCurrentText("CFCAN1.dbc")
+    combo.setCurrentText("CFCAN1.dbc（A19G1）")
     window._rebuild_channel_table([1])  # keep_prev=True 默认
-    assert window.table.cellWidget(0, 1).currentText() == "CFCAN1.dbc"
+    assert window.table.cellWidget(0, 1).currentText() == "CFCAN1.dbc（A19G1）"
 
 
 def test_auto_bind_missing_dbc_keeps_unbound(window):
     """auto 映射的 DBC 不在列表（AH8 缺 PFCAN2 场景）→ 保持不绑定。"""
     window.dbc_list = [_d("PFCAN1.dbc")]
-    window._rebuild_channel_table([15], auto={15: "PFCAN2.dbc"},
+    window._rebuild_channel_table([15], auto={15: "PFCAN2.dbc（A19G1）"},
                                   keep_prev=False)
     assert window.table.cellWidget(0, 1).currentText() == "不绑定"
 
@@ -71,18 +72,45 @@ def test_mapping_channel_missing_from_blf_row_added(window):
     """映射通道不在 BLF（样例 BLF 无 CAN15）：仍显示该行并绑定，
     状态标记「无数据」——映射是完整规格，不能静默缺失。"""
     window.dbc_list = [_d("PFCAN2.dbc"), _d("PFCAN1.dbc")]
-    window.auto_bind = {1: "PFCAN1.dbc", 15: "PFCAN2.dbc"}
+    window.auto_bind = {1: "PFCAN1.dbc（A19G1）", 15: "PFCAN2.dbc（A19G1）"}
     window._rebuild_channel_table([1])  # BLF 只有 CAN1
     rows = {window.table.item(r, 0).text(): r
             for r in range(window.table.rowCount())}
     assert "CAN15" in rows
     r15 = rows["CAN15"]
-    assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc"
+    assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc（A19G1）"
     assert window.table.item(r15, 2).text() == "无数据"
     # BLF 有的通道不受影响：CAN1 正常绑定
     r1 = rows["CAN1"]
-    assert window.table.cellWidget(r1, 1).currentText() == "PFCAN1.dbc"
+    assert window.table.cellWidget(r1, 1).currentText() == "PFCAN1.dbc（A19G1）"
     assert window.table.item(r1, 2).text() == "已绑定"
+
+
+def test_same_name_dbc_from_two_projects_distinguishable(window):
+    """同名 DBC 来自不同项目文件夹（A19G1/AH8 均有 PFCAN2.dbc）：
+    下拉两项并存、自动绑定与手动改选均命中各自文件，不互相串绑。
+
+    场景入口是「添加 DBC…」：选项目会整体替换列表，同名单项不会共存；
+    手动添加后两个 PFCAN2.dbc 同时入列，靠文件夹后缀区分。
+    """
+    a19 = DbcDef(path=str(Path("A19G1") / "PFCAN2.dbc"), db=None)
+    ah8 = DbcDef(path=str(Path("AH8") / "PFCAN2.dbc"), db=None)
+    window.dbc_list = [a19, ah8]
+    window._rebuild_channel_table([15], auto={15: "PFCAN2.dbc（A19G1）"},
+                                  keep_prev=False)
+    combo = window.table.cellWidget(0, 1)
+    items = [combo.itemText(i) for i in range(combo.count())]
+    assert "PFCAN2.dbc（A19G1）" in items
+    assert "PFCAN2.dbc（AH8）" in items
+    assert len(items) == len(set(items))  # 同名不同文件夹 = 两项，不合并
+    # 自动绑定选中 A19G1 那份
+    assert combo.currentText() == "PFCAN2.dbc（A19G1）"
+    # 手动改选 AH8 那份 → 转换回查精确命中 AH8 的文件对象（非同名误绑）
+    combo.setCurrentText("PFCAN2.dbc（AH8）")
+    assert window._dbc_by_display(combo.currentText()) is ah8
+    assert window._dbc_by_display("PFCAN2.dbc（A19G1）") is a19
+    # 防御：未知显示名（如界面状态异常）→ None，不抛 StopIteration
+    assert window._dbc_by_display("PFCAN2.dbc（X）") is None
 
 
 def test_dbc_combo_ignores_mouse_wheel(window):
@@ -94,7 +122,7 @@ def test_dbc_combo_ignores_mouse_wheel(window):
     window.dbc_list = [_d("PFCAN1.dbc"), _d("PFCAN2.dbc")]
     window._rebuild_channel_table([1])
     combo = window.table.cellWidget(0, 1)
-    combo.setCurrentText("PFCAN1.dbc")
+    combo.setCurrentText("PFCAN1.dbc（A19G1）")
     combo.setFocus()
     ev = QWheelEvent(
         QPointF(50, 50), QPointF(50, 50),   # pos, globalPos
@@ -102,7 +130,7 @@ def test_dbc_combo_ignores_mouse_wheel(window):
         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
         Qt.ScrollPhase.NoScrollPhase, False)
     QApplication.sendEvent(combo, ev)
-    assert combo.currentText() == "PFCAN1.dbc"
+    assert combo.currentText() == "PFCAN1.dbc（A19G1）"
 
 
 def test_channel_table_shows_all_rows_without_scrollbar(window):
@@ -334,12 +362,13 @@ def test_project_switch_drops_stale_mapped_row(window):
     """
     window.dbc_list = [_d("PFCAN1.dbc")]
     window.blf_channels = [1]  # 真实 BLF 只有 CAN1
-    window.auto_bind = {1: "PFCAN1.dbc", 15: "PFCAN1.dbc"}  # 项目 A：映射含 15
+    # 项目 A：映射含 15
+    window.auto_bind = {1: "PFCAN1.dbc（A19G1）", 15: "PFCAN1.dbc（A19G1）"}
     window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
                                   keep_prev=False)
     assert [window.table.item(r, 0).text()
             for r in range(window.table.rowCount())] == ["CAN1", "CAN15"]
-    window.auto_bind = {1: "PFCAN1.dbc"}  # 项目 B：映射不含 15
+    window.auto_bind = {1: "PFCAN1.dbc（A19G1）"}  # 项目 B：映射不含 15
     window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
                                   keep_prev=False)
     assert [window.table.item(r, 0).text()

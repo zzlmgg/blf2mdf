@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
@@ -55,21 +55,22 @@ class ConvertWorker(QObject):
     done = Signal(object)
     error = Signal(str)
 
-    def __init__(self, blf_path, bindings, out_path, raw_export):
+    def __init__(self, blf_path, bindings, out_path):
         super().__init__()
         self.blf_path = blf_path
         self.bindings = bindings
         self.out_path = out_path
-        self.raw_export = raw_export
 
     @Slot()
     def run(self):
         try:
             # 方案 G：GUI 默认开并行解码（per-bucket 多进程 finish，实测净省
             # ~5.4s）；内部自动回退串行（池失败/内存阈值），正确性零损失。
+            # 原始帧导出已从面板移除，GUI 固定关闭（与 CANoe 导出一致）；
+            # converter 的 raw_export 参数保留供库层/测试使用。
             result = convert(self.blf_path, self.bindings, self.out_path,
                              progress_cb=lambda s, p: self.progress.emit(s, p),
-                             raw_export=self.raw_export,
+                             raw_export=False,
                              parallel=True)
             self.done.emit(result)
         except Exception as e:  # noqa: BLE001 — 界面层兜底
@@ -116,7 +117,7 @@ class MainWindow(QMainWindow):
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
         self.blf_channels: list[int] = []
         self.dbc_list: list[DbcDef] = []
-        # 当前项目的自动绑定建议 {通道: DBC 文件名}；未选项目为 None。
+        # 当前项目的自动绑定建议 {通道: DBC 显示名}；未选项目为 None。
         # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
         self.auto_bind: dict[int, str] | None = None
         self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
@@ -182,11 +183,6 @@ class MainWindow(QMainWindow):
         self.table.verticalScrollBar().rangeChanged.connect(
             lambda *_: self._fit_table_width())
         right_col.addWidget(self.table, 1)
-        # 修复项 5：原始帧导出选项化，默认关闭（与 CANoe 导出一致）；
-        # 勾选后未绑定 DBC 的通道以 Raw::CANn 组导出（converter.raw_export）
-        self.raw_check = QCheckBox("导出未绑定通道的原始帧")
-        self.raw_check.setChecked(False)
-        right_col.addWidget(self.raw_check)
         middle.addLayout(right_col, 0)  # 右栏：通道表（总宽=三列列宽之和，余宽全给左侧 DBC 列表）
         # 中排高度由固定高的通道表决定（_fit_table_height 恒为 16 行上限），
         # 不参与额外空间分配；窗口高度在 __init__ 末尾贴合一次后不再变动
@@ -365,7 +361,7 @@ class MainWindow(QMainWindow):
             combo = DbcCombo()
             combo.addItem(UNBOUND)
             for dbc in self.dbc_list:
-                combo.addItem(Path(dbc.path).name)
+                combo.addItem(dbc.display_name)
             valid = [combo.itemText(i) for i in range(combo.count())]
             # auto/self.auto_bind 键为 int 通道号（与 auto_bindings 契约一致）；
             # prev 键为 "CANn" 字符串（来自表格显示名）。键型不可混用。
@@ -531,20 +527,29 @@ class MainWindow(QMainWindow):
             if text == UNBOUND:
                 bindings[ch] = None
             else:
-                bindings[ch] = next(d for d in self.dbc_list
-                                    if Path(d.path).name == text)
+                bindings[ch] = self._dbc_by_display(text)
         self._set_busy(True)
         self.progress.setValue(0)
         self.summary.clear()
         self.worker_thread = QThread()
-        self.worker = ConvertWorker(self.blf_path, bindings, out,
-                                    self.raw_check.isChecked())
+        self.worker = ConvertWorker(self.blf_path, bindings, out)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.done.connect(self._on_done)
         self.worker.error.connect(self._on_error)
         self.worker_thread.start()
+
+    def _dbc_by_display(self, text: str) -> DbcDef | None:
+        """按下拉显示名（文件名 + 文件夹，如 PFCAN2.dbc（AH8））回查 DbcDef。
+
+        同名 DBC 来自不同项目文件夹时，显示名以文件夹后缀区分（A19G1 与
+        AH8 均有 PFCAN2.dbc），逐项比对显示名即可精确命中各自文件；
+        下拉选项全部由 dbc_list 生成，理论上必有匹配，返回 None 仅为
+        防御（状态异常时按未绑定处理，不抛 StopIteration）。
+        """
+        return next((d for d in self.dbc_list if d.display_name == text),
+                    None)
 
     def _set_busy(self, busy: bool):
         self.convert_btn.setEnabled(not busy)
@@ -568,13 +573,8 @@ class MainWindow(QMainWindow):
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")
             else:
-                if self.worker.raw_export:
-                    line = f"CAN{s.channel} 未绑定: 原始帧 {s.raw_frames} 帧"
-                    if s.unknown_frames:
-                        line += f" · DBC 未匹配丢弃 {s.unknown_frames} 帧 ({s.unknown_ids} 个 ID)"
-                else:
-                    line = f"CAN{s.channel} 未绑定: 原始帧导出关闭"
-                lines.append(line)
+                # 原始帧导出已从面板移除（固定关闭，与 CANoe 一致）
+                lines.append(f"CAN{s.channel} 未绑定: 原始帧导出关闭")
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")
         self.summary.setPlainText("\n".join(lines))

@@ -1,6 +1,7 @@
 """DBC 解析：一次一个文件，不合并。"""
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,16 @@ class DbcDef:
     path: str
     db: object  # cantools Database，保留给 decoder 用
     messages: dict[int, MessageDef] = field(default_factory=dict)
+
+    @property
+    def display_name(self) -> str:
+        """下拉显示名：文件名 + 所在文件夹，如 PFCAN1.dbc（A19G1）。
+
+        同名 DBC 分散在不同项目文件夹（A19G1/AH8 均有 PFCAN1.dbc）时，
+        靠文件夹名区分；通道匹配下拉与自动绑定建议共用此格式。
+        """
+        p = Path(self.path)
+        return f"{p.name}（{p.parent.name}）"
 
 
 def _detect_encoding(raw: bytes) -> str:

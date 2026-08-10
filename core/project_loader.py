@@ -103,15 +103,16 @@ def load_project(root: str | Path, project: str) -> list[DbcDef]:
 
 
 def auto_bindings(dbcs: list[DbcDef], mapping: dict[str, int]) -> dict[int, str]:
-    """按映射计算自动绑定建议 {通道号: DBC 文件名}。
+    """按映射计算自动绑定建议 {通道号: DBC 显示名}。
 
     仅含「映射表内且已加载」的 DBC；项目缺文件（如 AH8 无 PFCAN2.dbc）
-    或 DBC 不在映射表内时对应通道不出现，保持不绑定。文件名与 GUI
-    「DBC 矩阵」下拉的显示名一致（含 .dbc 后缀）。
+    或 DBC 不在映射表内时对应通道不出现，保持不绑定。显示名与 GUI
+    「DBC 矩阵」下拉一致（含 .dbc 后缀与所在文件夹名，如
+    PFCAN1.dbc（A19G1）），匹配直接以显示名比对。
     """
     result = {}
     for d in dbcs:
         ch = mapping.get(Path(d.path).stem)
         if ch is not None:
-            result[ch] = Path(d.path).name
+            result[ch] = d.display_name
     return result
