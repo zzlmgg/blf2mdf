@@ -112,9 +112,12 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     # 时间基准对齐 CANoe（修复项 2）：以 BLF 文件头测量开始时间归零
     # （与解码帧无关，实测 CANoe 基准 = 文件头 start_timestamp；
     # 若用最早解码帧会整体偏移——样例首解码帧晚于测量开始 2ms）；
-    # 绝对起始时间（整秒）由 write_mdf 写入 MDF 头部 start_time 保留。
+    # t 轴零点 = 起始的整数秒（CANoe 语义，实测首帧 t=0.628791498 反推），
+    # 绝对起始时间（含小数秒，修复 624ms 截断，BLF 头 SYSTEMTIME 毫秒精度）
+    # 全精度传给 write_mdf 写入 MDF 头部 start_time/abs_time。
     # BLFReader 初始化只读文件头，此处开销可忽略。
-    abs_start_epoch = int(blf_reader.read_start_time(blf_path))
+    abs_start_time = blf_reader.read_start_time(blf_path)
+    abs_start_epoch = int(abs_start_time)
 
     # 性能优化（方案 A）：单遍全文件扫描——一次遍历完成 解码输入路由 +
     # 统计输入收集，替代按通道逐遍重复解析整个文件（旧实现每绑定通道
@@ -242,7 +245,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             progress_cb("写 MDF", 95)
         try:
             mdf_writer.write_mdf(all_series, raw_groups, out_path,
-                                 abs_start_epoch=abs_start_epoch,
+                                 abs_start_seconds=abs_start_time,
                                  stats_groups=stats_groups)
         except Exception:
             # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：

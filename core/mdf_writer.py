@@ -1,7 +1,7 @@
 """MDF 4.10 写出：信号组 + 原始帧组 + 总线统计组。"""
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -33,23 +33,39 @@ class RawGroup:
 _MASTER_TIME = ("t", 1)
 
 
+def _abs_time_ns(dt: datetime) -> int:
+    """naive UTC datetime → 绝对纳秒（纯整数运算，不经 float）。
+
+    修复 624ms 截断（2026-08-10）：asammdf 的 abs_time = int(dt.timestamp()*1e9)
+    是 float 路径，1.78e18 ns 量级有 ±256ns 网格二次舍入风险（A19G1 实测恰好
+    精确，非通用保证）→ 直接用整数运算写出，与 CANoe 参考逐位一致。
+    """
+    days = (dt.date() - date(1970, 1, 1)).days
+    return ((days * 86400 + dt.hour * 3600 + dt.minute * 60 + dt.second)
+            * 1_000_000 + dt.microsecond) * 1_000
+
+
 def write_mdf(signal_series_list: list[SignalSeries],
               raw_groups: list[RawGroup], out_path: str,
-              abs_start_epoch: float | None = None,
+              abs_start_seconds: float | None = None,
               stats_groups: list[ChannelStats] | None = None) -> None:
     # asammdf 8.8：append 无 group_name 参数，组名 = ChannelGroup.acq_name；
     # 每次 append 新建一组，同一组的所有信号须一次传入（列表）。
     # 主时间通道名由首信号的 master_metadata 决定（默认 "time"），
     # 统一传 ("t", SYNC_TYPE_TIME) 与 CANoe 一致（修复项 6）。
     mdf = MDF(version="4.10")
-    if abs_start_epoch is not None:
-        # 修复项 2：MDF 头部 start_time = 绝对测量起始（naive UTC 整秒）。
+    if abs_start_seconds is not None:
+        # 修复项 2：MDF 头部 start_time = 绝对测量起始（naive UTC，保留小数秒——
+        # 修复 624ms 截断）。BLF 头 SYSTEMTIME 为毫秒精度，float64 表示误差
+        # ±119ns < 0.5µs，fromtimestamp 的 µs 恢复对 ms 量化值精确。
         # asammdf setter 对 naive datetime 按 UTC 计算 abs_time 并置
-        # FLAG_HD_LOCAL_TIME / tz_offset=0——与 CANoe 参考 _T058.mdf 逐字段一致
+        # FLAG_HD_LOCAL_TIME / tz_offset=0——与 CANoe 参考逐字段一致
         # （实测 roundtrip：abs_time/flags/tz 全同；时间戳数据不受影响）。
-        mdf.header.start_time = (
-            datetime.fromtimestamp(int(abs_start_epoch), tz=timezone.utc)
-            .replace(tzinfo=None))
+        start_dt = (datetime.fromtimestamp(abs_start_seconds, tz=timezone.utc)
+                    .replace(tzinfo=None))
+        mdf.header.start_time = start_dt
+        # abs_time 不经 asammdf 的 float 路径，用纯整数运算精确覆盖（见 _abs_time_ns）。
+        mdf.header.abs_time = _abs_time_ns(start_dt)
     used_groups = set()
 
     for s in signal_series_list:

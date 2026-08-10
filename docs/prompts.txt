@@ -36,3 +36,25 @@ ZFCANR——CAN10
 ZFCANT——CAN11
 也就是说，用户只需要从“ccu3.0项目”下拉框中选择 项目，就可以：自动读入该项目文件夹下的dbc文件，根据匹配关系自动完成匹配；
 3、仍然保留现在的一些功能（方便自动导入匹配后用户的自行操作）：“DBC矩阵文件”中的“添加DBC”和“移除选中”，“通道匹配”中的 DBC矩阵 列的选择下拉；
+
+
+
+
+——————————
+下面是两组 blf 文件分别用 canoe 和 我们的 main.py 转换的 mdf 数据：
+组别一：
+blf：‪E:\projects\blf_dbc\inputs\blf\A19G1_ACFCAN_00112_20260614_141114.blf
+canoe 转的 mdf：‪E:\projects\blf_dbc\inputs\mdf\A19G1.mdf
+main.py 转的 mdf：‪E:\projects\blf_dbc\outputs\A19G1_20260810_091651.mdf
+组别二：
+blf：‪E:\projects\blf_dbc\inputs\blf\AHT_ACFCANPUB_20260317_210430_59125089-ACFCAN_20260317_210930_59125099.blf
+canoe 转的 mdf：‪E:\projects\blf_dbc\inputs\mdf\AHT.mdf
+main.py 转的 mdf：‪E:\projects\blf_dbc\outputs\AHT_20260810_091751.mdf
+
+
+
+
+
+
+
+

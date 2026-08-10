@@ -44,21 +44,52 @@ def test_write_and_readback_signal_groups(tmp_path):
 
 
 def test_write_abs_start_time_metadata(tmp_path):
-    """修复项 2：abs_start_epoch 写入 MDF 头部 start_time（naive UTC 整秒，
-    与 CANoe 参考逐字段一致：abs_time/time_flags/tz_offset）；
-    已存相对时间戳数据不受影响。"""
+    """修复项 2：abs_start_seconds 写入 MDF 头部 start_time（naive UTC，保留小数秒
+    ——修复 624ms 截断；abs_time 用纯整数运算精确写出），与 CANoe 参考逐字段一致：
+    abs_time/start_time/time_flags/tz_offset；已存相对时间戳数据不受影响。"""
     from datetime import datetime
 
     s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [0.005, 1.005],
                 {"Speed": [10.0, 20.0]})
     out = tmp_path / "meta.mdf"
-    write_mdf([s], [], str(out), abs_start_epoch=1784716800.005)
+    write_mdf([s], [], str(out), abs_start_seconds=1784716800.005)
 
     m = MDF(str(out))
-    assert m.header.start_time == datetime(2026, 7, 22, 10, 40)
-    assert m.header.abs_time == 1784716800000000000
+    assert m.header.start_time == datetime(2026, 7, 22, 10, 40, 0, 5000)
+    assert m.header.abs_time == 1784716800005000000
     assert m.header.time_flags == 0x1 and m.header.tz_offset == 0
     assert np.allclose(m.get("t", group=0).samples, [0.005, 1.005])
+
+
+def test_write_abs_start_fractional_matches_canoe(tmp_path):
+    """A19G1 参考值回归：BLF 头 start=2026-06-14 19:07:00.624（SYSTEMTIME 毫秒
+    精度），CANoe 参考 mdf abs_time=1781464020624000000。修复前双重 int() 截断为
+    整秒（1781464020000000000，差 624ms）——修复后与 CANoe 逐位一致。"""
+    from datetime import datetime
+
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [0.0], {"Speed": [10.0]})
+    out = tmp_path / "canoe.mdf"
+    write_mdf([s], [], str(out), abs_start_seconds=1781464020.624)
+
+    m = MDF(str(out))
+    assert m.header.start_time == datetime(2026, 6, 14, 19, 7, 0, 624000)
+    assert m.header.abs_time == 1781464020624000000
+    assert m.header.time_flags == 0x1 and m.header.tz_offset == 0
+
+
+def test_write_abs_start_whole_second_unchanged(tmp_path):
+    """整秒起点（AHT 参考：1773781304.0 = 2026-03-17 21:01:44）：毫秒为 0 时
+    头部与修复前完全一致（防回归）。"""
+    from datetime import datetime
+
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [0.0], {"Speed": [10.0]})
+    out = tmp_path / "whole.mdf"
+    write_mdf([s], [], str(out), abs_start_seconds=1773781304.0)
+
+    m = MDF(str(out))
+    assert m.header.start_time == datetime(2026, 3, 17, 21, 1, 44)
+    assert m.header.abs_time == 1773781304000000000
+    assert m.header.time_flags == 0x1 and m.header.tz_offset == 0
 
 
 def test_write_without_abs_start_keeps_default_header(tmp_path):
