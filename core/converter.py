@@ -90,6 +90,10 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
 
     stats_export=True（默认，与 CANoe 一致）：输出 1s 总线统计组（修复项 4
     阶段 1，10 项 × 16 通道，覆盖 0-15 全部通道与 DBC 绑定无关）。
+
+    progress_cb(stage, percent) 进度刻度（percent 单调不降）：
+    读取 BLF 5→10（逐容器字节位置）、解码 CANn 10→90（并行按桶/串行按
+    通道）、聚合统计 CANn 92→95（逐通道）、写 MDF 95、完成 100。
     """
     channels = sorted(bindings)
     if not channels:
@@ -143,7 +147,11 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     try:
         if progress_cb:
             progress_cb("读取 BLF", 5)
-        for fr in blf_reader.iter_all_messages(blf_path):
+        # 读取阶段进度：字节位置 5→10（读取占大文件转换耗时大头——实测
+        # 35MB 样例 52s 里 50s 在读取，逐容器上报让进度条全程前进）
+        read_cb = (lambda f: progress_cb("读取 BLF", 5 + 5 * f / 100)) \
+            if progress_cb else None
+        for fr in blf_reader.iter_all_messages(blf_path, progress_cb=read_cb):
             ch = fr.channel
             if stats_export:
                 t, e, r, er = stats_bufs[ch]
@@ -232,7 +240,12 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 ts = stats_bufs.get(ch, ((), None, None, None))[0]
                 if ts:
                     global_end = max(global_end, max(ts))
-            for ch in stats_mod.STAT_CHANNELS:
+            n_stats = len(stats_mod.STAT_CHANNELS)
+            for i, ch in enumerate(stats_mod.STAT_CHANNELS):
+                # 逐通道上报 92→95：聚合 16 通道实测 ~1.4s，不再停在 92%
+                if progress_cb:
+                    progress_cb(f"聚合统计 CAN{ch}",
+                                92 + 3 * (i + 1) / n_stats)
                 t, e, r, er = stats_bufs.get(ch, ((), (), (), ()))
                 stats_groups.append(stats_mod.aggregate_channel(
                     np.asarray(t, dtype=np.float64),

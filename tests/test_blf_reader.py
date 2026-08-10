@@ -57,6 +57,29 @@ def test_list_channels_on_sample():
     print("样例 BLF 通道:", channels)
 
 
+def test_iter_all_messages_reports_monotonic_progress(tmp_path):
+    """iter_all_messages 的 progress_cb 按文件字节位置单调推进，最终 100%。
+
+    修复项：转换读取阶段（占大文件耗时大头）进度条需真实前进——逐容器
+    回调（与 list_channels 同一语义），而不是停在 5% 几十秒。
+    """
+    import can
+
+    p = tmp_path / "prog2.blf"
+    with can.BLFWriter(str(p)) as w:
+        for i in range(3):
+            w.on_message_received(can.Message(
+                arbitration_id=0x100 + i, data=b"\x01\x02",
+                channel=1 + i, timestamp=1784716800.0 + i))
+    values = []
+    frames = list(iter_all_messages(str(p), progress_cb=values.append))
+    assert len(frames) == 3
+    assert values, "至少一次进度回调"
+    assert values[-1] == 100.0, "读完应报 100%"
+    assert all(0.0 <= v <= 100.0 for v in values)
+    assert values == sorted(values), "进度应单调不降"
+
+
 def test_iter_all_messages_matches_iter_messages(tmp_path):
     """单遍全量流 = 各通道按通道过滤流之和（方案 A 路由正确性）。"""
     import can

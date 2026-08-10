@@ -114,8 +114,10 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
 
     - 调用方可在扫描前创建池并 warm_up（spawn 成本藏在扫描期）；
       pool=None 时内部创建（无预热，主要供测试/串行兜底对照用）。
-    - progress_cb(stage, percent)：每通道全部桶收齐后回调一次（GUI 语义
-      与现状一致），percent 单调。
+    - progress_cb(stage, percent)：每桶完成时实时回调一次（percent =
+      10 + 80 × 累计完成帧数 / 总帧数，随 as_completed 单调递增）；
+      失败桶在串行兜底完成后同样上报。修复：旧实现把全部上报推迟到
+      所有桶完成后按通道补齐 → 解码期间进度条停住、结束瞬间跳到 90%。
     - verify=True：组装结果与父进程本地串行 finish 全量对拍（测试用）。
     - 失败回退：任务异常/池损坏 → 未完成桶原地串行 finish，结果与全串行一致。
     """
@@ -148,6 +150,17 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
     # ── 提交 + 收集 ──
     results: dict[tuple[int, int], tuple[list, int, list[int]]] = {}
     failed: list[tuple[int, int, dict]] = []
+    total_frames = sum(t[3] for t in tasks)
+    done_frames = 0
+
+    def _report(ch: int, bucket: dict) -> None:
+        """每桶完成上报：percent = 10 + 80 × 累计帧数 / 总帧数（单调）。"""
+        nonlocal done_frames
+        done_frames += len(bucket["ts"])
+        if progress_cb and total_frames:
+            progress_cb(f"解码 CAN{ch}",
+                        10 + 80 * done_frames / total_frames)
+
     try:
         futures = {}
         for w, tlist in enumerate(bins):
@@ -163,6 +176,7 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                 failed.append((ch, arb, decoders[ch].buckets[arb]))
                 continue
             results[(ch, arb)] = (series, unk_frames, unk_ids)
+            _report(ch, decoders[ch].buckets[arb])
     except Exception:
         # BrokenProcessPool 等：未收齐的桶全部转串行
         done = set(results)
@@ -174,11 +188,12 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
         if owned:
             pool.shutdown(wait=True, cancel_futures=True)
 
-    # ── 串行兜底（结果与全串行一致）──
+    # ── 串行兜底（结果与全串行一致，兜底桶同样上报进度）──
     for ch, arb, bucket in failed:
         _, _, series, unk_frames, unk_ids = \
             _finish_bucket_worker(ch, arb, bucket, decoders[ch].dbc)
         results[(ch, arb)] = (series, unk_frames, unk_ids)
+        _report(ch, bucket)
 
     if verify:
         for ch in channels:
@@ -212,6 +227,4 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
             unknown_ids=feed.unknown_ids | unk_ids,
         )
         merged[ch] = (series, stats)
-        if progress_cb:
-            progress_cb(f"解码 CAN{ch}", 10 + 80 * len(merged) / len(channels))
     return merged

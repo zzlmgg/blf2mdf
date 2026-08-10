@@ -4,9 +4,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from core import blf_reader, project_loader
@@ -15,10 +16,20 @@ from core.dbc_loader import DbcDef, load
 
 UNBOUND = "不绑定"
 
-# 通道表固定高度基准：以 13 路 CAN 为准（样例文件最大行数：AHT 13 通道、
-# A19G1 12 通道 + 映射 CAN15）。表格按此预留高度 → 几何与行数无关、
-# 读取全程不跳动；行数超 13（理论场景）时出现垂直滚动条。
-_TABLE_ROWS = 13
+# 通道表固定高度基准：总高沿用 13 路 CAN 的旧几何（样例文件最大行数：
+# AHT 13 通道、A19G1 12 通道 + 映射 CAN15），行高收缩到默认的 13/16，
+# 使 16 路 CAN 全显而面板总高度不变。几何与行数无关、读取全程不跳动；
+# 行数超 16（理论场景）时出现垂直滚动条。
+_TABLE_ROWS = 16
+_OLD_ROWS_BASIS = 13  # 高度基准：13 行 × 默认行高（改动前几何，总高不变）
+
+# 进度条样式：填充块浅绿色（Qt 原生 Windows 样式为蓝色渐变，视觉不符合
+# 预期）；轨道浅灰 + 圆角边框，进度文字居中
+_PROGRESS_STYLE = (
+    "QProgressBar { border: 1px solid #999; border-radius: 3px;"
+    " background-color: #F0F0F0; text-align: center; }"
+    "QProgressBar::chunk { background-color: #90EE90; }"
+)
 
 
 class DbcCombo(QComboBox):
@@ -97,8 +108,9 @@ class MainWindow(QMainWindow):
         # 通道匹配表格固定 = 表头 + 各行高 + 余量（「刚好 N 行多一丢丢」），
         # 结果摘要固定 ≈46px（≈ 默认布局下 277px 的 1/6），不再抢高度
         # 启动默认 760×920；几何在 __init__ 末尾一次性贴合（_fit_window_height）：
-        # 通道匹配表格固定 = 表头 + 13 路 CAN + 余量——任何行数下高度恒定，
-        # 读取 BLF 过程与完成后排布一致；结果摘要固定 ≈46px，不再抢高度
+        # 通道匹配表格固定 = 表头 + 13 路 CAN 基准总高（行高收缩后 16 路
+        # 全显）+ 余量——任何行数下高度恒定，读取 BLF 过程与完成后排布一致
+        # 结果摘要固定 ≈46px，不再抢高度
         self.resize(760, 920)
         self.blf_path = None
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
@@ -127,6 +139,7 @@ class MainWindow(QMainWindow):
         # 加载进度条：固定宽度，仅在扫描时显示（扫描结束即隐藏，不占布局空间、
         # 不影响排版）；「转换」行的大进度条只在转换时使用
         self.load_progress = QProgressBar()
+        self.load_progress.setStyleSheet(_PROGRESS_STYLE)
         self.load_progress.setFixedWidth(140)
         self.load_progress.setRange(0, 100)
         self.load_progress.setValue(0)
@@ -198,6 +211,7 @@ class MainWindow(QMainWindow):
         self.convert_btn.clicked.connect(self._start_convert)
         ctrl_row.addWidget(self.convert_btn)
         self.progress = QProgressBar()
+        self.progress.setStyleSheet(_PROGRESS_STYLE)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         ctrl_row.addWidget(self.progress, 1)
@@ -218,7 +232,8 @@ class MainWindow(QMainWindow):
         self.project_combo.model().item(0).setEnabled(False)
         for name in project_loader.list_projects(CCU3_ROOT):
             self.project_combo.addItem(name)
-        # 固定几何：通道表按 13 路 CAN 预留高度、三列固定宽度，窗口贴合一次。
+        # 固定几何：通道表按 13 路 CAN 基准预留高度（行高收缩，16 路全显）、
+        # 三列固定宽度，窗口贴合一次。
         # 此后任何 BLF 读取/表格重建都不改动几何——读取过程与完成后排布一致。
         # 行号表头也按两位数字（最大行号 16）预留固定宽度：sizeHint 随行数
         # 变化（实测 0/16/28px），会导致表格总宽随行数跳变
@@ -385,15 +400,22 @@ class MainWindow(QMainWindow):
         self._fit_table_width()
 
     def _fit_table_height(self):
-        """通道表固定高度 = 表头 + 13 路 CAN + 少量余量（样例最大行数）。
+        """通道表固定高度 = 表头 + 13 路 CAN 基准总高 + 余量（总高不变）。
 
-        高度与当前行数无关（实际行集 ≤ 13），保证读取 BLF 过程中与完成后
-        面板几何完全一致、不跳动；行数不足时表内留白，行数超 13（理论场景）
-        时出现垂直滚动条。余量 8px ≈ 四分之一行高。
+        行高收缩为默认行高的 13/16（16 行 × 行高 ≤ 13 行 × 默认行高），
+        16 路 CAN 全显而面板总高度与旧版 13 行基准完全一致——「保持总体
+        高度」的落点。高度与当前行数无关（实际行集 ≤ 16），读取 BLF 过程
+        与完成后几何一致、不跳动；行数超 16（理论场景）时出现垂直滚动条。
+        余量 8px ≈ 三分之一收缩行高。
         """
+        vh = self.table.verticalHeader()
+        d = vh.defaultSectionSize()  # 修改前读取：总高沿用旧基准，几何不变
+        row_h = (_OLD_ROWS_BASIS * d) // _TABLE_ROWS
+        vh.setDefaultSectionSize(row_h)
+        # 固定行高：行数重建不改变行高，16 行全显的几何恒定
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         content = (self.table.horizontalHeader().sizeHint().height()
-                   + _TABLE_ROWS * self.table.verticalHeader().defaultSectionSize()
-                   + 2 * self.table.frameWidth())
+                   + _OLD_ROWS_BASIS * d + 2 * self.table.frameWidth())
         self.table.setFixedHeight(content + 8)
 
     def _fit_window_height(self):

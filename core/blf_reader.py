@@ -78,18 +78,31 @@ def iter_messages(path: str, channel: int) -> Iterator[Frame]:
             yield _decode(msg)
 
 
-def iter_all_messages(path: str) -> Iterator[Frame]:
+def iter_all_messages(path: str, progress_cb=None) -> Iterator[Frame]:
     """单遍全量帧流（每帧带 channel 字段，供单遍扫描管线路由用）。
 
     性能优化（方案 A）：convert 只做一次全文件遍历，把帧路由到各通道
     解码器与统计收集器，替代按通道逐遍重复解析整个文件（python-can 的
     BLFReader 无索引，每次迭代都要从头解析全部帧）。
+
+    progress_cb(percent: float) 可选：每读完一个日志容器回调一次
+    （0-100，基于文件字节位置，与 list_channels 同一语义）——大文件
+    读取占转换耗时大头，进度条需在读取期间持续前进而不是停在 5%。
     """
+    import os
+
     import can
 
+    total = os.path.getsize(path)
+    last = -1
     with can.BLFReader(path) as reader:
         for msg in reader:
             yield _decode(msg)
+            if progress_cb is not None and total:
+                pos = reader.file.tell()
+                if pos != last:
+                    last = pos
+                    progress_cb(pos * 100.0 / total)
 
 
 def scan_channels(path: str) -> dict[int, tuple]:

@@ -109,6 +109,24 @@ def test_parallel_matches_serial_synthetic(synthetic_decoders):
         _assert_stats_equal(par[ch][1], ser[ch][1], ch)
 
 
+def test_finish_all_progress_reports_per_bucket(synthetic_decoders):
+    """finish_all 按桶完成实时上报：percent 单调且在 [10, 90]。
+
+    修复项：旧实现把上报推迟到所有桶完成后按通道瞬间补齐（5%→95% 跳变
+    的根因之一）；现改为每桶完成即回调（percent = 10 + 80 × 累计帧数/
+    总帧数，单调不降），解码全程进度条持续前进。
+    """
+    channels = sorted(synthetic_decoders)
+    calls = []
+    mp_finish.finish_all(synthetic_decoders, channels,
+                         progress_cb=lambda stage, pct: calls.append(pct))
+    assert calls, "应至少一次进度回调"
+    assert all(10.0 <= v <= 90.0 for v in calls)
+    assert calls == sorted(calls), "percent 应单调不降"
+    # 桶粒度：每通道 3 桶（50 帧×3 已知报文）→ 至少 6 次回调，而非按通道 2 次
+    assert len(calls) >= 2 * 3, "应按桶粒度实时上报（多于按通道）"
+
+
 # ── 2. 真实样例双跑逐组全量一致（golden）──
 
 def _mdf_equal(a_path, b_path) -> list[str]:

@@ -106,37 +106,41 @@ def test_dbc_combo_ignores_mouse_wheel(window):
 
 
 def test_channel_table_shows_all_rows_without_scrollbar(window):
-    """通道匹配高度足够展示全部行（13 行场景无垂直滚动条）。"""
+    """通道匹配高度足够展示全部行（16 行场景无垂直滚动条）。"""
     import gui.main_window as mw
 
     window.dbc_list = [_d(f"PFCAN1.dbc")]
-    window._rebuild_channel_table([0, 1, 2, 3, 6, 8, 9, 10, 11, 12, 13, 14, 15])
+    window._rebuild_channel_table(list(range(16)))
     window.resize(760, 920)
     window.show()
     assert window.table.verticalScrollBar().maximum() == 0
     assert isinstance(window.table.cellWidget(0, 1), mw.DbcCombo)
 
 
-def test_table_height_fixed_13_rows(window, qapp):
-    """通道匹配表格固定高度 = 表头 + 13 路 CAN + 余量，与行数无关。
+def test_table_height_fixed_16_rows(window, qapp):
+    """通道匹配表格固定高度 = 表头 + 13 路 CAN 基准总高，16 行全显。
 
     固定几何保证读取 BLF 过程与完成后排布一致（表格不随行数跳变）；
-    2 行与 13 行场景高度相同，且恰好容纳 13 行（样例最大行数，
-    面板因此不过高）。
+    行高收缩为默认行高的 13/16，2 行与 16 行场景高度相同，16 个通道
+    全部可见且总高度与旧版 13 行基准一致（面板不增高）。
     """
     window.dbc_list = [_d("PFCAN1.dbc")]
     window._rebuild_channel_table(list(range(2)))
     window.show()
     qapp.processEvents()
     h2 = window.table.height()
-    window._rebuild_channel_table(list(range(13)))
+    window._rebuild_channel_table(list(range(16)))
     qapp.processEvents()
-    h13 = window.table.height()
-    assert h2 == h13
+    h16 = window.table.height()
+    assert h2 == h16
+    # 总高 = 表头 + 13×旧默认行高 + 边框 + 余量；13×旧默认行高 =
+    # 16×收缩行高 + r（r ∈ [0,15]，整除取整丢失），故落在如下区间
+    row_h = window.table.verticalHeader().defaultSectionSize()
     expected = (window.table.horizontalHeader().height()
-                + 13 * window.table.verticalHeader().defaultSectionSize()
-                + 2 * window.table.frameWidth() + 8)
-    assert abs(h13 - expected) <= 2
+                + 16 * row_h + 2 * window.table.frameWidth() + 8)
+    assert expected <= h16 <= expected + 15
+    # 16 行全显，无垂直滚动条（行高收缩的验收点）
+    assert window.table.verticalScrollBar().maximum() == 0
 
 
 def test_summary_height_reduced_to_1_6(window, qapp):

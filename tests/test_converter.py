@@ -128,6 +128,16 @@ def test_convert_progress_callback(tmp_path, blf_and_dbc):
     assert calls, "应至少有一次回调"
     assert calls[-1][0] == "完成"
     assert "写 MDF" in [s for s, _ in calls]
+    # 细粒度修复：读取阶段按字节位置多次回调（5→10 爬升），而非停在 5%；
+    # 全程 percent 单调不降（跨阶段，含解码/统计逐段上报）
+    read_pcts = [p for s, p in calls if s == "读取 BLF"]
+    assert read_pcts, "读取阶段应有进度回调"
+    assert read_pcts == sorted(read_pcts)
+    assert max(read_pcts) <= 10.0, "读取阶段应落在 5→10 区间"
+    pcts = [p for _, p in calls]
+    assert pcts == sorted(pcts), "进度应单调不降"
+    assert len(set(s for s, _ in calls if s.startswith("聚合统计"))) >= 2, \
+        "统计阶段应按通道逐段上报（92→95）"
 
 
 def test_convert_no_matching_frames_warns(tmp_path, blf_and_dbc):
