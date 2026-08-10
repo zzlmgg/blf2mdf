@@ -15,6 +15,11 @@ from core.dbc_loader import DbcDef, load
 
 UNBOUND = "不绑定"
 
+# 通道表固定高度基准：以 13 路 CAN 为准（样例文件最大行数：AHT 13 通道、
+# A19G1 12 通道 + 映射 CAN15）。表格按此预留高度 → 几何与行数无关、
+# 读取全程不跳动；行数超 13（理论场景）时出现垂直滚动条。
+_TABLE_ROWS = 13
+
 
 class DbcCombo(QComboBox):
     """「DBC 矩阵」列下拉：忽略鼠标滚轮，防悬停误触改绑（滚轮事件冒泡给表格）。
@@ -32,11 +37,6 @@ CCU3_ROOT = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
 CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt"
 
 PROJECT_PLACEHOLDER = "选择项目…"  # 项目下拉首项（禁用占位，仅提示）
-
-# 调试用默认 BLF：启动时若文件存在则自动加载，免去每次手动选择
-DEFAULT_BLF = (r"E:\projects\blf_dbc\inputs\blf"
-               r"\ACFCANPUB_20260722_104000_59489600"
-               r"-ACFCANPUB_20260722_104930_59489619.blf")
 
 
 class ConvertWorker(QObject):
@@ -65,6 +65,30 @@ class ConvertWorker(QObject):
             self.error.emit(str(e))
 
 
+class BlfScanWorker(QObject):
+    """BLF 通道枚举（worker 线程）：list_channels 全文件解析可能耗时数十秒
+    （86MB/565 万帧实测 41s），放后台线程避免主界面冻结成「未响应」。
+
+    progress 按文件字节位置报真实进度（0-100），done/error 结果回主线程。
+    """
+    progress = Signal(float)
+    done = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    @Slot()
+    def run(self):
+        try:
+            channels = blf_reader.list_channels(
+                self.path, progress_cb=self.progress.emit)
+            self.done.emit(channels)
+        except Exception as e:  # noqa: BLE001 — 界面层兜底
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -72,6 +96,9 @@ class MainWindow(QMainWindow):
         # 启动默认 760×920；加载 BLF 后窗口高度自动贴合内容（_fit_window_height）：
         # 通道匹配表格固定 = 表头 + 各行高 + 余量（「刚好 N 行多一丢丢」），
         # 结果摘要固定 ≈46px（≈ 默认布局下 277px 的 1/6），不再抢高度
+        # 启动默认 760×920；几何在 __init__ 末尾一次性贴合（_fit_window_height）：
+        # 通道匹配表格固定 = 表头 + 13 路 CAN + 余量——任何行数下高度恒定，
+        # 读取 BLF 过程与完成后排布一致；结果摘要固定 ≈46px，不再抢高度
         self.resize(760, 920)
         self.blf_path = None
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
@@ -84,6 +111,8 @@ class MainWindow(QMainWindow):
         # 输出路径是否仍是自动生成名（用户手改/浏览选择后置 False，切换项目时不被覆盖）
         self._auto_out = True
         self.worker_thread: QThread | None = None
+        self.scan_thread: QThread | None = None
+        self.scan_worker: BlfScanWorker | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -95,8 +124,17 @@ class MainWindow(QMainWindow):
         self.blf_edit = QLineEdit()
         self.blf_edit.setReadOnly(True)
         row.addWidget(self.blf_edit, 1)
+        # 加载进度条：固定宽度，仅在扫描时显示（扫描结束即隐藏，不占布局空间、
+        # 不影响排版）；「转换」行的大进度条只在转换时使用
+        self.load_progress = QProgressBar()
+        self.load_progress.setFixedWidth(140)
+        self.load_progress.setRange(0, 100)
+        self.load_progress.setValue(0)
+        self.load_progress.setVisible(False)
+        row.addWidget(self.load_progress)
         btn_blf = QPushButton("浏览…")
         btn_blf.clicked.connect(self._pick_blf)
+        self.btn_blf = btn_blf
         row.addWidget(btn_blf)
         v.addLayout(row)
 
@@ -137,8 +175,8 @@ class MainWindow(QMainWindow):
         self.raw_check.setChecked(False)
         right_col.addWidget(self.raw_check)
         middle.addLayout(right_col, 0)  # 右栏：通道表（总宽=三列列宽之和，余宽全给左侧 DBC 列表）
-        # 中排高度由固定高的通道表决定（_fit_table_height 按行数计算），
-        # 不参与额外空间分配；窗口高度在加载后由 _fit_window_height 贴合内容
+        # 中排高度由固定高的通道表决定（_fit_table_height 恒为 16 行上限），
+        # 不参与额外空间分配；窗口高度在 __init__ 末尾贴合一次后不再变动
         v.addLayout(middle)
 
         # 输出路径
@@ -175,41 +213,95 @@ class MainWindow(QMainWindow):
         self.summary.setFixedHeight(46)
         v.addWidget(self.summary)
 
-        # 项目下拉：占位首项禁用，列表 = dbc_ccu3.0 下含 DBC 的项目文件夹；
-        # BLF 便于调试自动加载（不存在时静默跳过，不打断启动）
+        # 项目下拉：占位首项禁用，列表 = dbc_ccu3.0 下含 DBC 的项目文件夹
         self.project_combo.addItem(PROJECT_PLACEHOLDER)
         self.project_combo.model().item(0).setEnabled(False)
         for name in project_loader.list_projects(CCU3_ROOT):
             self.project_combo.addItem(name)
-        if Path(DEFAULT_BLF).exists():
-            self._load_blf(DEFAULT_BLF)
+        # 固定几何：通道表按 13 路 CAN 预留高度、三列固定宽度，窗口贴合一次。
+        # 此后任何 BLF 读取/表格重建都不改动几何——读取过程与完成后排布一致。
+        # 行号表头也按两位数字（最大行号 16）预留固定宽度：sizeHint 随行数
+        # 变化（实测 0/16/28px），会导致表格总宽随行数跳变
+        self._row_header_w = (self.table.verticalHeader().fontMetrics()
+                              .horizontalAdvance("16")
+                              + 2 * self.table.verticalHeader().fontMetrics()
+                              .horizontalAdvance("0"))
+        self.table.verticalHeader().setFixedWidth(self._row_header_w)
+        self._apply_column_widths()
+        self._fit_table_height()
+        self._fit_window_height()
 
     # ---- 文件选择 ----
     def _pick_blf(self):
-        # 对话框默认打开项目根目录的 inputs\blf（BLF 数据统一存放处）
-        start = str(PROJECT_ROOT / "inputs" / "blf")
-        path, _ = QFileDialog.getOpenFileName(self, "选择 BLF 文件", start,
-                                              "BLF 文件 (*.blf)")
+        # 对话框默认打开项目根目录的 inputs\blf（BLF 数据统一存放处）；
+        # 目录不存在时先创建，避免 Qt 回退到其他目录
+        start = PROJECT_ROOT / "inputs" / "blf"
+        start.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(self, "选择 BLF 文件",
+                                              str(start), "BLF 文件 (*.blf)")
         if not path:
             return
         self._load_blf(path)
 
     def _load_blf(self, path: str):
-        """加载 BLF：枚举通道 → 刷新通道表与默认输出路径。"""
-        try:
-            channels = blf_reader.list_channels(path)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "BLF 读取失败", f"{path}\n{e}")
-            return
+        """加载 BLF（异步）：后台线程枚举通道 → 刷新通道表与默认输出路径。
+
+        大文件（如 86MB/565 万帧）list_channels 全文件解析实测耗时 41s，
+        若在主线程同步执行窗口会冻结成「未响应」；改为 worker 线程 +
+        字节级真实进度，扫描期间界面保持响应，进度条可见推进。
+        """
+        if self.scan_thread is not None and self.scan_thread.isRunning():
+            return  # 扫描进行中不接受新文件
+        self._set_scan_busy(True)
+        self.load_progress.setVisible(True)
+        self.load_progress.setValue(0)
+        self.scan_thread = QThread()
+        self.scan_worker = BlfScanWorker(path)
+        self.scan_worker.moveToThread(self.scan_thread)
+        self.scan_thread.started.connect(self.scan_worker.run)
+        self.scan_worker.progress.connect(self._on_scan_progress)
+        self.scan_worker.done.connect(self._on_scan_done)
+        self.scan_worker.error.connect(self._on_scan_error)
+        self.scan_thread.start()
+
+    def _set_scan_busy(self, busy: bool):
+        """扫描期间禁用文件选择与转换；转换按钮另需已加载 BLF。"""
+        self.btn_blf.setEnabled(not busy)
+        self.convert_btn.setEnabled(not busy and self.blf_path is not None)
+        self.load_progress.setVisible(busy)
+
+    @Slot(float)
+    def _on_scan_progress(self, percent: float):
+        self.load_progress.setValue(int(percent))
+
+    @Slot(object)
+    def _on_scan_done(self, channels: list):
+        self._finish_scan()
         if not channels:
             QMessageBox.warning(self, "提示", "文件中未找到有效报文数据")
             return
+        path = self.scan_worker.path
         self.blf_path = path
         self.blf_edit.setText(path)
         self.blf_channels = channels
         self._rebuild_channel_table(channels)
         self._set_default_output()
         self.convert_btn.setEnabled(True)
+
+    @Slot(str)
+    def _on_scan_error(self, msg: str):
+        self._finish_scan()
+        QMessageBox.critical(self, "BLF 读取失败",
+                             f"{self.scan_worker.path}\n{msg}")
+
+    def _finish_scan(self):
+        thread = self.scan_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            self.scan_thread = None
+        self.load_progress.setValue(0)
+        self._set_scan_busy(False)  # 隐藏 load_progress、恢复按钮
 
     def _set_default_output(self):
         """默认输出路径：outputs/{项目名_}{时间戳}.mdf（重复转换不互相覆盖）。
@@ -279,9 +371,6 @@ class MainWindow(QMainWindow):
             else:
                 self._update_status(row)
         self._apply_column_widths()
-        self._fit_table_height()
-        if self.table.rowCount():
-            self._fit_window_height()
 
     def _apply_column_widths(self):
         """通道匹配列宽：原默认列宽（760px 面板下 100/100/261）按 0.7/2.0/0.3 缩放。
@@ -296,21 +385,23 @@ class MainWindow(QMainWindow):
         self._fit_table_width()
 
     def _fit_table_height(self):
-        """通道表高度 = 表头 + 各行 + 少量余量（「刚好 N 行多一丢丢」）。
+        """通道表固定高度 = 表头 + 13 路 CAN + 少量余量（样例最大行数）。
 
-        固定高度保证所有通道行完整可见、永不出垂直滚动条；行数变化
-        （不同 BLF/映射）时自动跟随。余量 8px ≈ 四分之一行高（行高 30px）。
+        高度与当前行数无关（实际行集 ≤ 13），保证读取 BLF 过程中与完成后
+        面板几何完全一致、不跳动；行数不足时表内留白，行数超 13（理论场景）
+        时出现垂直滚动条。余量 8px ≈ 四分之一行高。
         """
         content = (self.table.horizontalHeader().sizeHint().height()
-                   + sum(self.table.rowHeight(r) for r in range(self.table.rowCount()))
+                   + _TABLE_ROWS * self.table.verticalHeader().defaultSectionSize()
                    + 2 * self.table.frameWidth())
         self.table.setFixedHeight(content + 8)
 
     def _fit_window_height(self):
-        """窗口高度贴合内容：表与摘要均固定后，布局最小高度即理想内容高。
+        """窗口高度贴合布局最小高度（仅在 __init__ 末尾调用一次）。
 
-        底部不再有固定 920 窗口留下的空白；用户仍可手动拉高窗口（多余
-        空间留白），加载其他行数的 BLF 时自动重新贴合。
+        表格/摘要均为固定几何后，布局最小高度是常量——此后读取 BLF、
+        重建表格都不再改动窗口尺寸，读取过程与完成后排布一致。
+        用户仍可手动拉高窗口（多余空间留白）。
         """
         v = self.centralWidget().layout()
         self.resize(self.width(), v.minimumSize().height())
@@ -323,8 +414,9 @@ class MainWindow(QMainWindow):
         """
         hdr = self.table.horizontalHeader()
         sb = self.table.verticalScrollBar()
-        # sizeHint 而非 width()：行号表头在布局前 width() 为 0，sizeHint 始终反映内容宽
-        total = self.table.verticalHeader().sizeHint().width() + 2 * self.table.frameWidth()
+        # 行号表头用启动时预留的固定宽度（_row_header_w），不用 sizeHint：
+        # sizeHint 随行数变化（实测 0/16/28px），会导致表格总宽随行数跳变
+        total = self._row_header_w + 2 * self.table.frameWidth()
         for i in range(hdr.count()):
             total += hdr.sectionSize(i)
         # 用范围而非 isVisible 判断：rangeChanged 触发时滚动条可能尚未隐藏（时序滞后）
@@ -479,6 +571,11 @@ class MainWindow(QMainWindow):
         self.stage_label.setText("")
 
     def closeEvent(self, event):
+        thread = self.scan_thread
+        if thread is not None and thread.isRunning():
+            # 扫描无法中途取消：等待其完成，避免销毁仍在运行的 QThread
+            thread.quit()
+            thread.wait()
         thread = self.worker_thread
         if thread is not None and thread.isRunning():
             ans = QMessageBox.question(

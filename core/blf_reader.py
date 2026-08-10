@@ -31,13 +31,26 @@ def _decode(msg) -> Frame:
     )
 
 
-def list_channels(path: str) -> list[int]:
+def list_channels(path: str, progress_cb=None) -> list[int]:
+    """枚举 BLF 中的通道。progress_cb(percent: float) 每读完一个日志容器
+    回调一次（0-100，基于文件字节位置），供 GUI 显示真实读取进度——
+    BLF 是按容器顺序存放的，字节进度随容器单调推进到 100%。
+    """
+    import os
+
     import can
 
     channels = set()
+    total = os.path.getsize(path)
+    last = -1
     with can.BLFReader(path) as reader:
         for msg in reader:
             channels.add(int(msg.channel))
+            if progress_cb is not None and total:
+                pos = reader.file.tell()
+                if pos != last:
+                    last = pos
+                    progress_cb(pos * 100.0 / total)
     return sorted(channels)
 
 

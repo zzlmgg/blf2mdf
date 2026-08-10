@@ -26,6 +26,28 @@ def test_synthetic_blf_roundtrip(tmp_path):
     assert isinstance(frames[0], Frame)
 
 
+def test_list_channels_reports_monotonic_progress(tmp_path):
+    """list_channels 的 progress_cb 按文件字节位置单调推进，最终 100%。
+
+    修复项：大 BLF 读取期间 GUI 需真实进度（每读完一个日志容器回调一次，
+    基于 file.tell() / 文件大小）。
+    """
+    import can
+
+    p = tmp_path / "prog.blf"
+    with can.BLFWriter(str(p)) as w:
+        for i in range(3):
+            w.on_message_received(can.Message(
+                arbitration_id=0x100 + i, data=b"\x01\x02",
+                channel=1 + i, timestamp=1784716800.0 + i))
+    values = []
+    assert list_channels(str(p), progress_cb=values.append) == [1, 2, 3]
+    assert values, "至少一次进度回调"
+    assert values[-1] == 100.0, "读完应报 100%"
+    assert all(0.0 <= v <= 100.0 for v in values)
+    assert values == sorted(values), "进度应单调不降"
+
+
 def test_list_channels_on_sample():
     blf = sample_blf()
     if blf is None:

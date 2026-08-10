@@ -20,11 +20,9 @@ def qapp():
 
 
 @pytest.fixture()
-def window(qapp, monkeypatch):
+def window(qapp):
     import gui.main_window as mw
 
-    # 避免 __init__ 自动加载调试 BLF（慢且路径是机器相关的）
-    monkeypatch.setattr(mw, "DEFAULT_BLF", r"E:\__nonexistent__.blf")
     return mw.MainWindow()
 
 
@@ -119,20 +117,26 @@ def test_channel_table_shows_all_rows_without_scrollbar(window):
     assert isinstance(window.table.cellWidget(0, 1), mw.DbcCombo)
 
 
-def test_table_height_fits_rows_plus_slack(window, qapp):
-    """通道匹配表格高度 = 表头 + 各行 + 少量余量（「刚好 N 行多一丢丢」）。
+def test_table_height_fixed_13_rows(window, qapp):
+    """通道匹配表格固定高度 = 表头 + 13 路 CAN + 余量，与行数无关。
 
-    13 行（样例 BLF 12 通道 + 映射 CAN15）时表格恰好容纳所有行，
-    余量不超过半行——不再按窗口高度占比分配导致过高。
+    固定几何保证读取 BLF 过程与完成后排布一致（表格不随行数跳变）；
+    2 行与 13 行场景高度相同，且恰好容纳 13 行（样例最大行数，
+    面板因此不过高）。
     """
     window.dbc_list = [_d("PFCAN1.dbc")]
-    window._rebuild_channel_table(list(range(13)))
+    window._rebuild_channel_table(list(range(2)))
     window.show()
     qapp.processEvents()
-    content = (window.table.horizontalHeader().height()
-               + sum(window.table.rowHeight(r) for r in range(13))
-               + 2 * window.table.frameWidth())
-    assert 0 <= window.table.height() - content <= 12
+    h2 = window.table.height()
+    window._rebuild_channel_table(list(range(13)))
+    qapp.processEvents()
+    h13 = window.table.height()
+    assert h2 == h13
+    expected = (window.table.horizontalHeader().height()
+                + 13 * window.table.verticalHeader().defaultSectionSize()
+                + 2 * window.table.frameWidth() + 8)
+    assert abs(h13 - expected) <= 2
 
 
 def test_summary_height_reduced_to_1_6(window, qapp):
@@ -143,15 +147,17 @@ def test_summary_height_reduced_to_1_6(window, qapp):
     assert window.summary.height() == 46
 
 
-def test_window_snaps_to_content_height(window, qapp):
-    """加载后窗口高度贴合内容（不再固定 920 造成底部大段空白）。"""
+def test_window_geometry_stable_through_load(window, qapp):
+    """窗口几何在启动时贴合一次，重建表格不再改动——读取中与读取后一致。"""
     window.dbc_list = [_d("PFCAN1.dbc")]
-    window._rebuild_channel_table(list(range(13)))
     window.show()
     qapp.processEvents()
     v = window.centralWidget().layout()
-    assert abs(window.height() - v.minimumSize().height()) <= 2
-    assert window.height() < 850
+    h0 = window.height()
+    assert abs(h0 - v.minimumSize().height()) <= 2  # 启动时贴合
+    window._rebuild_channel_table(list(range(13)))
+    qapp.processEvents()
+    assert window.height() == h0                    # 重建后几何不变
 
 
 # ---- BLF 浏览默认目录 + 输出文件名项目前缀 ----
@@ -170,6 +176,102 @@ def test_pick_blf_opens_at_inputs_blf_dir(window, monkeypatch):
                         staticmethod(fake))
     window._pick_blf()
     assert captured["start"] == str(mw.PROJECT_ROOT / "inputs" / "blf")
+
+
+def test_startup_does_not_read_blf(qapp):
+    """启动不自动读取 BLF：未选择文件前不触发任何扫描、不显示路径。
+
+    修复项：启动自动加载 DEFAULT_BLF 已移除——用户没选 BLF 之前，
+    程序不得自行读文件（大文件读取会肉眼可见地"卡住/读进度"）。
+    """
+    import gui.main_window as mw
+
+    win = mw.MainWindow()
+    try:
+        assert win.blf_path is None
+        assert win.scan_thread is None
+        assert win.blf_edit.text() == ""
+        assert win.load_progress.isHidden()
+    finally:
+        win.close()
+
+
+def test_load_blf_async_does_not_block(window, qapp, tmp_path):
+    """_load_blf 异步加载：立即返回（后台 worker 扫描），完成后刷新界面。
+
+    修复前 list_channels 在主线程全文件同步解析（86MB/565 万帧实测 41s），
+    期间窗口冻结成「未响应」；修复后扫描在后台线程，主线程保持响应，
+    返回时路径尚未提交，事件循环泵动后结果到达。加载进度显示在
+    BLF 文件行的内嵌进度条（load_progress），「转换」行进度条与
+    stage_label 只属于转换流程，加载期间保持原样。
+    """
+    import can
+    import time
+
+    p = tmp_path / "tiny.blf"
+    with can.BLFWriter(str(p)) as w:
+        w.on_message_received(can.Message(arbitration_id=0x123, data=b"\x01",
+                                          channel=1, timestamp=1784716800.0))
+        w.on_message_received(can.Message(arbitration_id=0x456, data=b"\x03",
+                                          channel=2, timestamp=1784716801.0))
+    window._load_blf(str(p))
+    # 立即返回且未提交路径：扫描在后台进行（同步实现此处会阻塞数十秒）
+    assert window.blf_path is None
+    assert window.scan_thread is not None
+    assert not window.btn_blf.isEnabled()  # 扫描期间禁用文件选择
+    window.show()
+    qapp.processEvents()
+    # 加载反馈在 BLF 行内嵌进度条；「转换」进度条与状态标签不被动用
+    assert window.load_progress.isVisible()
+    assert window.progress.value() == 0
+    assert window.stage_label.text() == ""
+    deadline = time.monotonic() + 10
+    while window.blf_path is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert window.blf_path == str(p)
+    assert window.blf_channels == [1, 2]
+    assert window.scan_thread is None          # 扫描线程已收尾
+    assert window.convert_btn.isEnabled()      # 加载完成后可转换
+    assert window.load_progress.isHidden()     # 内嵌进度条已隐藏（不占排版）
+    assert window.progress.value() == 0        # 转换进度条仍归零
+    assert window.stage_label.text() == ""
+    assert window.btn_blf.isEnabled()          # 文件选择恢复
+    window.close()
+
+
+def test_layout_identical_before_during_after_load(window, qapp, tmp_path):
+    """读取 BLF 全程（读取前/读取中/完成后）面板几何完全一致。
+
+    修复项：通道表固定 16 行高 + 三列固定宽 + 窗口启动时贴合一次后，
+    窗口尺寸、通道表尺寸、左栏（ccu3.0 项目选择）尺寸在加载全程不变，
+    不随表格行数跳变。
+    """
+    import can
+    import time
+
+    p = tmp_path / "tiny.blf"
+    with can.BLFWriter(str(p)) as w:
+        w.on_message_received(can.Message(arbitration_id=0x123, data=b"\x01",
+                                          channel=1, timestamp=1784716800.0))
+    window.show()
+    qapp.processEvents()
+
+    def snap():
+        return (window.size(), window.table.size(),
+                window.project_combo.size())
+
+    before = snap()
+    window._load_blf(str(p))
+    qapp.processEvents()
+    assert snap() == before, "读取中：面板几何不得变化"
+    deadline = time.monotonic() + 10
+    while window.blf_path is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert window.blf_channels == [1]
+    assert snap() == before, "读取完成：面板几何不得变化"
+    window.close()
 
 
 def test_default_output_plain_timestamp_without_project(window):
