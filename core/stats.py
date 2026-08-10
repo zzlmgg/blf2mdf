@@ -11,7 +11,7 @@ CANoe 语义（实测）：
 - 累计 C[k] = 帧数 < (R[k] + 0.009)（严格小于，9ms 为输出时刻偏置）；
 - Rate[1] 分子界 = 1.099（首窗 1.1 - 1ms），Rate[k≥2] 界 = R[k]（整数）；
   Rate[k] = 窗内帧数 / 窗长（首窗 1.1、窗 1 0.9、其后 1.0）；末点复制 Rate[N-1]；
-- t 轴 = [0, 1.109, 2.009, ..., N-1+0.009, round(末帧, 3)]；
+- t 轴 = [0, 1.109, 2.009, ..., N-1+0.009, 末帧]（末点全精度，不 round）；
 - 覆盖全部 16 个 CAN 通道（0-15），无数据通道全 0；
 - 分类：扩展 ID → ExtData，远程帧 → StdRemote/ExtRemote（按扩展位），
   错误帧 → ErrorFrames，其余（含 CAN-FD）→ StdData。
@@ -38,6 +38,33 @@ _RATE_NAMES = tuple(n for n in STAT_NAMES if n not in _COUNT_NAMES)
 _I_STD, _I_EXT, _I_STDREM, _I_EXTREM, _I_ERR = range(5)
 
 
+# ms 网格判别的最大距网格偏差（秒）。BLF float64 绝对时间戳（~1.7e9 秒）
+# 在 2^30 尺度的量化步长 = 2^-22 ≈ 238ns，相对化后偏差 ≤ ±119ns；
+# 真实 ms 网格时间戳的观测偏差必 < 200ns，任意 ns 精度则可达 0.5ms。
+_MS_GRID_TOL = 2e-4
+
+
+def align_timestamps(ts) -> np.ndarray:
+    """时间戳对齐 CANoe（实测语义）：CANoe t 通道 = 整数 ns + CC 转换(a=1e-9)。
+
+    BLF 存 float64 绝对时间戳，相对化后损失 ~60ns（大数小数位仅 22 位
+    精度）。CANoe 时间戳的网格性由记录器决定，实测分两类：
+    - ms 网格（AHT 422 组全量：所有 t 为整数 ms）：距 ms 网格最大偏差
+      < 200ns → round 到 ms 精确恢复（±119ns 量化 << 0.5ms 边界），再按
+      ns 整数 ×1e-9 构造（与 CANoe CC 转换同构），输出逐位一致；
+    - 任意 ns 精度（A19G1 实测 74.9% 非 ms 网格）：BLF 已丢失 ±119ns，
+      无法恢复，保持 float64 原值（与 CANoe 位表示差 ≤ ±119ns）。
+    """
+    ts = np.asarray(ts, dtype=np.float64)
+    if not len(ts):
+        return ts
+    ms_dev = np.abs(ts * 1000.0 - np.round(ts * 1000.0)).max()
+    if ms_dev < _MS_GRID_TOL:
+        ms = np.round(ts * 1000.0).astype(np.int64)
+        return (ms * np.int64(1_000_000)).astype(np.float64) * np.float64(1e-9)
+    return ts
+
+
 class ChannelStats:
     """单通道的 1s 统计结果。"""
 
@@ -54,15 +81,16 @@ class ChannelStats:
 
 def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
                       is_remote: np.ndarray, is_error: np.ndarray,
-                      global_end_rounded: float) -> ChannelStats:
+                      global_end: float) -> ChannelStats:
     """按 CANoe 1s 统计语义聚合单通道帧流。
 
     参数（长度一致的数组，可为空）：
     - timestamps：帧相对时间戳（秒，测量开始归零后）
     - is_extended / is_remote / is_error：分类掩码
-    - global_end_rounded：全局测量结束时刻（round 到 1ms，全部通道最大值）
+    - global_end：全局测量结束时刻（未舍入，全部通道最大值；t 轴末点原样输出，
+      与 CANoe 全精度一致，不 round 到 1ms）
     """
-    ts = np.round(np.asarray(timestamps, dtype=np.float64), 3)
+    ts = align_timestamps(timestamps)
     # 方案 B：searchsorted 要求输入有序。BLF 帧按时间序写入（round 后仍单调，
     # 子序列仍单调），正常路径无须排序；乱序输入在分类掩码应用后对掩码取值
     # 排序（掩码已固定，排序 tsm 不改变 sum(x < b) 结果，等价成立）。
@@ -71,7 +99,7 @@ def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
     remote = np.asarray(is_remote, dtype=bool)
     err = np.asarray(is_error, dtype=bool)
 
-    n_windows = int(np.ceil(global_end_rounded))
+    n_windows = int(np.ceil(global_end))
     n_points = n_windows + 1
 
     # 窗界（秒）
@@ -83,8 +111,10 @@ def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
     rb = np.concatenate(([0.0, 1.1 - 0.001],
                          np.arange(2.0, n_windows, 1.0),
                          [c_bound[n_windows]]))
-    # t 轴：[0] + C 界[1..N-1] + [末帧]
-    t = np.concatenate(([0.0], c_bound[1:-1], [global_end_rounded]))
+    # t 轴：[0] + C 界[1..N-1] + [末帧]；全部按 CANoe 同款 ns 整数×1e-9
+    # 构造（实测 CANoe 统计 t 全量为整数 ns 网格，逐位一致；末帧由
+    # global_end 对齐到 ms，与 CANoe 输出时刻一致）
+    t = align_timestamps(np.concatenate(([0.0], c_bound[1:-1], [global_end])))
 
     # 分类计数（毫秒网格累计）
     classes = [np.zeros(len(ts), dtype=bool) for _ in range(5)]

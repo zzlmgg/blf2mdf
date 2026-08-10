@@ -206,10 +206,16 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     summary = ChannelSummary(channel=ch, bound=False)
             summaries.append(summary)
 
+        # 时间戳对齐 CANoe（修复：BLF float64 绝对时间戳大数减法损失 ~60ns
+        # 精度；自适应网格：ms 网格文件 round 到 1ms + ns 整数×1e-9 构造，
+        # 任意 ns 精度文件保留 float64 原值（BLF 量化 ±119ns 不可恢复），
+        # 见 stats.align_timestamps）
         for s in all_series:
-            s.timestamps = s.timestamps - abs_start_epoch
+            s.timestamps = stats_mod.align_timestamps(
+                s.timestamps - abs_start_epoch)
         for rg in raw_groups:
-            rg.timestamps = rg.timestamps - abs_start_epoch
+            rg.timestamps = stats_mod.align_timestamps(
+                rg.timestamps - abs_start_epoch)
 
         # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
         # 无帧通道输出全 0；输入已在单遍扫描中收集（stats_bufs），
@@ -223,7 +229,6 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 ts = stats_bufs.get(ch, ((), None, None, None))[0]
                 if ts:
                     global_end = max(global_end, max(ts))
-            end_rounded = round(global_end, 3)
             for ch in stats_mod.STAT_CHANNELS:
                 t, e, r, er = stats_bufs.get(ch, ((), (), (), ()))
                 stats_groups.append(stats_mod.aggregate_channel(
@@ -231,7 +236,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     np.asarray(e, dtype=bool),
                     np.asarray(r, dtype=bool),
                     np.asarray(er, dtype=bool),
-                    end_rounded))
+                    global_end))
 
         if progress_cb:
             progress_cb("写 MDF", 95)

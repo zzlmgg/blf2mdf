@@ -14,12 +14,17 @@ def stats(*args, **kwargs) -> ChannelStats:
 
 
 def test_empty_channel_full_zero_and_t_axis():
-    """无帧通道：601 点全 0，t 轴 = [0, 1.109, 2.009, ..., 599.009, 599.999]。"""
+    """无帧通道：601 点全 0，t 轴 = [0, 1.109, 2.009, ..., 599.009, 599.999]。
+
+    构造 = ns 整数 × 1e-9 乘法（CANoe CC 转换同款）：2009ms → 2.0090000000000003
+    （与 CANoe 位表示逐位一致，实测参考 AHT 422 组全量验证）。
+    """
     s = stats(np.array([], dtype=np.float64), np.array([], dtype=bool),
               np.array([], dtype=bool), np.array([], dtype=bool),
-              global_end_rounded=599.999)
+              global_end=599.999)
     assert len(s.t) == 601
-    assert s.t[0] == 0.0 and s.t[1] == 1.109 and s.t[2] == 2.009
+    assert s.t[0] == 0.0 and s.t[1] == 1.109
+    assert s.t[2] == 2.0090000000000003  # CANoe 位表示（2009×1e6×1e-9）
     assert s.t[-2] == 599.009 and s.t[-1] == 599.999
     for name in ("StdData", "StdDataRate", "ExtData", "ExtRemote", "ErrorFrames"):
         arr = s.values[name]
@@ -36,7 +41,7 @@ def test_cumulative_counts_window_bounds():
     """
     ts = np.array([0.5, 1.0, 1.5, 2.5, 3.5])
     s = stats(ts, np.zeros(5, dtype=bool), np.zeros(5, dtype=bool),
-              np.zeros(5, dtype=bool), global_end_rounded=3.5)
+              np.zeros(5, dtype=bool), global_end=3.5)
     assert s.values["StdData"].dtype == np.int32
     assert s.values["StdData"].tolist() == [0, 2, 3, 4, 5]
 
@@ -45,7 +50,7 @@ def test_rate_first_window_special_and_window_lengths():
     """Rate[1] = 帧' < 1.099 / 1.1（首窗 1.1s）；Rate[2] 分母 0.9；末点复制 Rate[N-1]。"""
     ts = np.array([0.5, 1.0, 1.5, 2.5, 3.5])
     s = stats(ts, np.zeros(5, dtype=bool), np.zeros(5, dtype=bool),
-              np.zeros(5, dtype=bool), global_end_rounded=3.5)
+              np.zeros(5, dtype=bool), global_end=3.5)
     r = s.values["StdDataRate"]
     assert r.dtype == np.float64
     # Rate[1] = 帧'<1.099(2 帧) / 1.1
@@ -64,7 +69,7 @@ def test_frame_timestamps_rounded_to_1ms():
     """帧时间戳 round 到 1ms（CANoe 毫秒网格）：1.10899996 → 1.109，1.10900006 → 1.109。"""
     ts = np.array([1.10899996, 1.10900006])
     s = stats(ts, np.zeros(2, dtype=bool), np.zeros(2, dtype=bool),
-              np.zeros(2, dtype=bool), global_end_rounded=1.109)
+              np.zeros(2, dtype=bool), global_end=1.109)
     # 两帧 round3 后都 = 1.109，恰等于 C 界 1.109（1.1+0.009）→ 严格小于排除
     assert s.values["StdData"][1] == 0
     # 但 Rate 界 1.099 之内 0 帧
@@ -77,7 +82,7 @@ def test_classification_ext_remote_error():
     ext = np.array([False, True, False, False, False, False])
     remote = np.array([False, False, True, True, False, False])
     error = np.array([False, False, False, False, True, True])
-    s = stats(ts, ext, remote, error, global_end_rounded=5.5)
+    s = stats(ts, ext, remote, error, global_end=5.5)
     n = len(s.t)
     assert s.values["StdData"][n - 1] == 1       # 仅 0.5
     assert s.values["ExtData"][n - 1] == 1       # 1.5（扩展数据帧）
@@ -87,11 +92,26 @@ def test_classification_ext_remote_error():
 
 
 def test_global_end_controls_window_count():
-    """N = ceil(global_end_rounded)；时长 599.999 → 601 点。"""
+    """N = ceil(global_end)；时长 599.999 → 601 点。"""
     s = stats(np.array([100.0]), np.zeros(1, dtype=bool), np.zeros(1, dtype=bool),
-              np.zeros(1, dtype=bool), global_end_rounded=599.999)
+              np.zeros(1, dtype=bool), global_end=599.999)
     assert len(s.t) == 601
     assert s.values["StdData"][101] == 1  # 100.0 < 101.009
+
+
+def test_t_axis_last_point_full_precision():
+    """t 轴末点 = 全局末帧时刻原样（不 round 到 1ms，与 CANoe 全精度一致）。
+
+    修复项：converter 曾 round(global_end, 3) 后传入（末点 254.42639749 → 254.426，
+    差 0.4ms）；CANoe 的 t 轴末点保留全精度。窗数仍由 ceil(global_end) 决定。
+    """
+    s = stats(np.array([100.0]), np.zeros(1, dtype=bool), np.zeros(1, dtype=bool),
+              np.zeros(1, dtype=bool), global_end=254.426397562)
+    assert len(s.t) == 256                 # ceil(254.426397562) = 255 窗 + 首点
+    assert s.t[-2] == 254.009
+    assert s.t[-1] == 254.426397562        # 全精度，非 254.426
+    # 帧仍按 1ms 网格计数，末点不影响计数结果
+    assert s.values["StdData"][101] == 1
 
 
 def _reference_aggregate(ts, ext, remote, err, end):
@@ -156,9 +176,9 @@ def test_unsorted_timestamps_equivalent():
     """乱序时间戳：排序兜底后结果与有序输入完全一致（sum(x < b) 与顺序无关）。"""
     ts = np.array([5.0, 1.0, 3.0, 2.0, 4.0, 1.0])
     s_unsorted = stats(ts.copy(), np.zeros(6, dtype=bool), np.zeros(6, dtype=bool),
-                       np.zeros(6, dtype=bool), global_end_rounded=5.0)
+                       np.zeros(6, dtype=bool), global_end=5.0)
     s_sorted = stats(np.sort(ts), np.zeros(6, dtype=bool), np.zeros(6, dtype=bool),
-                     np.zeros(6, dtype=bool), global_end_rounded=5.0)
+                     np.zeros(6, dtype=bool), global_end=5.0)
     for name in s_unsorted.values:
         assert np.array_equal(s_unsorted.values[name], s_sorted.values[name]), name
 
@@ -170,7 +190,7 @@ def test_unsorted_mixed_classes_mask_alignment():
     ext = np.array([True, True])
     remote = np.array([True, True])
     err = np.array([True, False])           # 92.362 帧为错误帧，9.73 帧为扩展远程
-    s = stats(ts, ext, remote, err, global_end_rounded=92.362)
+    s = stats(ts, ext, remote, err, global_end=92.362)
     # 9.73 帧（ExtRemote）计入窗口 10.009 内；92.362 帧（ErrorFrames）计入 93.009 末窗
     assert s.values["ExtRemote"][10] == 1
     assert s.values["ErrorFrames"][10] == 0
@@ -182,7 +202,7 @@ def test_duplicate_timestamps_strict_less():
     """重复时间戳 + 帧时刻恰等于 C 界：严格 < 排除（searchsorted 'left' 语义）。"""
     ts = np.array([1.109, 1.109, 2.009, 3.009, 3.009])
     s = stats(ts, np.zeros(5, dtype=bool), np.zeros(5, dtype=bool),
-              np.zeros(5, dtype=bool), global_end_rounded=3.009)
+              np.zeros(5, dtype=bool), global_end=3.009)
     # C 界 = [0, 1.109, 2.009, 3.009, 4.009]；恰等于界的帧不计：
     # C[2] 计入 < 2.009 的两个 1.109 帧，2.009 自身排除
     assert s.values["StdData"].tolist() == [0, 0, 2, 3, 5]

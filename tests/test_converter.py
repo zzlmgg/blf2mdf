@@ -220,3 +220,37 @@ def test_convert_stats_export_off_no_ones_groups(tmp_path, blf_and_dbc):
     convert(blf, {1: load(dbc_path)}, str(out), stats_export=False)
     m = MDF(str(out))
     assert {g.channel_group.acq_name for g in m.groups} == {"ABC"}
+
+
+def test_convert_stats_t_axis_last_point_full_precision(tmp_path):
+    """修复：统计组 t 轴末点 = 未舍入的全局末帧时刻（与 CANoe 全精度一致）。
+
+    回归背景：converter 曾把 global_end round 到 1ms 再传（末点 254.42639749 →
+    254.426，差 0.4ms）；CANoe 的 t 轴末点保留全精度（实测 A19G1 参考文件
+    254.42639749 vs 我们 254.426）。窗数不受影响：ceil(未舍入) 与 ceil(1ms 舍入) 一致。
+    """
+    import can
+
+    blf = tmp_path / "subms.blf"
+    with can.BLFWriter(str(blf)) as w:
+        w.on_message_received(can.Message(arbitration_id=100, is_extended_id=False,
+                                          data=bytes([0xE8, 0x03, 0, 0, 0, 0, 0, 0]),
+                                          channel=1, timestamp=1784716800.0))
+        # 末帧时间戳带亚毫秒精度：1784716805.123456 → 相对 = 5.123456
+        w.on_message_received(can.Message(arbitration_id=100, is_extended_id=False,
+                                          data=bytes([0x88, 0x13, 0, 0, 0, 0, 0, 0]),
+                                          channel=1, timestamp=1784716805.123456))
+    dbc = tmp_path / "t.dbc"
+    dbc.write_text(INLINE_DBC, encoding="utf-8")
+    out = tmp_path / "out.mdf"
+    convert(blf, {1: load(dbc)}, str(out))
+
+    m = MDF(str(out))
+    ones = [g for g in m.groups if g.channel_group.acq_name == "1s"]
+    assert len(ones) == 160
+    std = m.get("StdData", group=1 + 10)  # ch1 StdData（组 1 = 解码组）
+    t = np.asarray(std.timestamps)
+    assert len(t) == 7, t                     # ceil(5.123456) = 6 窗 + 首点
+    assert t[-2] == 5.009
+    # 末点保留全精度（仅容忍 BLF 写入/读回的浮点舍入，不允许 1ms 截断）
+    assert t[-1] == pytest.approx(5.123456, abs=1e-6), t[-1]

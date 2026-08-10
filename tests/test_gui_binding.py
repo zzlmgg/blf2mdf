@@ -154,6 +154,71 @@ def test_window_snaps_to_content_height(window, qapp):
     assert window.height() < 850
 
 
+# ---- BLF 浏览默认目录 + 输出文件名项目前缀 ----
+
+def test_pick_blf_opens_at_inputs_blf_dir(window, monkeypatch):
+    """「浏览…」选择 BLF 时，对话框默认打开项目根目录的 inputs\\blf。"""
+    import gui.main_window as mw
+
+    captured = {}
+
+    def fake(parent, title, start_dir, filt):
+        captured["start"] = start_dir
+        return ("", "")  # 取消选择，不触发加载
+
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileName",
+                        staticmethod(fake))
+    window._pick_blf()
+    assert captured["start"] == str(mw.PROJECT_ROOT / "inputs" / "blf")
+
+
+def test_default_output_plain_timestamp_without_project(window):
+    """未选项目：输出名保持 {时间戳}.mdf，不带前缀。"""
+    import re
+
+    window._set_default_output()
+    assert re.search(r"\d{8}_\d{6}\.mdf$", window.out_edit.text())
+    assert not re.search(r"\w+_\d{8}_\d{6}\.mdf$", window.out_edit.text())
+
+
+def test_default_output_prefixed_with_selected_project(window):
+    """已选项目：输出名 = {项目名}_{时间戳}.mdf。"""
+    import re
+
+    window._select_project = lambda name: None  # 只切选择，不触发真实加载
+    window.project_combo.setCurrentText("A19G1")
+    window._set_default_output()
+    assert re.search(r"A19G1_\d{8}_\d{6}\.mdf$", window.out_edit.text())
+
+
+def test_project_select_refreshes_default_output(window, monkeypatch):
+    """BLF 已加载、输出还是自动名时，切换项目会把项目名前缀补进输出名。"""
+    import gui.main_window as mw
+    import re
+
+    monkeypatch.setattr(mw.project_loader, "load_project",
+                        lambda root, name: [])  # 保持测试快速、不依赖真实数据
+    window.blf_path = r"E:\x.blf"
+    window._set_default_output()               # 先产生无前缀的自动名
+    assert not re.search(r"\w+_\d{8}_\d{6}\.mdf$", window.out_edit.text())
+    window.project_combo.setCurrentText("A19G1")  # 真实 _select_project
+    assert re.search(r"A19G1_\d{8}_\d{6}\.mdf$", window.out_edit.text())
+
+
+def test_project_select_keeps_custom_output_path(window, monkeypatch):
+    """用户手动改过的输出路径，切换项目时不被自动名覆盖。"""
+    import gui.main_window as mw
+
+    monkeypatch.setattr(mw.project_loader, "load_project",
+                        lambda root, name: [])
+    window.blf_path = r"E:\x.blf"
+    custom = r"E:\mine\custom.mdf"
+    window.out_edit.setText(custom)
+    window.out_edit.textEdited.emit(custom)  # 模拟用户手输
+    window.project_combo.setCurrentText("A19G1")
+    assert window.out_edit.text() == custom
+
+
 def test_project_switch_drops_stale_mapped_row(window):
     """换项目后，旧项目映射出的「无数据」行不应残留。
 

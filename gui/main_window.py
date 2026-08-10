@@ -81,6 +81,8 @@ class MainWindow(QMainWindow):
         # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
         self.auto_bind: dict[int, str] | None = None
         self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
+        # 输出路径是否仍是自动生成名（用户手改/浏览选择后置 False，切换项目时不被覆盖）
+        self._auto_out = True
         self.worker_thread: QThread | None = None
 
         central = QWidget()
@@ -143,6 +145,8 @@ class MainWindow(QMainWindow):
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("输出文件"))
         self.out_edit = QLineEdit()
+        # 手动输入视为自定义路径：切换项目时不再自动改名（见 _auto_out）
+        self.out_edit.textEdited.connect(lambda _: setattr(self, "_auto_out", False))
         out_row.addWidget(self.out_edit, 1)
         btn_out = QPushButton("浏览…")
         btn_out.clicked.connect(self._pick_out)
@@ -182,7 +186,9 @@ class MainWindow(QMainWindow):
 
     # ---- 文件选择 ----
     def _pick_blf(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择 BLF 文件", "",
+        # 对话框默认打开项目根目录的 inputs\blf（BLF 数据统一存放处）
+        start = str(PROJECT_ROOT / "inputs" / "blf")
+        path, _ = QFileDialog.getOpenFileName(self, "选择 BLF 文件", start,
                                               "BLF 文件 (*.blf)")
         if not path:
             return
@@ -206,10 +212,18 @@ class MainWindow(QMainWindow):
         self.convert_btn.setEnabled(True)
 
     def _set_default_output(self):
-        """默认输出路径：outputs/{时间戳}.mdf（重复转换不互相覆盖）。"""
+        """默认输出路径：outputs/{项目名_}{时间戳}.mdf（重复转换不互相覆盖）。
+
+        已选 ccu3.0 项目时文件名加项目名前缀（如 A19G1_20260807_100000.mdf），
+        未选项目则保持纯时间戳。标记 _auto_out：用户手动改过后不再覆盖。
+        """
         out_dir = PROJECT_ROOT / "outputs"
         out_dir.mkdir(parents=True, exist_ok=True)
-        self.out_edit.setText(str(out_dir / f"{datetime.now():%Y%m%d_%H%M%S}.mdf"))
+        name = self.project_combo.currentText()
+        prefix = f"{name}_" if name and name != PROJECT_PLACEHOLDER else ""
+        self.out_edit.setText(
+            str(out_dir / f"{prefix}{datetime.now():%Y%m%d_%H%M%S}.mdf"))
+        self._auto_out = True
 
     def _rebuild_channel_table(self, channels: list[int],
                                auto: dict[int, str] | None = None,
@@ -364,6 +378,9 @@ class MainWindow(QMainWindow):
         self.auto_bind = project_loader.auto_bindings(dbcs, self.mapping)
         self._rebuild_channel_table(self.blf_channels, auto=self.auto_bind,
                                     keep_prev=False)
+        # 项目名进入默认输出文件名；仅当输出还是自动名时更新，手改过的路径不动
+        if self.blf_path and self._auto_out:
+            self._set_default_output()
 
     def _remove_dbc(self):
         row = self.dbc_list_widget.currentRow()
@@ -378,6 +395,7 @@ class MainWindow(QMainWindow):
                                               "MDF 文件 (*.mdf)")
         if path:
             self.out_edit.setText(path)
+            self._auto_out = False  # 用户自选输出路径，切换项目不再覆盖
 
     # ---- 转换 ----
     def _start_convert(self):

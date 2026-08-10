@@ -9,17 +9,30 @@
 
 
 0、当前的dbc来源是 inputs/dbc，这部分dbc来源可以作废了，新方案的dbc来源是inputs/dbc_ccu3.0中各个项目文件夹（如AH8, A02...）目录中的dbc文件；
+新旧dbc的名字不一样了，对应的映射关系如下：
+VDCCCU_CANFD1——CFCAN1
+VDCCCU_CANFD2——CFCAN2
+VDCCCU_CANFD3——CFCAN3
+VDCCIDC_CANFD——IFCAN
+VDCPublic_CANFD1——PFCAN1
+VDCPublic_CANFD2——PFCAN2
+VDCCZF_CANFD——ZFCANF
+VDCCZL_CANFD——ZFCANL
+VDCCZR_CANFD——ZFCANR
+VDCCZT_CANFD——ZFCANT
+
 1、当前需要手动从“DBC矩阵文件”中点击“添加DBC”来选择DBC。我要改为：
 直接从“ccu3.0项目”下拉框选择项目（项目在 inputs/dbc_ccu3.0 中的），即可把项目文件夹中的各个dbc文件全部读进来；
-2、从项目文件夹读入dbc文件后，按照以下的“通道——dbc”的映射关系进行映射：
-VDCCCU_CANFD1——CFCAN1——CAN13
-VDCCCU_CANFD2——CFCAN2——CAN3
-VDCCCU_CANFD3——CFCAN3——CAN6
-VDCCIDC_CANFD——IFCAN——CAN12
-VDCPublic_CANFD1——PFCAN1——CAN1
-VDCPublic_CANFD2——PFCAN2——CAN15
-VDCCZF_CANFD——ZFCANF——CAN8
-VDCCZL_CANFD——ZFCANL——CAN9
-VDCCZR_CANFD——ZFCANR——CAN10
-VDCCZT_CANFD——ZFCANT——CAN11
-1、我要把当前项目中 inputs/dbc 中的 dbc 映射到 inputs/dbc_ccu3.0 中各个项目
+2、从项目文件夹读入dbc文件后，所有项目的dbc和通道都保持下面的映射关系（如有必要，这个映射关系可以写到配置文件中）：
+CFCAN1——CAN13
+CFCAN2——CAN3
+CFCAN3——CAN6
+IFCAN——CAN12
+PFCAN1——CAN1
+PFCAN2——CAN15
+ZFCANF——CAN8
+ZFCANL——CAN9
+ZFCANR——CAN10
+ZFCANT——CAN11
+也就是说，用户只需要从“ccu3.0项目”下拉框中选择 项目，就可以：自动读入该项目文件夹下的dbc文件，根据匹配关系自动完成匹配；
+3、仍然保留现在的一些功能（方便自动导入匹配后用户的自行操作）：“DBC矩阵文件”中的“添加DBC”和“移除选中”，“通道匹配”中的 DBC矩阵 列的选择下拉；

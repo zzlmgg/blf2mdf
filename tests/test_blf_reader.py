@@ -63,7 +63,11 @@ def test_iter_messages_fields_on_sample():
     assert frames, "第一个通道应产出帧"
     assert all(f.channel == chans[0] for f in frames)
     ts = [f.ts_seconds for f in frames]
-    assert ts == sorted(ts), "时间戳应非递减"
+    # 容差 50ms：CANoe 多源交织记录时帧时间戳偶有 ~23ms 级倒挂（实测
+    # A19G1 样例前 200 帧 39 处，最大 23ms）。reader 按文件序直通保序，
+    # 容差只滤掉数据级毛刺，仍能抓住真正的时间戳打乱。
+    assert all(ts[i] >= ts[i - 1] - 0.05 for i in range(1, len(ts))), \
+        "时间戳应大体非递减（容差 50ms）"
     assert all(f.ts_seconds >= 0 for f in frames)
     assert all(0 <= f.dlc <= 64 and len(f.data) == f.dlc for f in frames)
     assert any(f.is_fd for f in frames) or True  # 打印 FD 帧占比，不强制
