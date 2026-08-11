@@ -1,9 +1,8 @@
 """主窗口：BLF/DBC 选择 → 通道绑定 → 转换 → 摘要。"""
 import sys
-from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, QThread, QObject, Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -31,6 +30,18 @@ _PROGRESS_STYLE = (
     " background-color: #F0F0F0; text-align: center; }"
     "QProgressBar::chunk { background-color: #90EE90; }"
 )
+
+
+def _blf_drop_path(event) -> str | None:
+    """拖拽事件中的第一个 .blf 本地文件路径；没有则返回 None。
+
+    拖入多个文件时取第一个 .blf（其余忽略）；扩展名大小写不敏感
+    （Windows 资源管理器拖出的扩展名可能为大写 .BLF）。
+    """
+    for url in event.mimeData().urls():
+        if url.isLocalFile() and url.toLocalFile().lower().endswith(".blf"):
+            return url.toLocalFile()
+    return None
 
 
 class DbcCombo(QComboBox):
@@ -143,8 +154,6 @@ class MainWindow(QMainWindow):
         # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
         self.auto_bind: dict[int, str] | None = None
         self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
-        # 输出路径是否仍是自动生成名（用户手改/浏览选择后置 False，切换项目时不被覆盖）
-        self._auto_out = True
         self.worker_thread: QThread | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
@@ -155,10 +164,16 @@ class MainWindow(QMainWindow):
 
         # BLF 文件
         row = QHBoxLayout()
-        row.addWidget(QLabel("BLF 文件"))
+        self.blf_label = QLabel("BLF 文件")
+        row.addWidget(self.blf_label)
         self.blf_edit = QLineEdit()
         self.blf_edit.setReadOnly(True)
         row.addWidget(self.blf_edit, 1)
+        # 拖拽导入：标签 + 路径框整行接受 .blf 拖入（与「浏览…」并列的入口）。
+        # 事件过滤不新增控件、不改几何——排版与其他行完全一致
+        for w in (self.blf_label, self.blf_edit):
+            w.setAcceptDrops(True)
+            w.installEventFilter(self)
         # 加载进度条：固定宽度，仅在扫描时显示（扫描结束即隐藏，不占布局空间、
         # 不影响排版）；「转换」行的大进度条只在转换时使用
         self.load_progress = QProgressBar()
@@ -214,8 +229,6 @@ class MainWindow(QMainWindow):
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("输出文件"))
         self.out_edit = QLineEdit()
-        # 手动输入视为自定义路径：切换项目时不再自动改名（见 _auto_out）
-        self.out_edit.textEdited.connect(lambda _: setattr(self, "_auto_out", False))
         out_row.addWidget(self.out_edit, 1)
         btn_out = QPushButton("浏览…")
         btn_out.clicked.connect(self._pick_out)
@@ -265,6 +278,28 @@ class MainWindow(QMainWindow):
         self._fit_window_height()
 
     # ---- 文件选择 ----
+    def eventFilter(self, obj, event):
+        """BLF 文件行的拖拽导入：.blf 拖入标签/路径框 → _load_blf。
+
+        「浏览…」手动选择功能不变；非 .blf 拖入整行拒绝，且事件被消费、
+        不落到 QLineEdit 默认的文本拖放。扫描进行中拒绝拖入（与浏览按钮
+        禁用一致，避免「接受却无动作」的困惑）。
+        """
+        if obj in (self.blf_label, self.blf_edit) and event.type() in (
+                QEvent.Type.DragEnter, QEvent.Type.DragMove,
+                QEvent.Type.Drop):
+            busy = (self.scan_thread is not None
+                    and self.scan_thread.isRunning())
+            path = None if busy else _blf_drop_path(event)
+            if path and event.type() == QEvent.Type.Drop:
+                self._load_blf(path)
+            if path:
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return True  # 消费拖拽事件，控件默认处理不参与
+        return super().eventFilter(obj, event)
+
     def _pick_blf(self):
         # 对话框默认打开项目根目录的 inputs\blf（BLF 数据统一存放处）；
         # 目录不存在时先创建，避免 Qt 回退到其他目录
@@ -337,18 +372,14 @@ class MainWindow(QMainWindow):
         self._set_scan_busy(False)  # 隐藏 load_progress、恢复按钮
 
     def _set_default_output(self):
-        """默认输出路径：outputs/{项目名_}{时间戳}.mdf（重复转换不互相覆盖）。
+        """默认输出路径：与 BLF 同目录同文件名，仅扩展名 .mdf（run001.blf
+        → run001.mdf）。
 
-        已选 ccu3.0 项目时文件名加项目名前缀（如 A19G1_20260807_100000.mdf），
-        未选项目则保持纯时间戳。标记 _auto_out：用户手动改过后不再覆盖。
+        每次加载/重选 BLF 后输出自动跟随（_on_scan_done 调用）；用户手动
+        改过的输出路径也会在下次选择 BLF 时被新 BLF 的路径覆盖（需求：
+        输出文件路径始终与 BLF 文件路径一致）。
         """
-        out_dir = PROJECT_ROOT / "outputs"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        name = self.project_combo.currentText()
-        prefix = f"{name}_" if name and name != PROJECT_PLACEHOLDER else ""
-        self.out_edit.setText(
-            str(out_dir / f"{prefix}{datetime.now():%Y%m%d_%H%M%S}.mdf"))
-        self._auto_out = True
+        self.out_edit.setText(str(Path(self.blf_path).with_suffix(".mdf")))
 
     def _rebuild_channel_table(self, channels: list[int],
                                auto: dict[int, str] | None = None,
@@ -510,9 +541,6 @@ class MainWindow(QMainWindow):
         self.auto_bind = project_loader.auto_bindings(dbcs, self.mapping)
         self._rebuild_channel_table(self.blf_channels, auto=self.auto_bind,
                                     keep_prev=False)
-        # 项目名进入默认输出文件名；仅当输出还是自动名时更新，手改过的路径不动
-        if self.blf_path and self._auto_out:
-            self._set_default_output()
 
     def _remove_dbc(self):
         row = self.dbc_list_widget.currentRow()
@@ -523,11 +551,12 @@ class MainWindow(QMainWindow):
         self._rebuild_channel_table(self.blf_channels)
 
     def _pick_out(self):
-        path, _ = QFileDialog.getSaveFileName(self, "选择输出文件", "",
+        # 对话框默认打开当前 BLF 所在目录（输出与 BLF 同目录，需求一致）
+        start = str(Path(self.blf_path).parent) if self.blf_path else ""
+        path, _ = QFileDialog.getSaveFileName(self, "选择输出文件", start,
                                               "MDF 文件 (*.mdf)")
         if path:
             self.out_edit.setText(path)
-            self._auto_out = False  # 用户自选输出路径，切换项目不再覆盖
 
     # ---- 转换 ----
     def _start_convert(self):

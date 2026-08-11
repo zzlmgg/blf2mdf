@@ -192,7 +192,7 @@ def test_window_geometry_stable_through_load(window, qapp):
     assert window.height() == h0                    # 重建后几何不变
 
 
-# ---- BLF 浏览默认目录 + 输出文件名项目前缀 ----
+# ---- BLF 浏览默认目录 + 输出路径跟随 BLF ----
 
 def test_pick_blf_opens_at_inputs_blf_dir(window, monkeypatch):
     """「浏览…」选择 BLF 时，对话框默认打开项目根目录的 inputs\\blf。"""
@@ -306,41 +306,42 @@ def test_layout_identical_before_during_after_load(window, qapp, tmp_path):
     window.close()
 
 
-def test_default_output_plain_timestamp_without_project(window):
-    """未选项目：输出名保持 {时间戳}.mdf，不带前缀。"""
-    import re
+def test_blf_load_sets_output_follows_blf_path(window):
+    """需求 1/3：加载 BLF 完成后，输出路径 = BLF 同目录同文件名，扩展名 .mdf。
 
+    首次加载（启动后选第一个文件）即生效；不再落到 outputs/ 时间戳名。
+    """
+    class FakeWorker:
+        path = r"E:\data\run001.blf"
+    window.scan_worker = FakeWorker()
+    window._on_scan_done([1, 2])
+    assert window.blf_path == r"E:\data\run001.blf"
+    assert window.out_edit.text() == r"E:\data\run001.mdf"
+
+
+def test_new_blf_updates_output_even_after_custom_edit(window):
+    """需求 2：用户手改过输出路径后，重选 BLF 输出仍无条件跟随新 BLF。"""
+    window.blf_path = r"E:\data\old.blf"
+    window.out_edit.setText(r"F:\custom\my.mdf")   # 用户自选输出
+
+    class FakeWorker:
+        path = r"E:\data2\new.blf"
+    window.scan_worker = FakeWorker()
+    window._on_scan_done([1, 2])
+    assert window.out_edit.text() == r"E:\data2\new.mdf"
+
+
+def test_project_selection_does_not_rename_output(window):
+    """选项目不再把项目名写进输出文件名——输出名只跟随 BLF（需求 3）。"""
+    window.blf_path = r"E:\data\run001.blf"
     window._set_default_output()
-    assert re.search(r"\d{8}_\d{6}\.mdf$", window.out_edit.text())
-    assert not re.search(r"\w+_\d{8}_\d{6}\.mdf$", window.out_edit.text())
-
-
-def test_default_output_prefixed_with_selected_project(window):
-    """已选项目：输出名 = {项目名}_{时间戳}.mdf。"""
-    import re
-
     window._select_project = lambda name: None  # 只切选择，不触发真实加载
     window.project_combo.setCurrentText("A19G1")
-    window._set_default_output()
-    assert re.search(r"A19G1_\d{8}_\d{6}\.mdf$", window.out_edit.text())
-
-
-def test_project_select_refreshes_default_output(window, monkeypatch):
-    """BLF 已加载、输出还是自动名时，切换项目会把项目名前缀补进输出名。"""
-    import gui.main_window as mw
-    import re
-
-    monkeypatch.setattr(mw.project_loader, "load_project",
-                        lambda root, name: [])  # 保持测试快速、不依赖真实数据
-    window.blf_path = r"E:\x.blf"
-    window._set_default_output()               # 先产生无前缀的自动名
-    assert not re.search(r"\w+_\d{8}_\d{6}\.mdf$", window.out_edit.text())
-    window.project_combo.setCurrentText("A19G1")  # 真实 _select_project
-    assert re.search(r"A19G1_\d{8}_\d{6}\.mdf$", window.out_edit.text())
+    assert window.out_edit.text() == r"E:\data\run001.mdf"
 
 
 def test_project_select_keeps_custom_output_path(window, monkeypatch):
-    """用户手动改过的输出路径，切换项目时不被自动名覆盖。"""
+    """用户手动改过的输出路径，切换项目时不被覆盖。"""
     import gui.main_window as mw
 
     monkeypatch.setattr(mw.project_loader, "load_project",
@@ -348,9 +349,88 @@ def test_project_select_keeps_custom_output_path(window, monkeypatch):
     window.blf_path = r"E:\x.blf"
     custom = r"E:\mine\custom.mdf"
     window.out_edit.setText(custom)
-    window.out_edit.textEdited.emit(custom)  # 模拟用户手输
     window.project_combo.setCurrentText("A19G1")
     assert window.out_edit.text() == custom
+
+
+# ---- BLF 拖拽导入 ----
+
+def test_blf_drop_imports_file(window, tmp_path, monkeypatch):
+    """拖拽 .blf 到「BLF 文件」行（标签/路径框）→ _load_blf；非 .blf 拒绝。
+
+    「浏览…」手动选择功能不变；拖拽是并列的另一种文件入口。悬停接受
+    仅表示可放下，不触发加载；放下才走 _load_blf（异步扫描本身由
+    test_load_blf_async_does_not_block 覆盖，这里只验证接线）。
+    """
+    from PySide6.QtCore import QMimeData, QPoint, QUrl, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    from PySide6.QtWidgets import QApplication
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+
+    live_mimes = []  # QMimeData 包装器须存活到事件处理完：局部变量被 GC 后
+    # Shiboken 会删掉 C++ 对象，事件内 mimeData() 返回悬垂指针（裸 QObject）
+
+    def drag(urls, cls=QDragEnterEvent):
+        mime = QMimeData()
+        mime.setUrls(urls)
+        live_mimes.append(mime)
+        return cls(QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+
+    calls = []
+    monkeypatch.setattr(window, "_load_blf", lambda p: calls.append(p))
+
+    # .blf：标签与路径框均接受拖入（整行区域可拖）
+    for w in (window.blf_label, window.blf_edit):
+        ev = drag([QUrl.fromLocalFile(str(blf))])
+        QApplication.sendEvent(w, ev)
+        assert ev.isAccepted(), f"{type(w).__name__} 应接受 .blf 拖入"
+    assert calls == []  # 悬停只是接受，不触发加载
+
+    # 非 .blf（如 .txt）：整行拒绝
+    txt = tmp_path / "note.txt"
+    txt.write_text("x")
+    for w in (window.blf_label, window.blf_edit):
+        ev = drag([QUrl.fromLocalFile(str(txt))])
+        QApplication.sendEvent(w, ev)
+        assert not ev.isAccepted()
+
+    # 放下 .blf → _load_blf(路径)
+    drop = drag([QUrl.fromLocalFile(str(blf))], QDropEvent)
+    QApplication.sendEvent(window.blf_edit, drop)
+    assert drop.isAccepted()
+    assert len(calls) == 1 and Path(calls[0]) == blf
+
+
+def test_blf_drop_rejected_during_scan(window, tmp_path, monkeypatch):
+    """扫描进行中拒绝拖入（与「浏览…」按钮禁用一致），不启动新加载。
+
+    拖入被视觉接受却无动作比直接拒绝更困惑，故扫描期间光标显示禁止。
+    """
+    from PySide6.QtCore import QMimeData, QPoint, QUrl, Qt
+    from PySide6.QtGui import QDropEvent
+    from PySide6.QtWidgets import QApplication
+
+    class FakeScanThread:
+        def isRunning(self):
+            return True
+
+    calls = []
+    monkeypatch.setattr(window, "_load_blf", lambda p: calls.append(p))
+    window.scan_thread = FakeScanThread()
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(tmp_path / "x.blf"))])
+        ev = QDropEvent(QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+                        Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(window.blf_edit, ev)
+        assert not ev.isAccepted()
+        assert calls == []
+    finally:
+        window.scan_thread = None
 
 
 def test_project_switch_drops_stale_mapped_row(window):
