@@ -26,13 +26,20 @@ DEFAULT_MAPPING = {
 }
 
 
-def list_projects(root: str | Path) -> list[str]:
+def list_projects(root: str | Path | None) -> list[str]:
     """枚举含 .dbc 文件的项目文件夹（按名称排序）。
 
     只认目录中确实存在 DBC 的项目，避免把空文件夹/说明文件目录当项目。
+    root 为 None 或不存在时返回空列表（未定位到数据源/发布布局缺失时
+    GUI 降级为手动添加 DBC，而不是启动崩溃）。
     """
+    if root is None:
+        return []
+    root = Path(root)
+    if not root.is_dir():
+        return []
     return sorted(
-        d.name for d in Path(root).iterdir()
+        d.name for d in root.iterdir()
         if d.is_dir() and any(d.glob("*.dbc"))
     )
 

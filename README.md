@@ -26,6 +26,61 @@ StdData/ExtData/StdRemote/ExtRemote/ErrorFrames 及各自 Rate，逐秒聚合，
 （首窗 1.1s、帧时间戳毫秒网格等，见 `docs/2026-08-05-mdf-differences-fix-plan.md`
 §11 修复项 4 执行记录）。
 
+## 打包发布
+
+发布物为 PyInstaller onefile 窗口程序 `dist/blf2mdf.exe`（约 57MB，仅含实际
+导入的依赖：PySide6 Core/Gui/Widgets、numpy、pandas、asammdf、canmatrix 等；
+VC++ 运行库已内置，唯一系统级依赖是 System32 自带 ICU，Win10 1709+/Win11
+可用，**免安装、可在无 Python 环境机器直接运行**）。
+数据文件不打包，发布布局为 **exe 与 `inputs/` 文件夹同目录**（exe 自动在
+自身目录下找 `inputs/dbc_ccu3.0` 等数据，输出写到 exe 旁的 `outputs/`）。
+`dbc_ccu3.0` 也支持**直接放在 exe 同一目录**（无 `inputs/` 层），两种布局
+由 `main_window._find_ccu3_root()` 自动兼容（优先 inputs 布局）：
+
+发布包制作：`dist_publish/` 为已组装的最小发布目录（exe + inputs/dbc_ccu3.0
++ 使用说明.txt），`dist_publish.zip` 为可直接分发的压缩包；发布前用
+`tools/verify_clean_env.py <exe路径>` 在干净 PATH 下做启动冒烟验证（缺
+inputs 目录也能启动，UI 降级为手动添加 DBC——list_projects 对缺失目录
+返回空）。
+
+```
+发布目录/
+├── blf2mdf.exe
+└── inputs/
+    ├── dbc_ccu3.0/
+    └── (blf、dbc 可放任意路径，转换时手动选择)
+```
+
+构建命令（必须在 blfmdf conda 环境内，且前置 env 的 bin 目录使 PyInstaller
+能解析到 ffi-8 等 DLL）：
+
+```bash
+PATH="/c/ProgramData/Anaconda3/envs/blfmdf/Library/bin:/c/ProgramData/Anaconda3/envs/blfmdf/DLLs:$PATH" \
+/c/ProgramData/Anaconda3/envs/blfmdf/python.exe -m PyInstaller blf2mdf.spec \
+  --noconfirm --distpath dist --workpath build
+```
+
+验证：启动 exe 应出现"BLF 转 MDF 转换"窗口；`tools/frozen_probe.py` 与
+`tools/frozen_gui_probe.py` 是与 blf2mdf.spec 同裁剪配置的冻结探针
+（`sed 's/\[.main.py.\]/[tools\/frozen_probe.py]/; s/name=.blf2mdf./name=frozen_probe/'`，
+GUI 探针另加 `-e 's/console=False/console=True/'`），exe 同目录放置
+`inputs/blf/A19G1_ACFCAN_00112_20260614_141114.blf` 与
+`inputs/dbc/VDCCCU_CANFD1.dbc` 后运行：
+- `frozen_probe` 应打印 `PROBE_OK`（验证 multiprocessing spawn 路径）；
+- `frozen_gui_probe`（自动化入口 `tools/run_gui_probe.py`）应打印
+  `GUI_PROBE_OK`，验证真实 GUI 转换期间「BLF → MDF 转换」窗口数恒为 1——
+  即点击转换不会弹出第二个面板（回归防护，见下）。
+
+**冻结打包铁律**：入口脚本 `main.py` 的 `__main__` 块必须调用
+`multiprocessing.freeze_support()`。spawn worker 以
+`exe --multiprocessing-fork` 启动并重新执行入口脚本，没有该拦截会再开一个
+主面板并阻塞在事件循环（用户实测：点转换弹新面板，关掉才开始转）。PyInstaller
+6.21 不自动注入该调用，`tests/test_main_entry.py` 用 AST 断言防止回归。
+
+spec 内已裁剪未用的 Qt 模块 DLL/插件/翻译（约 60MB）与 conda
+ICU（33MB，System32 自带）；不装 UPX 是因为 onefile 内置 zlib 压缩后收益仅
+5~15% 且杀软误报风险高。
+
 ## 开发
 
 依赖：`pip install -r requirements.txt`（Python 3.12，conda 环境 blfmdf）

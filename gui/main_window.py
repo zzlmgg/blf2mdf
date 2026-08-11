@@ -1,4 +1,5 @@
 """主窗口：BLF/DBC 选择 → 通道绑定 → 转换 → 摘要。"""
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -41,11 +42,32 @@ class DbcCombo(QComboBox):
     def wheelEvent(self, event):
         event.ignore()
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _app_root() -> Path:
+    """运行根目录：源码运行时为项目根（gui/ 的上一级）；PyInstaller 冻结后
+    __file__ 指向临时解压目录，改为 exe 所在目录（inputs/outputs 随 exe 分发）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
-# ccu3.0 DBC 数据源：inputs/dbc_ccu3.0/<项目>/*.dbc + 同目录映射文件
-CCU3_ROOT = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
-CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt"
+
+PROJECT_ROOT = _app_root()
+
+
+def _find_ccu3_root(root: Path) -> Path | None:
+    """定位 ccu3.0 DBC 数据源（<root>/inputs/dbc_ccu3.0 或 <root>/dbc_ccu3.0）。
+
+    兼容两种发布布局：inputs/ 层（源码运行与当前发布包）与 exe 直接旁挂
+    （用户把 dbc_ccu3.0 放 exe 同一目录）。优先 inputs 布局；两者都无时
+    返回 None，GUI 降级为手动添加 DBC（不崩溃）。
+    """
+    for candidate in (root / "inputs" / "dbc_ccu3.0", root / "dbc_ccu3.0"):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+CCU3_ROOT = _find_ccu3_root(PROJECT_ROOT)
+CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt" if CCU3_ROOT else None
 
 PROJECT_PLACEHOLDER = "选择项目…"  # 项目下拉首项（禁用占位，仅提示）
 

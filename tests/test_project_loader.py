@@ -99,6 +99,39 @@ def test_list_projects_only_dbc_dirs(tmp_path):
     assert project_loader.list_projects(tmp_path) == ["A02", "AH8"]
 
 
+def test_list_projects_missing_root_returns_empty(tmp_path):
+    """发布布局缺 inputs/dbc_ccu3.0 时 GUI 启动不应崩溃（空项目列表 + 手动 DBC）。"""
+    assert project_loader.list_projects(tmp_path / "no_such_dir") == []
+
+
+def test_list_projects_none_returns_empty():
+    """未定位到数据源（CCU3_ROOT=None）时同样返回空列表。"""
+    assert project_loader.list_projects(None) == []
+
+
+# ---- ccu3 数据源定位（gui.main_window._find_ccu3_root）----
+
+def test_find_ccu3_root_prefers_inputs_layout(tmp_path):
+    """源码/发布包布局 <root>/inputs/dbc_ccu3.0 优先于直接旁挂。"""
+    (tmp_path / "inputs" / "dbc_ccu3.0").mkdir(parents=True)
+    (tmp_path / "dbc_ccu3.0").mkdir()
+    from gui.main_window import _find_ccu3_root
+    assert _find_ccu3_root(tmp_path) == tmp_path / "inputs" / "dbc_ccu3.0"
+
+
+def test_find_ccu3_root_direct_layout(tmp_path):
+    """exe 直接旁挂布局 <root>/dbc_ccu3.0 也能识别（用户需求）。"""
+    (tmp_path / "dbc_ccu3.0").mkdir()
+    from gui.main_window import _find_ccu3_root
+    assert _find_ccu3_root(tmp_path) == tmp_path / "dbc_ccu3.0"
+
+
+def test_find_ccu3_root_missing(tmp_path):
+    """两种布局都不存在 → None（GUI 降级手动 DBC，不崩溃）。"""
+    from gui.main_window import _find_ccu3_root
+    assert _find_ccu3_root(tmp_path) is None
+
+
 def test_list_projects_real_root():
     root = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
     projects = project_loader.list_projects(root)

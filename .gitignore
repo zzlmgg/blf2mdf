@@ -2,7 +2,9 @@
 inputs/
 outputs/
 raw_inputs*
+.codex-pytest*
 .claude
+.agents
 .superpowers*
 .pytest_cache*
 
@@ -17,3 +19,14 @@ venv/
 
 # 文档
 *superpower*
+
+# 打包产物
+build/
+dist/
+build_debug/
+dist_debug/
+build_probe/
+dist_probe/
+*.spec.bak
+dist_publish/
+dist_publish.zip
