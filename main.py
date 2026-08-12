@@ -4,12 +4,14 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from gui.main_window import MainWindow
+from gui.resources import install_application_icon
 from gui.theme import apply_theme
 
 
 def main():
     app = QApplication(sys.argv)
     apply_theme(app)
+    install_application_icon(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

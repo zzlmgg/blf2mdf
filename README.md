@@ -29,7 +29,8 @@ StdData/ExtData/StdRemote/ExtRemote/ErrorFrames 及各自 Rate，逐秒聚合，
 
 旧版发布物仍保留为 `dist/blf2mdf.exe` / `dist_publish/blf2mdf.exe`，不会被
 新版构建覆盖。PySide/QSS 新版使用独立文件名
-`exe_publish/BLF-to-MDF-PySide.exe`，同样是 PyInstaller onefile 窗口程序，
+`exe_publish/BLF2MDF.exe`，同样是 PyInstaller onefile 窗口程序；旧的
+`exe_publish/BLF-to-MDF-PySide.exe` 可继续保留用于版本对比，不会被新构建覆盖。
 目标体积不超过 65 MiB。两者都仅含实际
 导入的依赖：PySide6 Core/Gui/Widgets、numpy、pandas、asammdf、canmatrix 等；
 VC++ 运行库已内置，唯一系统级依赖是 System32 自带 ICU，Win10 1709+/Win11
@@ -47,7 +48,7 @@ inputs 目录也能启动，UI 降级为手动添加 DBC——list_projects 对�
 
 ```
 发布目录/
-├── blf2mdf.exe
+├── BLF2MDF.exe
 └── inputs/
     ├── dbc_ccu3.0/
     └── (blf、dbc 可放任意路径，转换时手动选择)
@@ -64,7 +65,7 @@ C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m PyInstaller `
 
 C:\ProgramData\Anaconda3\envs\blfmdf\python.exe `
   tools\verify_pyside_package.py --launch-smoke `
-  exe_publish\BLF-to-MDF-PySide.exe
+  exe_publish\BLF2MDF.exe
 ```
 
 验证：启动 exe 应出现 `BLF → MDF` 窗口；`tools/frozen_probe.py` 与

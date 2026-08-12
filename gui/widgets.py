@@ -3,8 +3,16 @@
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPalette, QPen
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QLinearGradient,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QComboBox,
@@ -18,6 +26,43 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from gui.resources import application_icon
+
+
+class AppShell(QWidget):
+    """Antialiased main-window shell whose outline stays inside its bounds."""
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        maximized = bool(self.property("shellMaximized"))
+        inset = 0.625 if maximized else 1.0
+        rect = QRectF(
+            inset,
+            inset,
+            self.width() - 2 * inset,
+            self.height() - 2 * inset,
+        )
+        path = QPainterPath()
+        radius = 0.0 if maximized else 10.0
+        path.addRoundedRect(rect, radius, radius)
+
+        if bool(self.property("nativeGlass")):
+            painter.setBrush(QColor(248, 250, 253, 220))
+        else:
+            background = QLinearGradient(0, rect.top(), 0, rect.bottom())
+            background.setColorAt(0, QColor(252, 253, 255, 244))
+            background.setColorAt(1, QColor(248, 250, 253, 238))
+            painter.setBrush(background)
+
+        border = QPen(QColor("#aeb1b7"), 1.25)
+        border.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(border)
+        painter.drawPath(path)
+        painter.end()
+        super().paintEvent(event)
 
 
 class CompactCombo(QComboBox):
@@ -262,6 +307,18 @@ class TitleBar(QWidget):
         self.title_label = QLabel("BLF → MDF", self)
         self.title_label.setObjectName("windowTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+
+        self.icon_label = QLabel(self)
+        self.icon_label.setObjectName("windowTitleIcon")
+        self.icon_label.setFixedSize(24, 24)
+        self.icon_label.setPixmap(application_icon().pixmap(QSize(24, 24)))
+        self.icon_label.setScaledContents(False)
+        self.icon_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(15, 0, 0, 0)
@@ -277,11 +334,11 @@ class TitleBar(QWidget):
         self.close_button.clicked.connect(lambda: self.window().close())
         self.minimize_button.clicked.connect(lambda: self.window().showMinimized())
         self.maximize_button.clicked.connect(self._toggle_maximized)
-        self.title_label.lower()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.title_label.setGeometry(0, 0, self.width(), self.height())
+        self.title_label.setGeometry(self.rect())
+        self.icon_label.move(14, (self.height() - self.icon_label.height()) // 2)
 
     def _toggle_maximized(self):
         window = self.window()

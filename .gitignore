@@ -31,6 +31,7 @@ dist_probe/
 dist_publish/
 dist_publish.zip
 build_pyside_qss/
+build_ui_review/
 exe_publish/
 release_pyside_qss*/
 build_ui_review/

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -38,8 +39,7 @@ def test_theme_exposes_approved_tokens():
     ):
         assert color in theme
     assert "qwidget#approot" in theme
-    assert "border-radius: 10px" in theme
-    assert "rgba(248, 250, 253" in theme
+    assert "qwidget#approot {\n    background: transparent;\n    border: 0;" in theme
 
 
 def test_theme_uses_explicit_chinese_capable_application_font(qapp):
@@ -47,6 +47,19 @@ def test_theme_uses_explicit_chinese_capable_application_font(qapp):
 
     apply_theme(qapp)
     assert qapp.font().family() == "Microsoft YaHei UI"
+
+
+def test_application_icon_is_loadable_and_installable(qapp):
+    """Catch missing/broken bundled PNGs and a forgotten QApplication icon."""
+    from gui.resources import application_icon, install_application_icon
+
+    qapp.setWindowIcon(QIcon())
+    icon = application_icon()
+    assert not icon.isNull()
+
+    installed = install_application_icon(qapp)
+    assert not installed.isNull()
+    assert not qapp.windowIcon().isNull()
 
 
 def test_semantic_icon_has_16px_ring_and_28px_hit_target(qapp):
@@ -82,6 +95,16 @@ def test_title_bar_exposes_centered_title_and_windows_actions(qapp):
     assert title_bar.height() == 38
     assert title_bar.title_label.text() == "BLF → MDF"
     assert title_bar.title_label.alignment() & Qt.AlignmentFlag.AlignHCenter
+    assert title_bar.icon_label.width() == 24
+    assert title_bar.icon_label.height() == 24
+    assert title_bar.icon_label.pixmap() is not None
+    assert not title_bar.icon_label.pixmap().isNull()
+    assert title_bar.icon_label.x() == 14
+    assert abs(
+        title_bar.icon_label.geometry().center().y()
+        - title_bar.rect().center().y()
+    ) <= 1
+    assert title_bar.title_label.geometry() == title_bar.rect()
     assert "Signal Workspace" not in {
         label.text() for label in title_bar.findChildren(QLabel)
     }
@@ -545,26 +568,54 @@ def test_delete_key_removes_all_selected_dbcs(window, qapp):
 
 
 def test_window_outer_border_follows_rounded_shell(window, qapp, monkeypatch):
-    from PySide6.QtGui import QColor
-
     import gui.main_window as main_window
     from gui.theme import apply_theme
+    from gui.widgets import AppShell
 
     monkeypatch.setattr(main_window, "apply_light_glass", lambda _: False)
     apply_theme(qapp)
     window.show()
     qapp.processEvents()
-    image = window.grab().toImage()
-    edge_points = (
-        (window.width() // 2, 0),
-        (0, window.height() // 2),
-        (window.width() - 1, window.height() // 2),
-        (window.width() // 2, window.height() - 1),
-    )
+    assert isinstance(window.centralWidget(), AppShell)
+    pixmap = window.grab()
+    image = pixmap.toImage()
+    dpr = pixmap.devicePixelRatio()
+    border = (174, 177, 183)
 
-    assert {
-        QColor(image.pixel(x, y)).name() for x, y in edge_points
-    } == {"#aeb1b7"}
+    def is_border_pixel(x, y):
+        color = image.pixelColor(x, y)
+        return max(
+            abs(color.red() - border[0]),
+            abs(color.green() - border[1]),
+            abs(color.blue() - border[2]),
+        ) <= 18
+
+    # At fractional Windows scaling, every scanline through each rounded arc
+    # must retain a substantially opaque border pixel. A border drawn directly
+    # on the widget boundary drops to isolated low-alpha pixels and looks broken.
+    corner_size = round(20 * dpr)
+    scan_start = round(4 * dpr)
+    scan_stop = round(10 * dpr)
+    transforms = (
+        lambda x, y: (x, y),
+        lambda x, y: (image.width() - 1 - x, y),
+        lambda x, y: (x, image.height() - 1 - y),
+        lambda x, y: (image.width() - 1 - x, image.height() - 1 - y),
+    )
+    scanline_count = scan_stop - scan_start + 1
+    for transform in transforms:
+        strong_scanlines = 0
+        for y in range(scan_start, scan_stop + 1):
+            alphas = []
+            for x in range(corner_size):
+                px, py = transform(x, y)
+                if is_border_pixel(px, py):
+                    alphas.append(image.pixelColor(px, py).alpha())
+            assert alphas and max(alphas) >= 120
+            if max(alphas) >= 220:
+                strong_scanlines += 1
+        assert strong_scanlines >= scanline_count - 2
+
     assert not window.mask().contains(window.rect().topLeft())
     assert not window.mask().contains(window.rect().topRight())
     assert not window.mask().contains(window.rect().bottomLeft())

@@ -26,7 +26,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=_CONDA_RUNTIME_BINARIES,
-    datas=[],
+    datas=[('assets/blf2mdf_icon.png', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -100,7 +100,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='BLF-to-MDF-PySide',
+    name='BLF2MDF',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -111,4 +111,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/blf2mdf_icon.ico',
 )

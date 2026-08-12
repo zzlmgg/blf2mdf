@@ -16,19 +16,14 @@ QMainWindow {
     background: transparent;
 }
 QWidget#appRoot {
-    background: qlineargradient(
-        x1: 0, y1: 0, x2: 0, y2: 1,
-        stop: 0 rgba(252, 253, 255, 244),
-        stop: 1 rgba(248, 250, 253, 238)
-    );
-    border: 1px solid #aeb1b7;
-    border-radius: 10px;
+    background: transparent;
+    border: 0;
 }
 QWidget#appRoot[nativeGlass="true"] {
-    background: rgba(248, 250, 253, 220);
+    background: transparent;
 }
 QWidget#appRoot[shellMaximized="true"] {
-    border-radius: 0px;
+    background: transparent;
 }
 QWidget#appBody {
     background: transparent;

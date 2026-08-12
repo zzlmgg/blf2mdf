@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
 from core import blf_reader, project_loader
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
+from gui.resources import application_icon
 from gui.theme import WINDOW_HEIGHT, WINDOW_WIDTH
 from gui.widgets import (
+    AppShell,
     CompactCombo,
     DbcListItemWidget,
     DbcListWidget,
@@ -134,6 +136,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BLF → MDF")
+        self.setWindowIcon(application_icon())
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -152,7 +155,7 @@ class MainWindow(QMainWindow):
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
 
-        central = QWidget()
+        central = AppShell()
         central.setObjectName("appRoot")
         central.setProperty("nativeGlass", False)
         central.setProperty("shellMaximized", False)
