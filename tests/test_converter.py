@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 from asammdf import MDF
 
+from core.blf_reader import ScanCancelled
 from core.converter import convert
 from core.dbc_loader import load
 
@@ -264,3 +267,61 @@ def test_convert_stats_t_axis_last_point_full_precision(tmp_path):
     assert t[-2] == 5.009
     # 末点保留全精度（仅容忍 BLF 写入/读回的浮点舍入，不允许 1ms 截断）
     assert t[-1] == pytest.approx(5.123456, abs=1e-6), t[-1]
+
+
+# ---- 转换取消 ----
+
+def test_convert_cancel_preset_no_output(tmp_path, blf_and_dbc):
+    """cancel_cb 预置 True：转换在任何检查点（读取后）即抛 ScanCancelled，
+    输出文件与半成品 .mf4 均不残留。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "cancelled.mdf"
+    with pytest.raises(ScanCancelled):
+        convert(blf, {1: load(dbc_path)}, str(out), cancel_cb=lambda: True)
+    assert not out.exists(), "取消后不应残留输出文件"
+    assert not Path(str(out).replace(".mdf", ".mf4")).exists(), \
+        "取消后不应残留半成品 .mf4"
+
+
+def test_convert_cancel_mid_read(tmp_path):
+    """读取阶段中途取消：≥1024 帧文件，cancel_cb 在第 3 次检查（3072 帧处）
+    置位 → 抛出且无输出。"""
+    import can
+
+    blf = tmp_path / "big_cancel.blf"
+    with can.BLFWriter(str(blf)) as w:
+        for i in range(3500):
+            w.on_message_received(can.Message(
+                arbitration_id=100, is_extended_id=False,
+                data=bytes([0xE8, 0x03, 0, 0, 0, 0, 0, 0]),
+                channel=1, timestamp=1784716800.0 + i))
+    dbc = tmp_path / "t.dbc"
+    dbc.write_text(INLINE_DBC, encoding="utf-8")
+    out = tmp_path / "mid_cancel.mdf"
+    state = {"calls": 0}
+
+    def cancel():
+        state["calls"] += 1
+        return state["calls"] >= 3  # 1024、2048 帧处 False，3072 帧处 True
+
+    with pytest.raises(ScanCancelled):
+        convert(blf, {1: load(dbc)}, str(out), cancel_cb=cancel)
+    assert not out.exists()
+
+
+def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
+    """并行解码（finish_all 桶收集循环）中取消：cancel_cb 在读取后检查点放行、
+    首个桶完成时置位 → ScanCancelled 从 finish_all 上抛（不被 except Exception
+    吞掉转串行重解），输出不残留。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "par_cancel.mdf"
+    state = {"calls": 0}
+
+    def cancel():
+        state["calls"] += 1
+        return state["calls"] >= 2  # 读取后检查点（第 1 次）放行，桶完成时（第 2 次）取消
+
+    with pytest.raises(ScanCancelled):
+        convert(blf, {1: load(dbc_path), 2: load(dbc_path)}, str(out),
+                parallel=True, cancel_cb=cancel)
+    assert not out.exists()

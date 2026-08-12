@@ -450,3 +450,145 @@ def test_project_switch_drops_stale_mapped_row(window):
                                   keep_prev=False)
     assert [window.table.item(r, 0).text()
             for r in range(window.table.rowCount())] == ["CAN 1"]
+
+
+# ---- 扫描/转换取消 ----
+
+def _wait_until(qapp, cond, timeout=10.0):
+    """泵动事件循环直到 cond() 为真或超时（GUI 异步测试的确定性等待）。"""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    return cond()
+
+
+def _looping_probe_until_cancel():
+    """确定性探测桩：循环检查 cancel_cb，置位即抛 ScanCancelled——
+    避免真实 probe 在毫秒级完成导致的时序抖动。"""
+    import time
+
+    from core.blf_reader import ScanCancelled
+
+    def fake(path, progress_cb=None, cancel_cb=None):
+        while True:
+            if cancel_cb and cancel_cb():
+                raise ScanCancelled()
+            time.sleep(0.001)
+
+    return fake
+
+
+def _looping_convert_until_cancel():
+    """确定性转换桩：循环检查 cancel_cb，置位即抛 ScanCancelled。"""
+    import time
+
+    from core.blf_reader import ScanCancelled
+
+    def fake(*args, cancel_cb=None, **kwargs):
+        while True:
+            if cancel_cb and cancel_cb():
+                raise ScanCancelled()
+            time.sleep(0.001)
+
+    return fake
+
+
+def test_scan_cancel_aborts_and_resets(window, qapp, tmp_path, monkeypatch):
+    """扫描中取消：worker 抛 ScanCancelled → 状态复位（blf_path 不变、
+    进度条隐藏、文件选择恢复），不弹错误框。"""
+    import gui.main_window as mw
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+    errors = []
+    monkeypatch.setattr(mw.QMessageBox, "critical",
+                        lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(mw.blf_reader, "probe_channels",
+                        _looping_probe_until_cancel())
+
+    window.show()  # isVisible() 需要整条祖先链可见
+    window._load_blf(str(blf))
+    assert window.scan_thread is not None and window.scan_thread.isRunning()
+    assert window.btn_scan_cancel.isVisible(), "扫描期间应显示取消按钮"
+    window.btn_scan_cancel.click()  # 设置取消事件
+    assert _wait_until(qapp, lambda: window.scan_thread is None), \
+        "取消后扫描线程应收尾"
+    assert window.blf_path is None, "取消不应用结果（未加载过文件）"
+    assert window.blf_channels == []
+    assert window.load_progress.isHidden(), "进度条应隐藏"
+    assert window.btn_blf.isEnabled(), "文件选择应恢复"
+    assert not window.convert_btn.isEnabled(), "无已加载 BLF 不能转换"
+    assert errors == [], "取消不是错误，不应弹错误框"
+    window.close()
+
+
+def test_convert_cancel_resets_state(window, qapp, tmp_path, monkeypatch):
+    """转换中取消：worker 抛 ScanCancelled → 状态复位（进度归零、
+    stage_label 就绪、按钮恢复、摘要「已取消」），不弹任何框。"""
+    import gui.main_window as mw
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+    out = tmp_path / "run001_t.mdf"
+    boxes = []
+    monkeypatch.setattr(mw.QMessageBox, "critical",
+                        lambda *a, **k: boxes.append(("critical", a)))
+    monkeypatch.setattr(mw.QMessageBox, "information",
+                        lambda *a, **k: boxes.append(("info", a)))
+    monkeypatch.setattr(mw, "convert", _looping_convert_until_cancel())
+
+    window.blf_path = str(blf)
+    window.out_edit.setText(str(out))
+    window._rebuild_channel_table([1])  # 一行「不绑定」→ bindings {1: None}
+    window.show()  # isVisible() 需要整条祖先链可见
+    window._start_convert()
+    assert window.worker_thread is not None and window.worker_thread.isRunning()
+    assert window.btn_convert_cancel.isVisible(), "转换期间应显示取消按钮"
+    window.btn_convert_cancel.click()
+    assert _wait_until(qapp, lambda: window.worker_thread is None), \
+        "取消后转换线程应收尾"
+    assert window.stage_label.text() == "就绪"
+    assert window.progress.value() == 0
+    assert window.convert_btn.isEnabled(), "转换按钮应恢复可用"
+    assert window.summary_status.text() == "已取消"
+    assert boxes == [], "取消不是错误/成功，不应弹任何框"
+    window.close()
+
+
+def test_close_during_scan_returns_promptly(window, qapp, tmp_path, monkeypatch):
+    """扫描中关窗：closeEvent 先置取消事件再等待 → 快速返回（不再等全文件扫完）。"""
+    import gui.main_window as mw
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+    monkeypatch.setattr(mw.blf_reader, "probe_channels",
+                        _looping_probe_until_cancel())
+    window._load_blf(str(blf))
+    assert window.scan_thread is not None and window.scan_thread.isRunning()
+    window.close()  # 若未置取消事件，此调用会卡住（桩循环永不退出）
+    assert window.scan_thread is None, "关窗后扫描线程应收尾"
+
+
+def test_close_during_convert_returns_promptly(window, qapp, tmp_path,
+                                               monkeypatch):
+    """转换中关窗：确认后先置取消事件再等待 → 快速返回。"""
+    import gui.main_window as mw
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+    out = tmp_path / "run001_t.mdf"
+    monkeypatch.setattr(mw, "convert", _looping_convert_until_cancel())
+    monkeypatch.setattr(
+        mw.QMessageBox, "question",
+        lambda *a, **k: mw.QMessageBox.StandardButton.Yes)
+
+    window.blf_path = str(blf)
+    window.out_edit.setText(str(out))
+    window._rebuild_channel_table([1])
+    window._start_convert()
+    assert window.worker_thread is not None and window.worker_thread.isRunning()
+    window.close()  # 未置取消事件会卡住（桩循环永不退出）
+    assert window.worker_thread is None, "关窗后转换线程应收尾"

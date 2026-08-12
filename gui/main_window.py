@@ -1,5 +1,6 @@
 """主窗口：BLF/DBC 选择 → 通道绑定 → 转换 → 摘要。"""
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QThread, QObject, Signal, Slot
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import blf_reader, project_loader
+from core.blf_reader import ScanCancelled
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
 from gui.resources import application_icon
@@ -84,13 +86,15 @@ PROJECT_PLACEHOLDER = "项目"  # 项目下拉首项（禁用占位，仅提示�
 class ConvertWorker(QObject):
     progress = Signal(str, float)
     done = Signal(object)
+    cancelled = Signal()
     error = Signal(str)
 
-    def __init__(self, blf_path, bindings, out_path):
+    def __init__(self, blf_path, bindings, out_path, cancel_event):
         super().__init__()
         self.blf_path = blf_path
         self.bindings = bindings
         self.out_path = out_path
+        self.cancel_event = cancel_event
 
     @Slot()
     def run(self):
@@ -102,32 +106,43 @@ class ConvertWorker(QObject):
             result = convert(self.blf_path, self.bindings, self.out_path,
                              progress_cb=lambda s, p: self.progress.emit(s, p),
                              raw_export=False,
-                             parallel=True)
+                             parallel=True,
+                             cancel_cb=self.cancel_event.is_set)
             self.done.emit(result)
+        except ScanCancelled:
+            self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
 
 
 class BlfScanWorker(QObject):
-    """BLF 通道枚举（worker 线程）：list_channels 全文件解析可能耗时数十秒
-    （86MB/565 万帧实测 41s），放后台线程避免主界面冻结成「未响应」。
+    """BLF 通道探测（worker 线程）：probe_channels 对象头级轻量行走
+    （list_channels 全文件解析 86MB/565 万帧实测 41s，探测 5-20 倍更快），
+    放后台线程避免主界面冻结成「未响应」。
 
-    progress 按文件字节位置报真实进度（0-100），done/error 结果回主线程。
+    progress 按文件字节位置报真实进度（0-100）；cancel_event 置位后
+    probe 在 1024 对象内抛 ScanCancelled → cancelled 信号回主线程。
     """
     progress = Signal(float)
     done = Signal(object)
+    cancelled = Signal()
     error = Signal(str)
 
-    def __init__(self, path):
+    def __init__(self, path, cancel_event):
         super().__init__()
         self.path = path
+        self.cancel_event = cancel_event
 
     @Slot()
     def run(self):
         try:
-            channels = blf_reader.list_channels(
-                self.path, progress_cb=self.progress.emit)
+            channels = blf_reader.probe_channels(
+                self.path,
+                progress_cb=self.progress.emit,
+                cancel_cb=self.cancel_event.is_set)
             self.done.emit(channels)
+        except ScanCancelled:
+            self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
 
@@ -154,6 +169,10 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
+        # 扫描/转换取消事件：每次加载/转换重建；取消按钮与 closeEvent
+        # 置位，worker 循环检查后抛 ScanCancelled（threading.Event 跨线程安全）
+        self.scan_cancel = threading.Event()
+        self.convert_cancel = threading.Event()
 
         central = AppShell()
         central.setObjectName("appRoot")
@@ -206,6 +225,15 @@ class MainWindow(QMainWindow):
         self.load_progress.setTextVisible(False)
         self.load_progress.setVisible(False)
         row.addWidget(self.load_progress)
+        # 扫描取消：仅扫描期间显示（_set_scan_busy 控制）；点击置位取消
+        # 事件，worker 循环在 1024 对象内抛 ScanCancelled 退出
+        self.btn_scan_cancel = QPushButton("取消")
+        self.btn_scan_cancel.setObjectName("secondaryButton")
+        self.btn_scan_cancel.setMinimumWidth(64)
+        self.btn_scan_cancel.setFixedHeight(32)
+        self.btn_scan_cancel.setVisible(False)
+        self.btn_scan_cancel.clicked.connect(self._cancel_scan)
+        row.addWidget(self.btn_scan_cancel)
         btn_blf = QPushButton("浏览…")
         btn_blf.setObjectName("secondaryButton")
         btn_blf.setMinimumWidth(76)
@@ -356,6 +384,14 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         progress_col.addWidget(self.progress)
         ctrl_row.addLayout(progress_col, 1)
+        # 转换取消：仅转换期间显示（_set_busy 控制）；大文件转换读取是
+        # 唯一长耗时步骤，读取/解码检查点都尊重该取消事件
+        self.btn_convert_cancel = QPushButton("取消")
+        self.btn_convert_cancel.setObjectName("secondaryButton")
+        self.btn_convert_cancel.setFixedSize(64, 36)
+        self.btn_convert_cancel.setVisible(False)
+        self.btn_convert_cancel.clicked.connect(self._cancel_convert)
+        ctrl_row.addWidget(self.btn_convert_cancel)
         self.convert_btn = QPushButton("开始转换")
         self.convert_btn.setObjectName("primaryButton")
         self.convert_btn.setFixedSize(126, 36)
@@ -437,31 +473,41 @@ class MainWindow(QMainWindow):
         self._load_blf(path)
 
     def _load_blf(self, path: str):
-        """加载 BLF（异步）：后台线程枚举通道 → 刷新通道表与默认输出路径。
+        """加载 BLF（异步）：后台线程探测通道 → 刷新通道表与默认输出路径。
 
-        大文件（如 86MB/565 万帧）list_channels 全文件解析实测耗时 41s，
-        若在主线程同步执行窗口会冻结成「未响应」；改为 worker 线程 +
-        字节级真实进度，扫描期间界面保持响应，进度条可见推进。
+        大文件（如 86MB/565 万帧）全文件解析实测耗时 41s，若在主线程
+        同步执行窗口会冻结成「未响应」；改为 worker 线程（probe_channels
+        对象头级轻量行走，5-20 倍更快）+ 字节级真实进度 + 取消按钮，
+        扫描期间界面保持响应，进度条可见推进。
         """
         if self.scan_thread is not None and self.scan_thread.isRunning():
             return  # 扫描进行中不接受新文件
+        self.scan_cancel = threading.Event()  # 每次加载重建（取消即作废本次尝试）
         self._set_scan_busy(True)
         self.load_progress.setVisible(True)
         self.load_progress.setValue(0)
         self.scan_thread = QThread()
-        self.scan_worker = BlfScanWorker(path)
+        self.scan_worker = BlfScanWorker(path, self.scan_cancel)
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.done.connect(self._on_scan_done)
+        self.scan_worker.cancelled.connect(self._on_scan_cancelled)
         self.scan_worker.error.connect(self._on_scan_error)
         self.scan_thread.start()
+
+    def _cancel_scan(self):
+        """「取消」按钮：置位取消事件（worker 在 1024 对象内抛 ScanCancelled）。"""
+        self.scan_cancel.set()
+        self.btn_scan_cancel.setEnabled(False)
 
     def _set_scan_busy(self, busy: bool):
         """扫描期间禁用文件选择与转换；转换按钮另需已加载 BLF。"""
         self.btn_blf.setEnabled(not busy)
         self.convert_btn.setEnabled(not busy and self.blf_path is not None)
         self.load_progress.setVisible(busy)
+        self.btn_scan_cancel.setVisible(busy)
+        self.btn_scan_cancel.setEnabled(busy)
 
     @Slot(float)
     def _on_scan_progress(self, percent: float):
@@ -486,6 +532,12 @@ class MainWindow(QMainWindow):
         self._finish_scan()
         QMessageBox.critical(self, "BLF 读取失败",
                              f"{self.scan_worker.path}\n{msg}")
+
+    @Slot()
+    def _on_scan_cancelled(self):
+        """取消：复位界面但**不应用**结果（blf_path 保持原值——
+        无文件保持 None，替换文件保持旧文件）。"""
+        self._finish_scan()
 
     def _finish_scan(self):
         thread = self.scan_thread
@@ -716,6 +768,7 @@ class MainWindow(QMainWindow):
                 bindings[ch] = None
             else:
                 bindings[ch] = self._dbc_by_display(text)
+        self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
         self._set_busy(True)
         self.progress.setValue(0)
         self.summary.clear()
@@ -723,13 +776,27 @@ class MainWindow(QMainWindow):
         self.summary_status.setText("转换中…")
         self.summary_button.setEnabled(False)
         self.worker_thread = QThread()
-        self.worker = ConvertWorker(self.blf_path, bindings, out)
+        self.worker = ConvertWorker(self.blf_path, bindings, out,
+                                    self.convert_cancel)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.done.connect(self._on_done)
+        self.worker.cancelled.connect(self._on_convert_cancelled)
         self.worker.error.connect(self._on_error)
         self.worker_thread.start()
+
+    def _cancel_convert(self):
+        """「取消」按钮：置位取消事件（worker 在 1024 帧/每桶内抛
+        ScanCancelled；写 MDF 期间点取消 → 清理已写输出后抛出）。"""
+        self.convert_cancel.set()
+        self.btn_convert_cancel.setEnabled(False)
+
+    @Slot()
+    def _on_convert_cancelled(self):
+        """取消：复位界面（进度归零、按钮恢复），摘要显示「已取消」。"""
+        self._finish()
+        self.summary_status.setText("已取消")
 
     def _dbc_by_display(self, text: str) -> DbcDef | None:
         """按下拉显示名（文件名 + 文件夹，如 PFCAN2.dbc（AH8））回查 DbcDef。
@@ -756,6 +823,8 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not busy)
         can_convert = bool(self.blf_path and self.out_edit.text().strip())
         self.convert_btn.setEnabled(not busy and can_convert)
+        self.btn_convert_cancel.setVisible(busy)
+        self.btn_convert_cancel.setEnabled(busy)
 
     @Slot(str, float)
     def _on_progress(self, stage: str, percent: float):
@@ -858,9 +927,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         thread = self.scan_thread
         if thread is not None and thread.isRunning():
-            # 扫描无法中途取消：等待其完成，避免销毁仍在运行的 QThread
+            # 先置位取消事件：probe 在 1024 对象内抛 ScanCancelled 快速返回，
+            # wait() 不再阻塞到全文件扫完
+            self.scan_cancel.set()
             thread.quit()
             thread.wait()
+            self.scan_thread = None
         thread = self.worker_thread
         if thread is not None and thread.isRunning():
             ans = QMessageBox.question(
@@ -869,9 +941,10 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            # convert() 无法中途取消：先退出事件循环再等待线程结束，
-            # 避免销毁仍在运行的 QThread（Qt 会 abort）。
-            # wait() 期间主线程阻塞，_on_done/_on_error 的 _finish() 不会并发执行。
+            # 先置位取消事件：convert 在 1024 帧/每桶检查点快速返回，
+            # wait() 不再阻塞到转换完成；写 MDF 期间取消会清理已写输出。
+            self.convert_cancel.set()
             thread.quit()
             thread.wait()
+            self.worker_thread = None
         event.accept()

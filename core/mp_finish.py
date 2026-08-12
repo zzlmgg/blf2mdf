@@ -22,6 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
+from core.blf_reader import ScanCancelled
 from core.decoder import DecodeStats, _decode_bucket_reference, \
     _finish_bucket_vectorized, _msg_vectorizable
 
@@ -109,7 +110,8 @@ def _assert_series_equal(a, b) -> str | None:
 def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                progress_cb=None, workers: int | None = None,
                pool: ProcessPoolExecutor | None = None,
-               verify: bool = False) -> dict[int, tuple[list, DecodeStats]]:
+               verify: bool = False,
+               cancel_cb=None) -> dict[int, tuple[list, DecodeStats]]:
     """按桶并行 finish 全部通道 → {ch: (series 列表, 合并后 DecodeStats)}。
 
     - 调用方可在扫描前创建池并 warm_up（spawn 成本藏在扫描期）；
@@ -120,6 +122,9 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
       所有桶完成后按通道补齐 → 解码期间进度条停住、结束瞬间跳到 90%。
     - verify=True：组装结果与父进程本地串行 finish 全量对拍（测试用）。
     - 失败回退：任务异常/池损坏 → 未完成桶原地串行 finish，结果与全串行一致。
+    - cancel_cb() 可选：每桶完成时检查（收集循环 + 串行兜底循环），置位即
+      raise ScanCancelled——注意必须在通用 except Exception 之前捕获，否则
+      取消异常会被当成池故障吞掉、转串行兜底重解（取消静默失效）。
     """
     if not channels:
         return {}
@@ -169,6 +174,10 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                 f = pool.submit(_finish_bucket_worker, ch, arb, bucket, dbc)
                 futures[f] = (ch, arb)
         for f in as_completed(futures):
+            # 取消检查点：每桶完成时（in-flight 桶由 finally 的
+            # shutdown(cancel_futures=True) 收尾，运行中桶至多 ~1s）
+            if cancel_cb is not None and cancel_cb():
+                raise ScanCancelled()
             ch, arb = futures[f]
             try:
                 _, _, series, unk_frames, unk_ids = f.result()
@@ -177,6 +186,9 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                 continue
             results[(ch, arb)] = (series, unk_frames, unk_ids)
             _report(ch, decoders[ch].buckets[arb])
+    except ScanCancelled:
+        # 必须先于通用 except Exception 捕获：取消不能走「池故障→串行兜底」
+        raise
     except Exception:
         # BrokenProcessPool 等：未收齐的桶全部转串行
         done = set(results)
@@ -190,6 +202,9 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
 
     # ── 串行兜底（结果与全串行一致，兜底桶同样上报进度）──
     for ch, arb, bucket in failed:
+        # 取消检查点：串行兜底逐桶
+        if cancel_cb is not None and cancel_cb():
+            raise ScanCancelled()
         _, _, series, unk_frames, unk_ids = \
             _finish_bucket_worker(ch, arb, bucket, decoders[ch].dbc)
         results[(ch, arb)] = (series, unk_frames, unk_ids)

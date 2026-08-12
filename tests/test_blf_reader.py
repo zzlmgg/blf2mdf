@@ -2,8 +2,41 @@ import itertools
 
 import pytest
 
-from core.blf_reader import Frame, iter_all_messages, iter_messages, list_channels
+from core.blf_reader import (
+    Frame,
+    ScanCancelled,
+    iter_all_messages,
+    iter_messages,
+    list_channels,
+    probe_channels,
+)
 from conftest import sample_blf
+
+
+def _multi_container_blf(path, frames=3000):
+    """多容器合成 BLF（~9000 帧 × ~35B ≈ 300KB → python-can 容器上限内多个
+    容器），制造跨容器读取路径；返回预期通道列表 [1, 2, 3]。
+    """
+    import can
+
+    with can.BLFWriter(str(path)) as w:
+        for i in range(frames):
+            for ch in (1, 2, 3):
+                w.on_message_received(can.Message(
+                    arbitration_id=0x100 + i % 3, data=b"\xAA\xBB\xCC",
+                    channel=ch, timestamp=1784716800.0 + i))
+    return [1, 2, 3]
+
+
+def _big_blf(path, frames=2500):
+    """≥1024 帧的单通道合成 BLF（取消检查点每 1024 帧触发一次）。"""
+    import can
+
+    with can.BLFWriter(str(path)) as w:
+        for i in range(frames):
+            w.on_message_received(can.Message(
+                arbitration_id=0x100 + i % 3, data=b"\xAA",
+                channel=1, timestamp=1784716800.0 + i))
 
 
 def test_synthetic_blf_roundtrip(tmp_path):
@@ -118,3 +151,54 @@ def test_iter_messages_fields_on_sample():
     assert any(f.is_fd for f in frames) or True  # 打印 FD 帧占比，不强制
     fd_count = sum(1 for f in frames if f.is_fd)
     print(f"前 200 帧中 CANFD: {fd_count}")
+
+
+# ---- 轻量通道探测 probe_channels ----
+
+def test_probe_channels_matches_list_channels(tmp_path):
+    """probe_channels（对象头级行走）== list_channels（完整解析）——
+    多容器文件下通道集合逐位一致。"""
+    p = tmp_path / "multi.blf"
+    expected = _multi_container_blf(p)
+    assert probe_channels(str(p)) == expected
+    assert probe_channels(str(p)) == list_channels(str(p))
+
+
+def test_probe_channels_on_sample():
+    """样例 BLF：探测与完整解析通道集合一致（覆盖 CANoe 真实文件布局，
+    含跨容器对象/尾部衔接——合成 BLF 的 writer 不在消息间跨容器）。"""
+    blf = sample_blf()
+    if blf is None:
+        pytest.skip("无样例 BLF 文件")
+    assert probe_channels(str(blf)) == list_channels(str(blf))
+
+
+def test_probe_channels_reports_monotonic_progress(tmp_path):
+    """probe_channels 的 progress_cb 按文件字节位置单调推进，最终 100%。"""
+    p = tmp_path / "prog3.blf"
+    _multi_container_blf(p)
+    values = []
+    assert probe_channels(str(p), progress_cb=values.append) == [1, 2, 3]
+    assert values, "至少一次进度回调"
+    assert values[-1] == 100.0, "读完应报 100%"
+    assert values == sorted(values), "进度应单调不降"
+
+
+def test_probe_channels_cancel(tmp_path):
+    """cancel_cb 置位 → raise ScanCancelled；恒 False → 正常完成。"""
+    p = tmp_path / "cancel1.blf"
+    _big_blf(p)  # ≥1024 帧，检查点在 1024 帧处触发
+    with pytest.raises(ScanCancelled):
+        probe_channels(str(p), cancel_cb=lambda: True)
+    assert probe_channels(str(p), cancel_cb=lambda: False), \
+        "cancel_cb 恒 False 不应取消"
+
+
+def test_iter_all_messages_cancel(tmp_path):
+    """iter_all_messages 的 cancel_cb 同款语义（转换读取阶段用）。"""
+    p = tmp_path / "cancel2.blf"
+    _big_blf(p)
+    with pytest.raises(ScanCancelled):
+        list(iter_all_messages(str(p), cancel_cb=lambda: True))
+    frames = list(iter_all_messages(str(p), cancel_cb=lambda: False))
+    assert len(frames) >= 1024, "恒 False 不应取消"

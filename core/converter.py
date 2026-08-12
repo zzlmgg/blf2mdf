@@ -7,9 +7,16 @@ from pathlib import Path
 import numpy as np
 
 from core import blf_reader, mdf_writer, mp_finish
+from core.blf_reader import ScanCancelled
 from core.decoder import ChannelDecoder
 from core.dbc_loader import DbcDef
 from core import stats as stats_mod
+
+
+def _check_cancel(cancel_cb) -> None:
+    """转换检查点：cancel_cb 置位 → raise ScanCancelled（GUI 取消按钮）。"""
+    if cancel_cb is not None and cancel_cb():
+        raise ScanCancelled()
 
 # 方案 G：并行解码的桶内存阈值（估算，超阈值回退串行，env 可覆盖；见 §5.7）
 _MP_MEM_THRESHOLD = float(os.environ.get("BLF_MP_MEM_THRESHOLD", 1.5e9))
@@ -82,7 +89,8 @@ def _collect_raw(frames, channel: int,
 
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             progress_cb=None, raw_export: bool = False,
-            stats_export: bool = True, parallel: bool = False) -> ConversionResult:
+            stats_export: bool = True, parallel: bool = False,
+            cancel_cb=None) -> ConversionResult:
     """多通道 BLF → 单个 MDF。
 
     raw_export=False（默认，与 CANoe 一致）：未绑定 DBC 的通道不导出原始帧，
@@ -94,6 +102,10 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     progress_cb(stage, percent) 进度刻度（percent 单调不降）：
     读取 BLF 5→10（逐容器字节位置）、解码 CANn 10→90（并行按桶/串行按
     通道）、聚合统计 CANn 92→95（逐通道）、写 MDF 95、完成 100。
+
+    cancel_cb() 可选：读取（每 1024 帧）、解码（串行逐通道/并行每桶）、
+    写 MDF 前后检查，置位即 raise ScanCancelled；写 MDF 期间（asammdf
+    无取消钩子）点取消 → 删除已写输出与半成品 .mf4 后抛出。
     """
     channels = sorted(bindings)
     if not channels:
@@ -151,7 +163,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         # 35MB 样例 52s 里 50s 在读取，逐容器上报让进度条全程前进）
         read_cb = (lambda f: progress_cb("读取 BLF", 5 + 5 * f / 100)) \
             if progress_cb else None
-        for fr in blf_reader.iter_all_messages(blf_path, progress_cb=read_cb):
+        for fr in blf_reader.iter_all_messages(blf_path, progress_cb=read_cb,
+                                               cancel_cb=cancel_cb):
             ch = fr.channel
             if stats_export:
                 t, e, r, er = stats_bufs[ch]
@@ -164,6 +177,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 dec.feed(fr)
             elif raw_export and ch in raw_bufs:
                 raw_bufs[ch].append(fr)
+        # 取消检查点：读取完毕、解码前（取消则不再启动解码/池回收）
+        _check_cancel(cancel_cb)
 
         # 内存阈值回退（方案 G §5.7）：feed 后桶内存估算超阈值 → 转串行。
         # 池已预热但未提交任务，shutdown 无副作用。
@@ -175,12 +190,15 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         # ── 解码阶段：并行（方案 G，per-bucket）或串行（现状语义）──
         if pool is not None:
             results = mp_finish.finish_all(decoders, sorted(decoders),
-                                           progress_cb=progress_cb, pool=pool)
+                                           progress_cb=progress_cb, pool=pool,
+                                           cancel_cb=cancel_cb)
         else:
             results = {}
             for i, ch in enumerate(sorted(decoders)):
                 if progress_cb:
                     progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
+                # 取消检查点：串行解码逐通道
+                _check_cancel(cancel_cb)
                 results[ch] = decoders[ch].finish()
 
         for i, ch in enumerate(channels):
@@ -256,6 +274,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
 
         if progress_cb:
             progress_cb("写 MDF", 95)
+        # 取消检查点：写 MDF 前（取消则不写，无输出残留）
+        _check_cancel(cancel_cb)
         try:
             mdf_writer.write_mdf(all_series, raw_groups, out_path,
                                  abs_start_seconds=abs_start_time,
@@ -267,6 +287,12 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 if os.path.exists(p):
                     os.remove(p)
             raise
+        # 取消检查点：写入期间（asammdf 无取消钩子）点取消 → 清理已写输出
+        if cancel_cb is not None and cancel_cb():
+            for p in (out_path, Path(out_path).with_suffix(".mf4")):
+                if os.path.exists(p):
+                    os.remove(p)
+            raise ScanCancelled()
         if progress_cb:
             progress_cb("完成", 100)
         return ConversionResult(
