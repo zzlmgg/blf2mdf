@@ -4,17 +4,16 @@
 
 ## 使用
 
-运行 `conda run -n blfmdf python main.py`：
+运行 `C:\ProgramData\Anaconda3\envs\blfmdf\python.exe main.py`，启动
+PySide6/QSS 的紧凑 Windows 桌面面板：
 
-1. 选择 .blf 文件（自动列出其中记录的总线通道）
-2. "添加 DBC…" 导入 .dbc 矩阵
-3. 为每个通道选择一个 DBC；不选则该通道不参与解码
-4. （可选）勾选「导出未绑定通道的原始帧」后再点"转换"，输出单个 .mdf（所有通道数据）
+1. 浏览或拖入 `.blf` 文件，后台自动扫描其中记录的总线通道。
+2. 选择 ccu3.0 项目自动载入/匹配 DBC，或点击 DBC 标题旁绿色 `+` 手动添加。
+3. 在 `Channel ↔ DBC` 中检查或调整绑定；不绑定的通道状态为“不导出”。
+4. 确认自动生成的 `<BLF 文件名>_t.mdf` 输出路径（可手动修改或浏览），点击“开始转换”；完成后可打开完整转换摘要。
 
-未绑定 DBC 的通道**默认不导出原始帧**（与 CANoe 导出一致）；勾选「导出未绑定通道的
-原始帧」后，未绑定通道以 `Raw::CANn` 组导出，仅保留本次转换中任一已绑定 DBC 有
-报文定义的帧；其余帧（DBC 中无对应信号名的未知信号）在摘要中计数并丢弃。
-完全不使用 DBC 时不过滤。
+未绑定 DBC 的通道**不导出原始帧**（与当前 CANoe 对比基线一致）；界面固定使用
+`raw_export=False`，不提供会改变这一语义的开关。
 
 时间基准与 CANoe 导出一致：时间通道 `t` 为**相对时间**（以 BLF 文件头的测量
 开始时间归零）；绝对测量起始时间（整秒，UTC）写入 MDF 头部 `start_time`，
@@ -28,7 +27,10 @@ StdData/ExtData/StdRemote/ExtRemote/ErrorFrames 及各自 Rate，逐秒聚合，
 
 ## 打包发布
 
-发布物为 PyInstaller onefile 窗口程序 `dist/blf2mdf.exe`（约 57MB，仅含实际
+旧版发布物仍保留为 `dist/blf2mdf.exe` / `dist_publish/blf2mdf.exe`，不会被
+新版构建覆盖。PySide/QSS 新版使用独立文件名
+`exe_publish/BLF-to-MDF-PySide.exe`，同样是 PyInstaller onefile 窗口程序，
+目标体积不超过 65 MiB。两者都仅含实际
 导入的依赖：PySide6 Core/Gui/Widgets、numpy、pandas、asammdf、canmatrix 等；
 VC++ 运行库已内置，唯一系统级依赖是 System32 自带 ICU，Win10 1709+/Win11
 可用，**免安装、可在无 Python 环境机器直接运行**）。
@@ -51,16 +53,21 @@ inputs 目录也能启动，UI 降级为手动添加 DBC——list_projects 对�
     └── (blf、dbc 可放任意路径，转换时手动选择)
 ```
 
-构建命令（必须在 blfmdf conda 环境内，且前置 env 的 bin 目录使 PyInstaller
-能解析到 ffi-8 等 DLL）：
+新版构建命令（必须使用 blfmdf conda 环境）：
 
-```bash
-PATH="/c/ProgramData/Anaconda3/envs/blfmdf/Library/bin:/c/ProgramData/Anaconda3/envs/blfmdf/DLLs:$PATH" \
-/c/ProgramData/Anaconda3/envs/blfmdf/python.exe -m PyInstaller blf2mdf.spec \
-  --noconfirm --distpath dist --workpath build
+```powershell
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m PyInstaller `
+  --noconfirm --clean `
+  --workpath build_pyside_qss `
+  --distpath exe_publish `
+  blf2mdf.spec
+
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe `
+  tools\verify_pyside_package.py --launch-smoke `
+  exe_publish\BLF-to-MDF-PySide.exe
 ```
 
-验证：启动 exe 应出现"BLF 转 MDF 转换"窗口；`tools/frozen_probe.py` 与
+验证：启动 exe 应出现 `BLF → MDF` 窗口；`tools/frozen_probe.py` 与
 `tools/frozen_gui_probe.py` 是与 blf2mdf.spec 同裁剪配置的冻结探针
 （`sed 's/\[.main.py.\]/[tools\/frozen_probe.py]/; s/name=.blf2mdf./name=frozen_probe/'`，
 GUI 探针另加 `-e 's/console=False/console=True/'`），exe 同目录放置
@@ -84,5 +91,5 @@ ICU（33MB，System32 自带）；不装 UPX 是因为 onefile 内置 zlib 压�
 ## 开发
 
 依赖：`pip install -r requirements.txt`（Python 3.12，conda 环境 blfmdf）
-测试：`conda run -n blfmdf python -m pytest`
-金标准对比：`conda run -n blfmdf python -m pytest -m golden`
+测试：`C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest`
+金标准对比：`C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest -m golden`

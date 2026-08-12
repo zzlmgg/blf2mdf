@@ -4,11 +4,12 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from gui.main_window import MainWindow
+from gui.theme import apply_theme
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_theme(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

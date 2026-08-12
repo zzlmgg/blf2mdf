@@ -76,12 +76,12 @@ def test_mapping_channel_missing_from_blf_row_added(window):
     window._rebuild_channel_table([1])  # BLF 只有 CAN1
     rows = {window.table.item(r, 0).text(): r
             for r in range(window.table.rowCount())}
-    assert "CAN15" in rows
-    r15 = rows["CAN15"]
+    assert "CAN 15" in rows
+    r15 = rows["CAN 15"]
     assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc（A19G1）"
     assert window.table.item(r15, 2).text() == "无数据"
     # BLF 有的通道不受影响：CAN1 正常绑定
-    r1 = rows["CAN1"]
+    r1 = rows["CAN 1"]
     assert window.table.cellWidget(r1, 1).currentText() == "PFCAN1.dbc（A19G1）"
     assert window.table.item(r1, 2).text() == "已绑定"
 
@@ -133,25 +133,20 @@ def test_dbc_combo_ignores_mouse_wheel(window):
     assert combo.currentText() == "PFCAN1.dbc（A19G1）"
 
 
-def test_channel_table_shows_all_rows_without_scrollbar(window):
-    """通道匹配高度足够展示全部行（16 行场景无垂直滚动条）。"""
+def test_channel_table_uses_internal_scrollbar(window, qapp):
+    """紧凑面板不增高；通道较多时只在表格内部滚动。"""
     import gui.main_window as mw
 
-    window.dbc_list = [_d(f"PFCAN1.dbc")]
+    window.dbc_list = [_d("PFCAN1.dbc")]
     window._rebuild_channel_table(list(range(16)))
-    window.resize(760, 920)
     window.show()
-    assert window.table.verticalScrollBar().maximum() == 0
+    qapp.processEvents()
+    assert window.table.verticalScrollBar().maximum() > 0
     assert isinstance(window.table.cellWidget(0, 1), mw.DbcCombo)
 
 
 def test_table_height_fixed_16_rows(window, qapp):
-    """通道匹配表格固定高度 = 表头 + 13 路 CAN 基准总高，16 行全显。
-
-    固定几何保证读取 BLF 过程与完成后排布一致（表格不随行数跳变）；
-    行高收缩为默认行高的 13/16，2 行与 16 行场景高度相同，16 个通道
-    全部可见且总高度与旧版 13 行基准一致（面板不增高）。
-    """
+    """表格高度不随行数变化，超出内容由内部滚动处理。"""
     window.dbc_list = [_d("PFCAN1.dbc")]
     window._rebuild_channel_table(list(range(2)))
     window.show()
@@ -161,35 +156,28 @@ def test_table_height_fixed_16_rows(window, qapp):
     qapp.processEvents()
     h16 = window.table.height()
     assert h2 == h16
-    # 总高 = 表头 + 13×旧默认行高 + 边框 + 余量；13×旧默认行高 =
-    # 16×收缩行高 + r（r ∈ [0,15]，整除取整丢失），故落在如下区间
-    row_h = window.table.verticalHeader().defaultSectionSize()
-    expected = (window.table.horizontalHeader().height()
-                + 16 * row_h + 2 * window.table.frameWidth() + 8)
-    assert expected <= h16 <= expected + 15
-    # 16 行全显，无垂直滚动条（行高收缩的验收点）
-    assert window.table.verticalScrollBar().maximum() == 0
+    assert window.table.verticalScrollBar().maximum() > 0
 
 
-def test_summary_height_reduced_to_1_6(window, qapp):
-    """结果摘要 ≈ 46px（默认布局下原 277px 的 1/6），不再抢高度。"""
+def test_summary_uses_compact_bar(window, qapp):
+    """完整摘要移出主布局，主窗口只保留 34px 摘要条。"""
     window._rebuild_channel_table([1])
     window.show()
     qapp.processEvents()
-    assert window.summary.height() == 46
+    assert window.summary.isHidden()
+    assert window.summary_bar.height() == 34
 
 
 def test_window_geometry_stable_through_load(window, qapp):
-    """窗口几何在启动时贴合一次，重建表格不再改动——读取中与读取后一致。"""
+    """窗口固定为定稿默认尺寸，重建表格不改变几何。"""
     window.dbc_list = [_d("PFCAN1.dbc")]
     window.show()
     qapp.processEvents()
-    v = window.centralWidget().layout()
-    h0 = window.height()
-    assert abs(h0 - v.minimumSize().height()) <= 2  # 启动时贴合
+    before = window.size()
+    assert (before.width(), before.height()) == (690, 596)
     window._rebuild_channel_table(list(range(13)))
     qapp.processEvents()
-    assert window.height() == h0                    # 重建后几何不变
+    assert window.size() == before
 
 
 # ---- BLF 浏览默认目录 + 输出路径跟随 BLF ----
@@ -246,6 +234,7 @@ def test_load_blf_async_does_not_block(window, qapp, tmp_path):
                                           channel=1, timestamp=1784716800.0))
         w.on_message_received(can.Message(arbitration_id=0x456, data=b"\x03",
                                           channel=2, timestamp=1784716801.0))
+    stage_before = window.stage_label.text()
     window._load_blf(str(p))
     # 立即返回且未提交路径：扫描在后台进行（同步实现此处会阻塞数十秒）
     assert window.blf_path is None
@@ -256,7 +245,7 @@ def test_load_blf_async_does_not_block(window, qapp, tmp_path):
     # 加载反馈在 BLF 行内嵌进度条；「转换」进度条与状态标签不被动用
     assert window.load_progress.isVisible()
     assert window.progress.value() == 0
-    assert window.stage_label.text() == ""
+    assert window.stage_label.text() == stage_before
     deadline = time.monotonic() + 10
     while window.blf_path is None and time.monotonic() < deadline:
         qapp.processEvents()
@@ -267,7 +256,7 @@ def test_load_blf_async_does_not_block(window, qapp, tmp_path):
     assert window.convert_btn.isEnabled()      # 加载完成后可转换
     assert window.load_progress.isHidden()     # 内嵌进度条已隐藏（不占排版）
     assert window.progress.value() == 0        # 转换进度条仍归零
-    assert window.stage_label.text() == ""
+    assert window.stage_label.text() == stage_before
     assert window.btn_blf.isEnabled()          # 文件选择恢复
     window.close()
 
@@ -307,7 +296,7 @@ def test_layout_identical_before_during_after_load(window, qapp, tmp_path):
 
 
 def test_blf_load_sets_output_follows_blf_path(window):
-    """需求 1/3：加载 BLF 完成后，输出路径 = BLF 同目录同文件名，扩展名 .mdf。
+    """加载 BLF 完成后，输出路径 = BLF 同目录、文件名追加 _t、扩展名 .mdf。
 
     首次加载（启动后选第一个文件）即生效；不再落到 outputs/ 时间戳名。
     """
@@ -316,7 +305,7 @@ def test_blf_load_sets_output_follows_blf_path(window):
     window.scan_worker = FakeWorker()
     window._on_scan_done([1, 2])
     assert window.blf_path == r"E:\data\run001.blf"
-    assert window.out_edit.text() == r"E:\data\run001.mdf"
+    assert window.out_edit.text() == r"E:\data\run001_t.mdf"
 
 
 def test_new_blf_updates_output_even_after_custom_edit(window):
@@ -328,7 +317,15 @@ def test_new_blf_updates_output_even_after_custom_edit(window):
         path = r"E:\data2\new.blf"
     window.scan_worker = FakeWorker()
     window._on_scan_done([1, 2])
-    assert window.out_edit.text() == r"E:\data2\new.mdf"
+    assert window.out_edit.text() == r"E:\data2\new_t.mdf"
+
+
+def test_default_output_always_appends_t(window):
+    """自动命名固定追加 _t，不把已有的 _t 当作特殊情况。"""
+    window.blf_path = r"E:\data\run001_t.blf"
+    window._set_default_output()
+
+    assert window.out_edit.text() == r"E:\data\run001_t_t.mdf"
 
 
 def test_project_selection_does_not_rename_output(window):
@@ -337,7 +334,7 @@ def test_project_selection_does_not_rename_output(window):
     window._set_default_output()
     window._select_project = lambda name: None  # 只切选择，不触发真实加载
     window.project_combo.setCurrentText("A19G1")
-    assert window.out_edit.text() == r"E:\data\run001.mdf"
+    assert window.out_edit.text() == r"E:\data\run001_t.mdf"
 
 
 def test_project_select_keeps_custom_output_path(window, monkeypatch):
@@ -447,9 +444,9 @@ def test_project_switch_drops_stale_mapped_row(window):
     window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
                                   keep_prev=False)
     assert [window.table.item(r, 0).text()
-            for r in range(window.table.rowCount())] == ["CAN1", "CAN15"]
+            for r in range(window.table.rowCount())] == ["CAN 1", "CAN 15"]
     window.auto_bind = {1: "PFCAN1.dbc（A19G1）"}  # 项目 B：映射不含 15
     window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
                                   keep_prev=False)
     assert [window.table.item(r, 0).text()
-            for r in range(window.table.rowCount())] == ["CAN1"]
+            for r in range(window.table.rowCount())] == ["CAN 1"]

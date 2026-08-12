@@ -45,3 +45,16 @@ def test_main_guard_calls_freeze_support():
                 if node.func.attr == "freeze_support":
                     calls.append(node)
         assert calls, "main.py 的 __main__ 块未调用 multiprocessing.freeze_support()"
+
+
+def test_main_applies_application_theme():
+    """应用级 QSS 必须在 QApplication 创建后统一安装。"""
+    tree = ast.parse(MAIN_SRC.read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_theme"
+    ]
+    assert calls, "main.py 未调用 apply_theme(app)"

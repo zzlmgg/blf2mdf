@@ -2,34 +2,30 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QThread, QObject, Signal, Slot
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QObject, Signal, Slot
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QFileDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget, QListWidgetItem,
 )
 
 from core import blf_reader, project_loader
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
+from gui.theme import WINDOW_HEIGHT, WINDOW_WIDTH
+from gui.widgets import (
+    CompactCombo,
+    DbcListItemWidget,
+    DbcListWidget,
+    SemanticIconButton,
+    SummaryDialog,
+    TitleBar,
+)
+from gui.windows_effects import apply_light_glass, sync_rounded_window
 
 UNBOUND = "不绑定"
-
-# 通道表固定高度基准：总高沿用 13 路 CAN 的旧几何（样例文件最大行数：
-# AHT 13 通道、A19G1 12 通道 + 映射 CAN15），行高收缩到默认的 13/16，
-# 使 16 路 CAN 全显而面板总高度不变。几何与行数无关、读取全程不跳动；
-# 行数超 16（理论场景）时出现垂直滚动条。
-_TABLE_ROWS = 16
-_OLD_ROWS_BASIS = 13  # 高度基准：13 行 × 默认行高（改动前几何，总高不变）
-
-# 进度条样式：填充块浅绿色（Qt 原生 Windows 样式为蓝色渐变，视觉不符合
-# 预期）；轨道浅灰 + 圆角边框，进度文字居中
-_PROGRESS_STYLE = (
-    "QProgressBar { border: 1px solid #999; border-radius: 3px;"
-    " background-color: #F0F0F0; text-align: center; }"
-    "QProgressBar::chunk { background-color: #90EE90; }"
-)
 
 
 def _blf_drop_path(event) -> str | None:
@@ -44,7 +40,7 @@ def _blf_drop_path(event) -> str | None:
     return None
 
 
-class DbcCombo(QComboBox):
+class DbcCombo(CompactCombo):
     """「DBC 矩阵」列下拉：忽略鼠标滚轮，防悬停误触改绑（滚轮事件冒泡给表格）。
 
     下拉选择只应通过点击/键盘完成；滚轮悬停改选是误改绑定的常见来源。
@@ -80,7 +76,7 @@ def _find_ccu3_root(root: Path) -> Path | None:
 CCU3_ROOT = _find_ccu3_root(PROJECT_ROOT)
 CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt" if CCU3_ROOT else None
 
-PROJECT_PLACEHOLDER = "选择项目…"  # 项目下拉首项（禁用占位，仅提示）
+PROJECT_PLACEHOLDER = "项目"  # 项目下拉首项（禁用占位，仅提示）
 
 
 class ConvertWorker(QObject):
@@ -137,15 +133,13 @@ class BlfScanWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BLF → MDF 转换")
-        # 启动默认 760×920；加载 BLF 后窗口高度自动贴合内容（_fit_window_height）：
-        # 通道匹配表格固定 = 表头 + 各行高 + 余量（「刚好 N 行多一丢丢」），
-        # 结果摘要固定 ≈46px（≈ 默认布局下 277px 的 1/6），不再抢高度
-        # 启动默认 760×920；几何在 __init__ 末尾一次性贴合（_fit_window_height）：
-        # 通道匹配表格固定 = 表头 + 13 路 CAN 基准总高（行高收缩后 16 路
-        # 全显）+ 余量——任何行数下高度恒定，读取 BLF 过程与完成后排布一致
-        # 结果摘要固定 ≈46px，不再抢高度
-        self.resize(760, 920)
+        self.setWindowTitle("BLF → MDF")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setMinimumSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self._visual_effects_applied = False
+        self._native_rounding = False
         self.blf_path = None
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
         self.blf_channels: list[int] = []
@@ -159,15 +153,40 @@ class MainWindow(QMainWindow):
         self.scan_worker: BlfScanWorker | None = None
 
         central = QWidget()
+        central.setObjectName("appRoot")
+        central.setProperty("nativeGlass", False)
+        central.setProperty("shellMaximized", False)
         self.setCentralWidget(central)
-        v = QVBoxLayout(central)
+        shell = QVBoxLayout(central)
+        shell.setContentsMargins(1, 1, 1, 1)
+        shell.setSpacing(0)
 
-        # BLF 文件
-        row = QHBoxLayout()
-        self.blf_label = QLabel("BLF 文件")
+        self.title_bar = TitleBar()
+        shell.addWidget(self.title_bar)
+
+        body = QWidget()
+        body.setObjectName("appBody")
+        v = QVBoxLayout(body)
+        v.setContentsMargins(17, 8, 17, 8)
+        v.setSpacing(4)
+        shell.addWidget(body, 1)
+
+        # 输入 BLF：浏览与拖拽两种入口保持等价。
+        self.input_panel = QFrame()
+        self.input_panel.setProperty("card", True)
+        self.input_panel.setObjectName("inputPanel")
+        self.input_panel.setFixedHeight(48)
+        row = QHBoxLayout(self.input_panel)
+        row.setContentsMargins(12, 6, 8, 6)
+        row.setSpacing(8)
+        self.blf_label = QLabel("输入 BLF")
+        self.blf_label.setObjectName("sectionLabel")
+        self.blf_label.setFixedWidth(64)
         row.addWidget(self.blf_label)
         self.blf_edit = QLineEdit()
+        self.blf_edit.setObjectName("pathField")
         self.blf_edit.setReadOnly(True)
+        self.blf_edit.setPlaceholderText("选择或拖入 .blf 文件")
         row.addWidget(self.blf_edit, 1)
         # 拖拽导入：标签 + 路径框整行接受 .blf 拖入（与「浏览…」并列的入口）。
         # 事件过滤不新增控件、不改几何——排版与其他行完全一致
@@ -177,102 +196,205 @@ class MainWindow(QMainWindow):
         # 加载进度条：固定宽度，仅在扫描时显示（扫描结束即隐藏，不占布局空间、
         # 不影响排版）；「转换」行的大进度条只在转换时使用
         self.load_progress = QProgressBar()
-        self.load_progress.setStyleSheet(_PROGRESS_STYLE)
-        self.load_progress.setFixedWidth(140)
+        self.load_progress.setObjectName("inlineProgress")
+        self.load_progress.setFixedWidth(110)
         self.load_progress.setRange(0, 100)
         self.load_progress.setValue(0)
+        self.load_progress.setTextVisible(False)
         self.load_progress.setVisible(False)
         row.addWidget(self.load_progress)
         btn_blf = QPushButton("浏览…")
+        btn_blf.setObjectName("secondaryButton")
+        btn_blf.setMinimumWidth(76)
+        btn_blf.setFixedHeight(32)
         btn_blf.clicked.connect(self._pick_blf)
         self.btn_blf = btn_blf
         row.addWidget(btn_blf)
-        v.addLayout(row)
+        v.addWidget(self.input_panel)
 
-        # 第二排：左 = ccu3.0 项目 + DBC 矩阵文件，右 = 通道匹配
-        middle = QHBoxLayout()
-        left_col = QVBoxLayout()
-        # ccu3.0 项目：选项目 = 读入该项目全部 DBC 并按映射自动匹配通道
-        left_col.addWidget(QLabel("ccu3.0 项目"))
-        self.project_combo = QComboBox()
+        # 中部工作区：左右卡片固定同高，内容在卡片内部滚动。
+        workspace = QHBoxLayout()
+        workspace.setContentsMargins(0, 0, 0, 0)
+        workspace.setSpacing(10)
+
+        self.dbc_panel = QFrame()
+        self.dbc_panel.setProperty("card", True)
+        self.dbc_panel.setObjectName("dbcPanel")
+        self.dbc_panel.setFixedHeight(350)
+        self.dbc_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        left_col = QVBoxLayout(self.dbc_panel)
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(0)
+
+        dbc_header = QHBoxLayout()
+        dbc_header.setContentsMargins(12, 7, 7, 7)
+        dbc_header.setSpacing(2)
+        dbc_title = QLabel("DBC")
+        dbc_title.setObjectName("panelTitle")
+        dbc_header.addWidget(dbc_title)
+        self.btn_add_dbc = SemanticIconButton("+", "positive")
+        self.btn_add_dbc.clicked.connect(self._add_dbc)
+        dbc_header.addWidget(self.btn_add_dbc)
+        dbc_header.addStretch(1)
+
+        self.ccu_combo = CompactCombo()
+        self.ccu_combo.setObjectName("compactCombo")
+        self.ccu_combo.setFixedWidth(95)
+        self.ccu_combo.addItem("ccu3.0")
+        self.ccu_combo.addItem("ccu4.0 · 暂未开发")
+        self.ccu_combo.model().item(1).setEnabled(False)
+        dbc_header.addWidget(self.ccu_combo)
+
+        self.project_combo = CompactCombo()
+        self.project_combo.setObjectName("compactCombo")
+        self.project_combo.setFixedWidth(98)
         self.project_combo.currentTextChanged.connect(self._select_project)
-        left_col.addWidget(self.project_combo)
-        left_col.addWidget(QLabel("DBC 矩阵文件"))
-        self.dbc_list_widget = QListWidget()
-        left_col.addWidget(self.dbc_list_widget, 1)
-        dbc_btns = QHBoxLayout()
-        btn_add = QPushButton("添加 DBC…")
-        btn_add.clicked.connect(self._add_dbc)
-        btn_rm = QPushButton("移除选中")
-        btn_rm.clicked.connect(self._remove_dbc)
-        dbc_btns.addWidget(btn_add)
-        dbc_btns.addWidget(btn_rm)
-        dbc_btns.addStretch(1)
-        left_col.addLayout(dbc_btns)
-        middle.addLayout(left_col, 1)  # 左栏：DBC 列表
+        dbc_header.addWidget(self.project_combo)
+        left_col.addLayout(dbc_header)
 
-        right_col = QVBoxLayout()
-        right_col.addWidget(QLabel("通道匹配"))
+        self.dbc_list_widget = DbcListWidget()
+        self.dbc_list_widget.setObjectName("dbcList")
+        self.dbc_list_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.dbc_list_widget.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.dbc_list_widget.delete_requested.connect(self._remove_selected_dbcs)
+        left_col.addWidget(self.dbc_list_widget, 1)
+
+        self.channel_panel = QFrame()
+        self.channel_panel.setProperty("card", True)
+        self.channel_panel.setObjectName("channelPanel")
+        self.channel_panel.setFixedHeight(350)
+        self.channel_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        right_col = QVBoxLayout(self.channel_panel)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(0)
+        channel_header = QHBoxLayout()
+        channel_header.setContentsMargins(12, 7, 11, 7)
+        channel_title = QLabel("Channel  ⟷  DBC")
+        channel_title.setObjectName("panelTitle")
+        channel_header.addWidget(channel_title)
+        channel_header.addStretch(1)
+        self.channel_count_label = QLabel("0 路")
+        self.channel_count_label.setObjectName("channelCount")
+        self.channel_count_label.setFixedWidth(48)
+        self.channel_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        channel_header.addWidget(self.channel_count_label)
+        right_col.addLayout(channel_header)
+
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["通道", "DBC 矩阵", "状态"])
-        # 列宽（含手动拖动）或滚动条出现/消失后，表格总宽跟随三列之和，不留白
-        self.table.horizontalHeader().sectionResized.connect(self._fit_table_width)
-        self.table.verticalScrollBar().rangeChanged.connect(
-            lambda *_: self._fit_table_width())
+        self.table.setObjectName("channelTable")
+        self.table.horizontalHeader().hide()
+        self.table.verticalHeader().hide()
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
+        self.table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         right_col.addWidget(self.table, 1)
-        middle.addLayout(right_col, 0)  # 右栏：通道表（总宽=三列列宽之和，余宽全给左侧 DBC 列表）
-        # 中排高度由固定高的通道表决定（_fit_table_height 恒为 16 行上限），
-        # 不参与额外空间分配；窗口高度在 __init__ 末尾贴合一次后不再变动
-        v.addLayout(middle)
+
+        workspace.addWidget(self.dbc_panel, 300)
+        workspace.addWidget(self.channel_panel, 340)
+        v.addLayout(workspace)
 
         # 输出路径
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("输出文件"))
+        self.output_panel = QFrame()
+        self.output_panel.setProperty("card", True)
+        self.output_panel.setObjectName("outputPanel")
+        self.output_panel.setFixedHeight(42)
+        out_row = QHBoxLayout(self.output_panel)
+        out_row.setContentsMargins(12, 4, 8, 4)
+        out_row.setSpacing(8)
+        out_label = QLabel("输出 MDF")
+        out_label.setObjectName("sectionLabel")
+        out_label.setFixedWidth(64)
+        out_row.addWidget(out_label)
         self.out_edit = QLineEdit()
+        self.out_edit.setObjectName("pathField")
+        self.out_edit.setPlaceholderText("选择 BLF 后自动生成输出路径")
         out_row.addWidget(self.out_edit, 1)
         btn_out = QPushButton("浏览…")
+        btn_out.setObjectName("secondaryButton")
+        btn_out.setMinimumWidth(76)
+        btn_out.setFixedHeight(30)
         btn_out.clicked.connect(self._pick_out)
+        self.btn_out = btn_out
         out_row.addWidget(btn_out)
-        v.addLayout(out_row)
+        v.addWidget(self.output_panel)
 
-        # 转换按钮 + 进度（同一行，省一行高度；底部整体下移后归上方通道匹配）
-        ctrl_row = QHBoxLayout()
-        self.convert_btn = QPushButton("转 换")
+        # 转换控制区
+        self.conversion_panel = QFrame()
+        self.conversion_panel.setObjectName("conversionPanel")
+        self.conversion_panel.setFixedHeight(44)
+        ctrl_row = QHBoxLayout(self.conversion_panel)
+        ctrl_row.setContentsMargins(0, 3, 0, 3)
+        ctrl_row.setSpacing(10)
+        progress_col = QVBoxLayout()
+        progress_col.setContentsMargins(2, 0, 0, 0)
+        progress_col.setSpacing(2)
+        self.stage_label = QLabel("就绪")
+        self.stage_label.setObjectName("stageLabel")
+        progress_col.addWidget(self.stage_label)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("conversionProgress")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        progress_col.addWidget(self.progress)
+        ctrl_row.addLayout(progress_col, 1)
+        self.convert_btn = QPushButton("开始转换")
+        self.convert_btn.setObjectName("primaryButton")
+        self.convert_btn.setFixedSize(126, 36)
         self.convert_btn.setEnabled(False)
         self.convert_btn.clicked.connect(self._start_convert)
         ctrl_row.addWidget(self.convert_btn)
-        self.progress = QProgressBar()
-        self.progress.setStyleSheet(_PROGRESS_STYLE)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        ctrl_row.addWidget(self.progress, 1)
-        v.addLayout(ctrl_row)
-        self.stage_label = QLabel("")
-        v.addWidget(self.stage_label)
+        v.addWidget(self.conversion_panel)
 
-        # 摘要（只读）：固定 ≈46px（默认布局下原 277px 的 1/6），不抢高度；
-        # 内容超出时内部滚动
-        v.addWidget(QLabel("结果摘要"))
-        self.summary = QPlainTextEdit()
+        # 主窗口只保留紧凑摘要条；完整摘要稍后在对话框内展示。
+        self.summary_bar = QFrame()
+        self.summary_bar.setObjectName("summaryBar")
+        self.summary_bar.setMinimumHeight(34)
+        self.summary_bar.setMaximumHeight(34)
+        summary_row = QHBoxLayout(self.summary_bar)
+        summary_row.setContentsMargins(10, 0, 7, 0)
+        summary_row.setSpacing(8)
+        summary_title = QLabel("转换摘要")
+        summary_title.setObjectName("summaryTitle")
+        summary_row.addWidget(summary_title)
+        self.summary_status = QLabel("尚未转换")
+        self.summary_status.setObjectName("summaryStatus")
+        summary_row.addWidget(self.summary_status)
+        summary_row.addStretch(1)
+        self.summary_button = QPushButton("查看摘要")
+        self.summary_button.setObjectName("linkButton")
+        self.summary_button.setEnabled(False)
+        self.summary_button.clicked.connect(self._show_summary)
+        summary_row.addWidget(self.summary_button)
+        v.addWidget(self.summary_bar)
+
+        # 兼容既有外部引用；不进入主布局，因此不会再抬高窗口。
+        self.summary = QPlainTextEdit(central)
         self.summary.setReadOnly(True)
-        self.summary.setFixedHeight(46)
-        v.addWidget(self.summary)
+        self.summary.hide()
+        self.summary_text = ""
+        self.summary_dialog = SummaryDialog(self)
 
         # 项目下拉：占位首项禁用，列表 = dbc_ccu3.0 下含 DBC 的项目文件夹
         self.project_combo.addItem(PROJECT_PLACEHOLDER)
         self.project_combo.model().item(0).setEnabled(False)
         for name in project_loader.list_projects(CCU3_ROOT):
             self.project_combo.addItem(name)
-        # 固定几何：通道表按 13 路 CAN 基准预留高度（行高收缩，16 路全显）、
-        # 三列固定宽度，窗口贴合一次。
-        # 此后任何 BLF 读取/表格重建都不改动几何——读取过程与完成后排布一致。
-        # 行号表头也按两位数字（最大行号 16）预留固定宽度：sizeHint 随行数
-        # 变化（实测 0/16/28px），会导致表格总宽随行数跳变
-        self._row_header_w = (self.table.verticalHeader().fontMetrics()
-                              .horizontalAdvance("16")
-                              + 2 * self.table.verticalHeader().fontMetrics()
-                              .horizontalAdvance("0"))
-        self.table.verticalHeader().setFixedWidth(self._row_header_w)
         self._apply_column_widths()
         self._fit_table_height()
         self._fit_window_height()
@@ -372,14 +494,15 @@ class MainWindow(QMainWindow):
         self._set_scan_busy(False)  # 隐藏 load_progress、恢复按钮
 
     def _set_default_output(self):
-        """默认输出路径：与 BLF 同目录同文件名，仅扩展名 .mdf（run001.blf
-        → run001.mdf）。
+        """默认输出路径：与 BLF 同目录，文件名追加 _t（run001.blf
+        → run001_t.mdf）。
 
         每次加载/重选 BLF 后输出自动跟随（_on_scan_done 调用）；用户手动
         改过的输出路径也会在下次选择 BLF 时被新 BLF 的路径覆盖（需求：
         输出文件路径始终与 BLF 文件路径一致）。
         """
-        self.out_edit.setText(str(Path(self.blf_path).with_suffix(".mdf")))
+        source = Path(self.blf_path)
+        self.out_edit.setText(str(source.with_name(f"{source.stem}_t.mdf")))
 
     def _rebuild_channel_table(self, channels: list[int],
                                auto: dict[int, str] | None = None,
@@ -407,10 +530,14 @@ class MainWindow(QMainWindow):
         for ch in all_channels:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            name = f"CAN{ch}"
-            self.table.setItem(row, 0, QTableWidgetItem(name))
+            name = f"CAN {ch}"
+            channel_item = QTableWidgetItem(name)
+            channel_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(row, 0, channel_item)
             self.table.setItem(row, 2, QTableWidgetItem(
-                "无数据" if ch not in blf_channels else "原始"))
+                "无数据" if ch not in blf_channels else "不导出"))
             combo = DbcCombo()
             combo.addItem(UNBOUND)
             for dbc in self.dbc_list:
@@ -431,78 +558,91 @@ class MainWindow(QMainWindow):
             )
             if ch not in blf_channels:
                 # 无数据行保持「无数据」；用户手动改下拉后由信号接管为绑定态
-                self.table.item(row, 2).setText("无数据")
+                self._set_status_item(row, "无数据")
             else:
                 self._update_status(row)
+        self.channel_count_label.setText(f"{len(all_channels)} 路")
         self._apply_column_widths()
 
     def _apply_column_widths(self):
-        """通道匹配列宽：原默认列宽（760px 面板下 100/100/261）按 0.7/2.0/0.3 缩放。
-
-        通道 70px（CAN 名够用）、DBC 矩阵 200px（最长文件名 ~190px 可完整显示）、
-        状态 78px；仍可手动拖动列宽（表格总宽自动跟随，见 _fit_table_width）。
-        """
+        """紧凑通道表列宽：状态列仅保留结果文字所需空间。"""
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
-        for i, (base, ratio) in enumerate(zip((100, 100, 261), (0.7, 2.0, 0.3))):
-            hdr.resizeSection(i, max(1, int(base * ratio)))
-        self._fit_table_width()
+        for index in range(3):
+            hdr.setSectionResizeMode(index, QHeaderView.ResizeMode.Fixed)
+        hdr.resizeSection(0, 66)
+        hdr.resizeSection(1, 209)
+        hdr.resizeSection(2, 58)
 
     def _fit_table_height(self):
-        """通道表固定高度 = 表头 + 13 路 CAN 基准总高 + 余量（总高不变）。
-
-        行高收缩为默认行高的 13/16（16 行 × 行高 ≤ 13 行 × 默认行高），
-        16 路 CAN 全显而面板总高度与旧版 13 行基准完全一致——「保持总体
-        高度」的落点。高度与当前行数无关（实际行集 ≤ 16），读取 BLF 过程
-        与完成后几何一致、不跳动；行数超 16（理论场景）时出现垂直滚动条。
-        余量 8px ≈ 三分之一收缩行高。
-        """
+        """卡片负责固定高度，表格行高保持易读并允许内部滚动。"""
         vh = self.table.verticalHeader()
-        d = vh.defaultSectionSize()  # 修改前读取：总高沿用旧基准，几何不变
-        row_h = (_OLD_ROWS_BASIS * d) // _TABLE_ROWS
-        vh.setDefaultSectionSize(row_h)
-        # 固定行高：行数重建不改变行高，16 行全显的几何恒定
+        vh.setDefaultSectionSize(38)
         vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        content = (self.table.horizontalHeader().sizeHint().height()
-                   + _OLD_ROWS_BASIS * d + 2 * self.table.frameWidth())
-        self.table.setFixedHeight(content + 8)
 
     def _fit_window_height(self):
-        """窗口高度贴合布局最小高度（仅在 __init__ 末尾调用一次）。
-
-        表格/摘要均为固定几何后，布局最小高度是常量——此后读取 BLF、
-        重建表格都不再改动窗口尺寸，读取过程与完成后排布一致。
-        用户仍可手动拉高窗口（多余空间留白）。
-        """
-        v = self.centralWidget().layout()
-        self.resize(self.width(), v.minimumSize().height())
+        """保留旧调用点；新窗口使用批准的固定默认尺寸。"""
+        self.resize(max(self.width(), WINDOW_WIDTH),
+                    max(self.height(), WINDOW_HEIGHT))
 
     def _fit_table_width(self):
-        """通道表总宽 = 三列列宽之和 + 行号表头 + 边框（垂直滚动条可见时再补其宽度）。
-
-        表格固定宽度，视口内零留白；右侧余宽全部让给「DBC 矩阵文件」列表。
-        列宽拖动（sectionResized）或滚动条出现/消失（rangeChanged）时自动重算。
-        """
-        hdr = self.table.horizontalHeader()
-        sb = self.table.verticalScrollBar()
-        # 行号表头用启动时预留的固定宽度（_row_header_w），不用 sizeHint：
-        # sizeHint 随行数变化（实测 0/16/28px），会导致表格总宽随行数跳变
-        total = self._row_header_w + 2 * self.table.frameWidth()
-        for i in range(hdr.count()):
-            total += hdr.sectionSize(i)
-        # 用范围而非 isVisible 判断：rangeChanged 触发时滚动条可能尚未隐藏（时序滞后）
-        policy = self.table.verticalScrollBarPolicy()
-        need_sb = (policy == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
-                   or (policy != Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-                       and sb.maximum() > 0))
-        if need_sb:
-            total += sb.sizeHint().width()
-        self.table.setFixedWidth(total)
+        """兼容旧调用；新表格宽度由右侧卡片布局管理。"""
 
     def _update_status(self, row: int):
         combo = self.table.cellWidget(row, 1)
-        status = "已绑定" if combo.currentText() != UNBOUND else "原始"
-        self.table.item(row, 2).setText(status)
+        status = "已绑定" if combo.currentText() != UNBOUND else "不导出"
+        self._set_status_item(row, status)
+
+    def _set_status_item(self, row: int, text: str):
+        """统一状态文字、颜色和列内对齐。"""
+        item = self.table.item(row, 2)
+        item.setText(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        colors = {
+            "已绑定": "#207e4b",
+            "不导出": "#a56400",
+            "无数据": "#8d9096",
+        }
+        item.setForeground(QBrush(QColor(colors[text])))
+
+    def _refresh_dbc_items(self):
+        """用双行路径组件重建 DBC 列表，并让每个删除按钮绑定自身行。"""
+        self.dbc_list_widget.clear()
+        for row, dbc in enumerate(self.dbc_list):
+            item = QListWidgetItem(self.dbc_list_widget)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            widget = DbcListItemWidget(
+                dbc.path, lambda _checked=False, r=row: self._remove_dbc_at(r)
+            )
+            item.setSizeHint(QSize(0, widget.sizeHint().height()))
+            self.dbc_list_widget.setItemWidget(item, widget)
+
+    def _remove_dbc_at(self, row: int):
+        """移除指定 DBC，并保留其余仍有效的用户绑定。"""
+        if not 0 <= row < len(self.dbc_list):
+            return
+        self.dbc_list.pop(row)
+        self._refresh_dbc_items()
+        self._rebuild_channel_table(self.blf_channels)
+
+    def _remove_selected_dbcs(self):
+        """从面板移除所有选中 DBC；不影响磁盘上的原始文件。"""
+        rows = sorted(
+            {
+                self.dbc_list_widget.row(item)
+                for item in self.dbc_list_widget.selectedItems()
+            },
+            reverse=True,
+        )
+        if not rows:
+            return
+        for row in rows:
+            if 0 <= row < len(self.dbc_list):
+                self.dbc_list.pop(row)
+        self._refresh_dbc_items()
+        self._rebuild_channel_table(self.blf_channels)
 
     def _add_dbc(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择 DBC 文件", "",
@@ -516,9 +656,9 @@ class MainWindow(QMainWindow):
         for p in paths:
             try:
                 self.dbc_list.append(load(p))
-                self.dbc_list_widget.addItem(f"{Path(p).name}    {Path(p).parent}")
             except Exception as e:  # noqa: BLE001
                 QMessageBox.critical(self, "DBC 解析失败", f"{p}\n{e}")
+        self._refresh_dbc_items()
         self._rebuild_channel_table(self.blf_channels)
 
     def _select_project(self, name: str):
@@ -535,20 +675,14 @@ class MainWindow(QMainWindow):
             self.project_combo.setCurrentIndex(0)
             return
         self.dbc_list = dbcs
-        self.dbc_list_widget.clear()
-        for d in dbcs:
-            self.dbc_list_widget.addItem(f"{Path(d.path).name}    {Path(d.path).parent}")
+        self._refresh_dbc_items()
         self.auto_bind = project_loader.auto_bindings(dbcs, self.mapping)
         self._rebuild_channel_table(self.blf_channels, auto=self.auto_bind,
                                     keep_prev=False)
 
     def _remove_dbc(self):
         row = self.dbc_list_widget.currentRow()
-        if row < 0:
-            return
-        self.dbc_list.pop(row)
-        self.dbc_list_widget.takeItem(row)
-        self._rebuild_channel_table(self.blf_channels)
+        self._remove_dbc_at(row)
 
     def _pick_out(self):
         # 对话框默认打开当前 BLF 所在目录（输出与 BLF 同目录，需求一致）
@@ -573,7 +707,7 @@ class MainWindow(QMainWindow):
                 return
         bindings = {}
         for r in range(self.table.rowCount()):
-            ch = int(self.table.item(r, 0).text()[3:])
+            ch = int(self.table.item(r, 0).text().split()[-1])
             text = self.table.cellWidget(r, 1).currentText()
             if text == UNBOUND:
                 bindings[ch] = None
@@ -582,6 +716,9 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self.progress.setValue(0)
         self.summary.clear()
+        self.summary_text = ""
+        self.summary_status.setText("转换中…")
+        self.summary_button.setEnabled(False)
         self.worker_thread = QThread()
         self.worker = ConvertWorker(self.blf_path, bindings, out)
         self.worker.moveToThread(self.worker_thread)
@@ -603,7 +740,19 @@ class MainWindow(QMainWindow):
                     None)
 
     def _set_busy(self, busy: bool):
-        self.convert_btn.setEnabled(not busy)
+        for widget in (
+            self.btn_blf,
+            self.btn_add_dbc,
+            self.ccu_combo,
+            self.project_combo,
+            self.dbc_list_widget,
+            self.table,
+            self.btn_out,
+            self.out_edit,
+        ):
+            widget.setEnabled(not busy)
+        can_convert = bool(self.blf_path and self.out_edit.text().strip())
+        self.convert_btn.setEnabled(not busy and can_convert)
 
     @Slot(str, float)
     def _on_progress(self, stage: str, percent: float):
@@ -613,11 +762,31 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_done(self, result: ConversionResult):
         self._finish()
+        self.summary_text = self._format_summary(result)
+        self.summary.setPlainText(self.summary_text)
+        warning_count = sum(bool(s.warning) for s in result.summaries)
+        self.summary_status.setText(
+            f"已完成 · {result.duration_seconds:.1f} s · {warning_count} 条警告"
+        )
+        self.summary_button.setEnabled(True)
+        notice = QMessageBox(
+            QMessageBox.Icon.Information,
+            "提示",
+            "转换完成。",
+            QMessageBox.StandardButton.Ok,
+            self,
+        )
+        notice.button(QMessageBox.StandardButton.Ok).setText("确定")
+        notice.exec()
+
+    @staticmethod
+    def _format_summary(result: ConversionResult) -> str:
+        """把转换结果格式化为摘要对话框使用的完整中文文本。"""
         lines = [f"总时长: {result.duration_seconds:.1f} s"]
         for s in result.summaries:
             if s.bound:
                 lines.append(
-                    f"CAN{s.channel} 已绑定: 解码 {s.decoded_frames} 帧 · "
+                    f"CAN {s.channel} 已绑定: 解码 {s.decoded_frames} 帧 · "
                     f"{s.signal_count} 个信号 · 未知 {s.unknown_frames} 帧 "
                     f"({s.unknown_ids} 个 ID)"
                 )
@@ -625,14 +794,21 @@ class MainWindow(QMainWindow):
                     lines.append(f"  警告: {s.warning}")
             else:
                 # 原始帧导出已从面板移除（固定关闭，与 CANoe 一致）
-                lines.append(f"CAN{s.channel} 未绑定: 原始帧导出关闭")
+                lines.append(f"CAN {s.channel} 未绑定: 原始帧导出关闭")
                 if s.warning:
                     lines.append(f"  警告: {s.warning}")
-        self.summary.setPlainText("\n".join(lines))
+        return "\n".join(lines)
+
+    def _show_summary(self):
+        if not self.summary_text:
+            return
+        self.summary_dialog.set_summary(self.summary_text)
+        self.summary_dialog.exec()
 
     @Slot(str)
     def _on_error(self, msg: str):
         self._finish()
+        self.summary_status.setText("转换失败")
         QMessageBox.critical(self, "转换失败", msg)
 
     def _finish(self):
@@ -641,7 +817,40 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self._set_busy(False)
         self.progress.setValue(0)
-        self.stage_label.setText("")
+        self.stage_label.setText("就绪")
+
+    def _sync_window_shape(self):
+        root = self.centralWidget()
+        maximized = self.isMaximized()
+        if root is not None and root.property("shellMaximized") != maximized:
+            root.setProperty("shellMaximized", maximized)
+            root.style().unpolish(root)
+            root.style().polish(root)
+        sync_rounded_window(self, self._native_rounding)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._visual_effects_applied:
+            self._visual_effects_applied = True
+            self._native_rounding = apply_light_glass(self)
+            root = self.centralWidget()
+            root.setProperty("nativeGlass", self._native_rounding)
+            root.style().unpolish(root)
+            root.style().polish(root)
+        self._sync_window_shape()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_native_rounding"):
+            self._sync_window_shape()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and hasattr(self, "_native_rounding")
+        ):
+            self._sync_window_shape()
 
     def closeEvent(self, event):
         thread = self.scan_thread
