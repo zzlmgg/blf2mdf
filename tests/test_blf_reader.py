@@ -55,7 +55,9 @@ def test_synthetic_blf_roundtrip(tmp_path):
     assert len(frames) == 1
     assert frames[0].arbitration_id == 0x123
     assert frames[0].data == b"\x01\x02"
-    assert frames[0].ts_seconds == 1784716800.0
+    # ts_seconds 语义 = 相对测量开始整数秒（整数 ns 构造，与 CANoe 同构）：
+    # 整数秒 start + 首帧偏移 0 → 0.0
+    assert frames[0].ts_seconds == 0.0
     assert isinstance(frames[0], Frame)
 
 
@@ -202,3 +204,104 @@ def test_iter_all_messages_cancel(tmp_path):
         list(iter_all_messages(str(p), cancel_cb=lambda: True))
     frames = list(iter_all_messages(str(p), cancel_cb=lambda: False))
     assert len(frames) >= 1024, "恒 False 不应取消"
+
+
+def _raw_rel_ns(path):
+    """读 BLF 首容器消息对象的对象头 rel 整数（验证读路径还原的值）。"""
+    import struct
+    import zlib
+
+    from can.io.blf import (
+        CAN_MESSAGE,
+        CAN_MESSAGE2,
+        FILE_HEADER_STRUCT,
+        LOG_CONTAINER,
+        LOG_CONTAINER_STRUCT,
+        NO_COMPRESSION,
+        OBJ_HEADER_BASE_STRUCT,
+        OBJ_HEADER_V1_STRUCT,
+        OBJ_HEADER_V2_STRUCT,
+        ZLIB_DEFLATE,
+    )
+
+    with open(path, "rb") as f:
+        header = FILE_HEADER_STRUCT.unpack(f.read(FILE_HEADER_STRUCT.size))
+        f.seek(header[1])
+        base = f.read(OBJ_HEADER_BASE_STRUCT.size)
+        _, _, _, obj_size, obj_type = OBJ_HEADER_BASE_STRUCT.unpack(base)
+        od = f.read(obj_size - OBJ_HEADER_BASE_STRUCT.size)
+        method, _ = LOG_CONTAINER_STRUCT.unpack_from(od)
+        cd = od[LOG_CONTAINER_STRUCT.size:]
+        data = zlib.decompress(cd) if method == ZLIB_DEFLATE else cd
+    pos = 0
+    out = []
+    while True:
+        try:
+            pos = data.index(b"LOBJ", pos, pos + 8)
+        except ValueError:
+            break
+        if pos + 8 > len(data):
+            break
+        _, _, hv, osize, otype = OBJ_HEADER_BASE_STRUCT.unpack_from(data, pos)
+        if otype not in (CAN_MESSAGE, CAN_MESSAGE2):
+            break
+        p = pos + OBJ_HEADER_BASE_STRUCT.size
+        if hv == 1:
+            flags, _, _, rel = OBJ_HEADER_V1_STRUCT.unpack_from(data, p)
+        else:
+            flags, _, _, rel = OBJ_HEADER_V2_STRUCT.unpack_from(data, p)
+        out.append(rel if flags != 1 else rel * 10_000)
+        pos += osize
+    return out
+
+
+def test_ts_seconds_integer_ns_construction(tmp_path):
+    """非整数秒 start：ts_seconds = (SYSTEMTIME 毫秒部分 + 对象头 rel)×1e-9。
+
+    根因（修复项）：python-can 读路径 timestamp = float(Decimal(rel)*1e-9)
+    + start_timestamp，float64 加法在 ~1.78e9s 量级把整数 ns 帧时刻
+    舍入到 238ns 网格（实测 A19G1 偏离 CANoe +72.5~73.5ns）。CANoe
+    用整数运算：t = (SYSTEMTIME_ms 整数 + rel 整数) − int(S)×1e9。
+    本测试断言读回的 ts_seconds 忠实还原对象头整数 rel（读路径不再
+    引入任何浮点舍入）。
+    """
+    import can
+
+    p = tmp_path / "subms.blf"
+    start = 1784716800.624  # 非整数秒（毫秒 624，SYSTEMTIME 写入）
+    offsets = [0.0, 0.123456789, 0.5, 1.000000001, 99.846363]
+    with can.BLFWriter(str(p)) as w:
+        for rel_s in offsets:
+            w.on_message_received(can.Message(
+                arbitration_id=0x123, data=b"\xAA\xBB",
+                channel=1, timestamp=start + rel_s))
+    frames = list(iter_all_messages(str(p)))
+    rels = _raw_rel_ns(str(p))
+    assert len(frames) == len(rels)
+    # 注：python-can 写路径 rel = int((start+rel_s − start)×1e9) 是 float
+    # 减法（写路径固有 238ns 网格，非本测试对象）；读路径必须逐位还原
+    # 对象头整数，并按 CANoe 同构公式构造（ms_part 从毫秒整数推：
+    # int(start) 的 float64 减法不可靠——1784716800.624 在 238ns 网格）
+    ms_part = (int(round(start * 1000)) % 1000) * 1_000_000  # 624_000_000
+    for i, (f, rel) in enumerate(zip(frames, rels)):
+        expected = float(ms_part + rel) * 1e-9
+        assert f.ts_seconds == expected, \
+            f"帧 {i} ts_seconds={f.ts_seconds!r} 应还原对象头 rel={rel} 的整数构造 {expected!r}"
+
+
+def test_ts_seconds_integer_ns_construction_integer_start(tmp_path):
+    """整数秒 start（AHT 场景）：整数 ns 构造与 float 路径一致，不回归。"""
+    import can
+
+    p = tmp_path / "intstart.blf"
+    offsets = [0.0, 1.0, 2.5, 10.125]
+    with can.BLFWriter(str(p)) as w:
+        for rel_s in offsets:
+            w.on_message_received(can.Message(
+                arbitration_id=0x123, data=b"\xAA",
+                channel=1, timestamp=1784716800.0 + rel_s))
+    frames = list(iter_all_messages(str(p)))
+    for i, f in enumerate(frames):
+        expected = float(int(round(offsets[i] * 1e9))) * 1e-9
+        assert f.ts_seconds == expected, \
+            f"帧 {i} 整数秒 start 下应精确等于 {expected!r}"

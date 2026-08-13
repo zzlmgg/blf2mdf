@@ -55,6 +55,31 @@ ZFCANT——CAN11
 
 
 
+自动对比：
+——————————
+以下面两组原始 blf 及其对应的 canoe 转换的 mdf 文件：
+组别一：
+  blf：‪E:\projects\blf_dbc\inputs\blf\A19G1_ACFCAN_00112_20260614_141114.blf
+  canoe 转的 mdf：‪E:\projects\blf_dbc\inputs\mdf\A19G1.mdf
+组别二：
+  blf：‪E:\projects\blf_dbc\inputs\blf\AHT_ACFCANPUB_20260317_210430_59125089-ACFCAN_20260317_210930_59125099.blf
+  canoe 转的 mdf：‪E:\projects\blf_dbc\inputs\mdf\AHT.mdf
+
+1、通过 main.py 把上面两组原始 blf 转换为对应的 mdf 文件。
+2、把 main.py 转换的 mdf 与各自的 canoe 转换的 mdf 进行详细对比：分析两组结果中 main.py 的转换结果与 canoe 的转换结果是否完全一致？如果不一致，体现在哪里？
+—————— 告诉我分析结果，不要动代码。
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

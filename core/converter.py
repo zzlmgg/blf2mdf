@@ -128,12 +128,13 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     # 时间基准对齐 CANoe（修复项 2）：以 BLF 文件头测量开始时间归零
     # （与解码帧无关，实测 CANoe 基准 = 文件头 start_timestamp；
     # 若用最早解码帧会整体偏移——样例首解码帧晚于测量开始 2ms）；
-    # t 轴零点 = 起始的整数秒（CANoe 语义，实测首帧 t=0.628791498 反推），
-    # 绝对起始时间（含小数秒，修复 624ms 截断，BLF 头 SYSTEMTIME 毫秒精度）
-    # 全精度传给 write_mdf 写入 MDF 头部 start_time/abs_time。
-    # BLFReader 初始化只读文件头，此处开销可忽略。
+    # t 轴零点 = 起始的整数秒（CANoe 语义，实测首帧 t=0.628791498 反推）。
+    # Frame.ts_seconds 已按整数 ns 构造相对该整数秒（见 blf_reader 模块
+    # docstring：float64 大数加法有 238ns 网格舍入，整数构造与 CANoe 同构），
+    # 此处不再做 float - int 相对化。
+    # 绝对起始时间（含小数秒，BLF 头 SYSTEMTIME 毫秒精度）全精度传给
+    # write_mdf 写入 MDF 头部 start_time/abs_time。
     abs_start_time = blf_reader.read_start_time(blf_path)
-    abs_start_epoch = int(abs_start_time)
 
     # 性能优化（方案 A）：单遍全文件扫描——一次遍历完成 解码输入路由 +
     # 统计输入收集，替代按通道逐遍重复解析整个文件（旧实现每绑定通道
@@ -168,7 +169,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             ch = fr.channel
             if stats_export:
                 t, e, r, er = stats_bufs[ch]
-                t.append(fr.ts_seconds - abs_start_epoch)
+                t.append(fr.ts_seconds)
                 e.append(fr.is_extended)
                 r.append(fr.is_remote)
                 er.append(fr.is_error)
@@ -235,16 +236,13 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     summary = ChannelSummary(channel=ch, bound=False)
             summaries.append(summary)
 
-        # 时间戳对齐 CANoe（修复：BLF float64 绝对时间戳大数减法损失 ~60ns
-        # 精度；自适应网格：ms 网格文件 round 到 1ms + ns 整数×1e-9 构造，
-        # 任意 ns 精度文件保留 float64 原值（BLF 量化 ±119ns 不可恢复），
-        # 见 stats.align_timestamps）
+        # 时间戳对齐 CANoe（修复：输入已是整数 ns 构造的相对值，见
+        # blf_reader 模块 docstring；align_timestamps 对 ms 网格文件仍
+        # round 到 1ms 整数（幂等），任意 ns 精度文件保留整数 ns 原值）
         for s in all_series:
-            s.timestamps = stats_mod.align_timestamps(
-                s.timestamps - abs_start_epoch)
+            s.timestamps = stats_mod.align_timestamps(s.timestamps)
         for rg in raw_groups:
-            rg.timestamps = stats_mod.align_timestamps(
-                rg.timestamps - abs_start_epoch)
+            rg.timestamps = stats_mod.align_timestamps(rg.timestamps)
 
         # 修复项 4：总线统计 1s 组（阶段 1）——覆盖 0-15 全部通道（与 DBC 绑定无关），
         # 无帧通道输出全 0；输入已在单遍扫描中收集（stats_bufs），
