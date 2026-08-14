@@ -384,19 +384,19 @@ class TitleBar(QWidget):
 
 
 class SummaryDialog(QDialog):
-    """主窗口之外显示完整逐通道转换摘要。"""
+    """主窗口之外显示完整日志（加载/转换各阶段耗时 + 转换摘要）。"""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("summaryDialog")
-        self.setWindowTitle("转换摘要")
+        self.setWindowTitle("日志")
         self.setModal(True)
         self.resize(520, 410)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 16)
         layout.setSpacing(12)
-        heading = QLabel("转换摘要")
+        heading = QLabel("日志")
         heading.setObjectName("dialogHeading")
         layout.addWidget(heading)
 

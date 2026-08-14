@@ -1,6 +1,8 @@
-"""主窗口：BLF/DBC 选择 → 通道绑定 → 转换 → 摘要。"""
+"""主窗口：BLF/DBC 选择 → 通道绑定 → 转换 → 日志。"""
+import datetime
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QThread, QObject, Signal, Slot
@@ -400,7 +402,7 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.convert_btn)
         v.addWidget(self.conversion_panel)
 
-        # 主窗口只保留紧凑摘要条；完整摘要稍后在对话框内展示。
+        # 主窗口只保留紧凑日志条；完整日志（耗时 + 摘要）在对话框内展示。
         self.summary_bar = QFrame()
         self.summary_bar.setObjectName("summaryBar")
         self.summary_bar.setMinimumHeight(34)
@@ -408,17 +410,17 @@ class MainWindow(QMainWindow):
         summary_row = QHBoxLayout(self.summary_bar)
         summary_row.setContentsMargins(10, 0, 7, 0)
         summary_row.setSpacing(8)
-        summary_title = QLabel("转换摘要")
+        summary_title = QLabel("日志")
         summary_title.setObjectName("summaryTitle")
         summary_row.addWidget(summary_title)
         self.summary_status = QLabel("尚未转换")
         self.summary_status.setObjectName("summaryStatus")
         summary_row.addWidget(self.summary_status)
         summary_row.addStretch(1)
-        self.summary_button = QPushButton("查看摘要")
+        self.summary_button = QPushButton("查看日志")
         self.summary_button.setObjectName("linkButton")
         self.summary_button.setEnabled(False)
-        self.summary_button.clicked.connect(self._show_summary)
+        self.summary_button.clicked.connect(self._show_log)
         summary_row.addWidget(self.summary_button)
         v.addWidget(self.summary_bar)
 
@@ -484,6 +486,7 @@ class MainWindow(QMainWindow):
             return  # 扫描进行中不接受新文件
         self.scan_cancel = threading.Event()  # 每次加载重建（取消即作废本次尝试）
         self._set_scan_busy(True)
+        self._load_start = time.perf_counter()  # 加载耗时计时（_on_scan_done 记日志）
         self.load_progress.setVisible(True)
         self.load_progress.setValue(0)
         self.scan_thread = QThread()
@@ -526,10 +529,19 @@ class MainWindow(QMainWindow):
         self._rebuild_channel_table(channels)
         self._set_default_output()
         self.convert_btn.setEnabled(True)
+        # 加载耗时记入日志（测试直调 _on_scan_done 时无 _load_start → 不记耗时）
+        t0 = getattr(self, "_load_start", None)
+        if t0 is not None:
+            elapsed = time.perf_counter() - t0
+            self._log(f"输入BLF 完成: {path}，耗时 {elapsed:.2f} s",
+                      status=f"输入BLF 完成: {elapsed:.2f} s")
+        else:
+            self._log(f"输入BLF 完成: {path}", status="输入BLF 完成")
 
     @Slot(str)
     def _on_scan_error(self, msg: str):
         self._finish_scan()
+        self._log(f"输入BLF 读取失败: {msg}", status="输入BLF 读取失败")
         QMessageBox.critical(self, "BLF 读取失败",
                              f"{self.scan_worker.path}\n{msg}")
 
@@ -538,6 +550,7 @@ class MainWindow(QMainWindow):
         """取消：复位界面但**不应用**结果（blf_path 保持原值——
         无文件保持 None，替换文件保持旧文件）。"""
         self._finish_scan()
+        self._log("输入BLF 已取消", status="输入BLF 已取消")
 
     def _finish_scan(self):
         thread = self.scan_thread
@@ -771,10 +784,7 @@ class MainWindow(QMainWindow):
         self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
         self._set_busy(True)
         self.progress.setValue(0)
-        self.summary.clear()
-        self.summary_text = ""
         self.summary_status.setText("转换中…")
-        self.summary_button.setEnabled(False)
         self.worker_thread = QThread()
         self.worker = ConvertWorker(self.blf_path, bindings, out,
                                     self.convert_cancel)
@@ -794,9 +804,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_convert_cancelled(self):
-        """取消：复位界面（进度归零、按钮恢复），摘要显示「已取消」。"""
+        """取消：复位界面（进度归零、按钮恢复），日志记「已取消」。"""
         self._finish()
-        self.summary_status.setText("已取消")
+        self._log("转换已取消", status="已取消")
 
     def _dbc_by_display(self, text: str) -> DbcDef | None:
         """按下拉显示名（文件名 + 文件夹，如 PFCAN2.dbc（AH8））回查 DbcDef。
@@ -834,13 +844,19 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_done(self, result: ConversionResult):
         self._finish()
-        self.summary_text = self._format_summary(result)
-        self.summary.setPlainText(self.summary_text)
+        lines = [f"{label}: {t:.2f} s" for label, t in result.timings]
+        body = "转换完成" + ("\n" + "\n".join(lines) if lines else "")
+        detail = self._format_summary(result)
+        if detail:
+            body += "\n转换摘要:\n" + detail
+        # 状态行：墙钟总耗时为主；无 timings（测试构造/旧调用方）兜底数据时长
+        total = next((t for label, t in result.timings if label == "总耗时"),
+                     result.duration_seconds)
         warning_count = sum(bool(s.warning) for s in result.summaries)
-        self.summary_status.setText(
-            f"已完成 · {result.duration_seconds:.1f} s · {warning_count} 条警告"
-        )
-        self.summary_button.setEnabled(True)
+        status = f"转换完成 · 总耗时 {total:.1f} s"
+        if warning_count:
+            status += f" · {warning_count} 条警告"
+        self._log(body, status=status)
         notice = QMessageBox(
             QMessageBox.Icon.Information,
             "提示",
@@ -871,7 +887,7 @@ class MainWindow(QMainWindow):
                     lines.append(f"  警告: {s.warning}")
         return "\n".join(lines)
 
-    def _show_summary(self):
+    def _show_log(self):
         if not self.summary_text:
             return
         self.summary_dialog.set_summary(self.summary_text)
@@ -880,8 +896,23 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_error(self, msg: str):
         self._finish()
-        self.summary_status.setText("转换失败")
+        self._log(f"转换失败: {msg}", status="转换失败")
         QMessageBox.critical(self, "转换失败", msg)
+
+    def _log(self, text: str, status: str | None = None) -> None:
+        """追加一条日志（带墙钟时间戳），同步底条状态与隐藏缓冲。
+
+        只在终态槽调用（扫描/转换的 done/cancelled/error）——隐藏的
+        summary 缓冲被 frozen_gui_probe 当作「转换完成」标志，转换完成
+        前不得写入（见 tools/frozen_gui_probe.py）。
+        """
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        entry = f"[{ts}] {text}"
+        self.summary_text = (self.summary_text + "\n" + entry
+                             if self.summary_text else entry)
+        self.summary.setPlainText(self.summary_text)
+        self.summary_status.setText(status if status is not None else text)
+        self.summary_button.setEnabled(True)
 
     def _finish(self):
         self.worker_thread.quit()

@@ -325,3 +325,32 @@ def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
         convert(blf, {1: load(dbc_path), 2: load(dbc_path)}, str(out),
                 parallel=True, cancel_cb=cancel)
     assert not out.exists()
+
+
+# ---- 阶段计时（GUI 日志用）----
+
+def test_convert_reports_stage_timings(tmp_path, blf_and_dbc):
+    """串行 convert 返回 timings：标签顺序 读入 BLF → 解码 CANn → 统计聚合
+    → 写 MDF → 总耗时；只含已绑定通道的解码项；所有值 >= 0。
+    串行逐通道耗时本身即墙钟，无并行路径的「解码墙钟」行。"""
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "timed.mdf"
+    result = convert(blf, {1: load(dbc_path), 2: None}, str(out))
+
+    labels = [label for label, _ in result.timings]
+    assert labels[0] == "读入 BLF" and labels[-1] == "总耗时", labels
+    assert "解码 CAN1" in labels, labels
+    assert "解码 CAN2" not in labels, "未绑定通道无解码项"
+    assert "解码墙钟（并行）" not in labels, "串行路径无并行墙钟行"
+    assert "统计聚合" in labels and "写 MDF" in labels, labels
+    values = {label: t for label, t in result.timings}
+    assert all(v >= 0.0 for v in values.values())
+    assert values["总耗时"] >= values["读入 BLF"]
+
+
+def test_convert_cancel_discards_timings(tmp_path, blf_and_dbc):
+    """取消路径：ScanCancelled 上抛，timings 随异常丢弃（GUI 取消日志不带耗时）。"""
+    blf, dbc_path = blf_and_dbc
+    with pytest.raises(ScanCancelled):
+        convert(blf, {1: load(dbc_path)}, str(tmp_path / "x.mdf"),
+                cancel_cb=lambda: True)

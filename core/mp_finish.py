@@ -18,6 +18,7 @@ cantools Database）——样例 10 通道全向量化，零 DBC 重复 pickle�
 失败回退：任务异常/池损坏 → 未完成桶原地串行 finish，输出与全串行一致。
 """
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -30,9 +31,12 @@ from core.decoder import DecodeStats, _decode_bucket_reference, \
 def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
     """子进程入口：单桶 finish（= ChannelDecoder.finish() 内同一函数）。
 
-    返回 (channel, arb, series 列表, unknown_frames, sorted(unknown_ids))。
+    返回 (channel, arb, series 列表, unknown_frames, sorted(unknown_ids),
+    桶解码耗时秒)。耗时在 worker 内实测（perf_counter 包住解码本身，
+    不含 pickle/传输）——timings 语义 = 每通道累计工作量，而非调度跨度。
     stats 从空开始（feed 期计数在父进程，见 finish_all 合并规则）。
     """
+    t0 = time.perf_counter()
     stats = DecodeStats()
     md = bucket["md"]
     if not _msg_vectorizable(md):
@@ -40,7 +44,8 @@ def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
         series = _decode_bucket_reference(dbc, channel, bucket, stats)
     else:
         series = _finish_bucket_vectorized(dbc, channel, bucket, stats)
-    return channel, arb, series, stats.unknown_frames, sorted(stats.unknown_ids)
+    return channel, arb, series, stats.unknown_frames, sorted(stats.unknown_ids), \
+        time.perf_counter() - t0
 
 
 def _noop():
@@ -111,7 +116,9 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                progress_cb=None, workers: int | None = None,
                pool: ProcessPoolExecutor | None = None,
                verify: bool = False,
-               cancel_cb=None) -> dict[int, tuple[list, DecodeStats]]:
+               cancel_cb=None,
+               timings: dict[int, float] | None = None) \
+        -> dict[int, tuple[list, DecodeStats]]:
     """按桶并行 finish 全部通道 → {ch: (series 列表, 合并后 DecodeStats)}。
 
     - 调用方可在扫描前创建池并 warm_up（spawn 成本藏在扫描期）；
@@ -125,6 +132,10 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
     - cancel_cb() 可选：每桶完成时检查（收集循环 + 串行兜底循环），置位即
       raise ScanCancelled——注意必须在通用 except Exception 之前捕获，否则
       取消异常会被当成池故障吞掉、转串行兜底重解（取消静默失效）。
+    - timings 可选（GUI 日志用）：传入 dict 时填充 {ch: 秒}，语义 = 该通道
+      各桶解码的累计工作量（worker 内实测每桶耗时求和，含串行兜底桶）——
+      并行下各通道互相重叠，是 CPU 工作而非墙钟跨度；零桶通道填 0.0；
+      ScanCancelled 抛出时不收尾（随异常丢弃）。
     """
     if not channels:
         return {}
@@ -157,6 +168,8 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
     failed: list[tuple[int, int, dict]] = []
     total_frames = sum(t[3] for t in tasks)
     done_frames = 0
+    # 每通道累计解码工作量（timings 请求时）：worker 内实测桶耗时求和
+    ch_work: dict[int, float] = {}
 
     def _report(ch: int, bucket: dict) -> None:
         """每桶完成上报：percent = 10 + 80 × 累计帧数 / 总帧数（单调）。"""
@@ -180,10 +193,11 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                 raise ScanCancelled()
             ch, arb = futures[f]
             try:
-                _, _, series, unk_frames, unk_ids = f.result()
+                _, _, series, unk_frames, unk_ids, dur = f.result()
             except Exception:
                 failed.append((ch, arb, decoders[ch].buckets[arb]))
                 continue
+            ch_work[ch] = ch_work.get(ch, 0.0) + dur
             results[(ch, arb)] = (series, unk_frames, unk_ids)
             _report(ch, decoders[ch].buckets[arb])
     except ScanCancelled:
@@ -205,9 +219,10 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
         # 取消检查点：串行兜底逐桶
         if cancel_cb is not None and cancel_cb():
             raise ScanCancelled()
-        _, _, series, unk_frames, unk_ids = \
+        _, _, series, unk_frames, unk_ids, dur = \
             _finish_bucket_worker(ch, arb, bucket, decoders[ch].dbc)
         results[(ch, arb)] = (series, unk_frames, unk_ids)
+        ch_work[ch] = ch_work.get(ch, 0.0) + dur
         _report(ch, bucket)
 
     if verify:
@@ -223,6 +238,11 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
                 diff = _assert_series_equal(sa, sb)
                 if diff:
                     raise AssertionError(f"CAN{ch} 系列不一致: {diff}")
+
+    # ── 每通道累计解码工作量（timings 请求时）：零桶通道填 0.0 ──
+    if timings is not None:
+        for ch in channels:
+            timings[ch] = ch_work.get(ch, 0.0)
 
     # ── 按桶序组装 + 合并 feed 期计数（§5.5）──
     merged: dict[int, tuple[list, DecodeStats]] = {}

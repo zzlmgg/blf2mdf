@@ -138,6 +138,36 @@ def test_summary_dialog_keeps_full_text_and_pinned_done_button(qapp):
     assert dialog.summary_view.toPlainText() == "总时长 1.0 s\nCAN 1 已绑定"
     assert dialog.done_button.text() == "完成"
     assert dialog.done_button.objectName() == "primaryButton"
+    assert dialog.windowTitle() == "日志"  # 复用为日志弹窗，可见标题已改
+
+
+def test_log_bar_uses_approved_visible_text(window, qapp):
+    """底部条可见文字：标题「日志」、按钮「查看日志」；34px 紧凑条不变。"""
+    from PySide6.QtWidgets import QLabel
+
+    window.show()
+    qapp.processEvents()
+    title = window.summary_bar.findChild(QLabel, "summaryTitle")
+    assert title is not None and title.text() == "日志"
+    assert window.summary_button.text() == "查看日志"
+    assert window.summary_bar.height() == 34
+
+
+def test_log_dialog_shows_full_log(window, monkeypatch):
+    """「查看日志」弹窗展示完整累积日志；日志为空时不弹。"""
+    window.summary_text = "[10:00:00.000] 输入BLF 完成: a.blf，耗时 2.00 s"
+    exec_calls = []
+    monkeypatch.setattr(window.summary_dialog, "exec",
+                        lambda: exec_calls.append(1))
+    window._show_log()
+    assert exec_calls == [1]
+    assert window.summary_dialog.summary_view.toPlainText() == \
+        window.summary_text
+    # 空日志不弹窗
+    window.summary_text = ""
+    exec_calls.clear()
+    window._show_log()
+    assert exec_calls == []
 
 
 def test_window_uses_compact_approved_geometry(window, qapp):
@@ -349,6 +379,8 @@ def test_done_updates_summary_before_showing_completion_notice(
             ChannelSummary(channel=2, bound=False),
         ],
         duration_seconds=12.34,
+        timings=[("读入 BLF", 50.0), ("解码 CAN1", 4.0),
+                 ("统计聚合", 0.6), ("写 MDF", 1.2), ("总耗时", 12.34)],
     )
     monkeypatch.setattr(window, "_finish", lambda: None)
 
@@ -372,14 +404,19 @@ def test_done_updates_summary_before_showing_completion_notice(
     assert observed["title"] == "提示"
     assert observed["text"] == "转换完成。"
     assert observed["buttons"] == ["确定"]
-    assert observed["summary_status"] == "已完成 · 12.3 s · 1 条警告"
+    assert observed["summary_status"] == "转换完成 · 总耗时 12.3 s · 1 条警告"
     assert observed["summary_enabled"]
     assert window.isVisible()
+    # 计时块在日志前部，摘要块并入日志末尾
+    assert "读入 BLF: 50.00 s" in window.summary_text
+    assert "解码 CAN1: 4.00 s" in window.summary_text
+    assert "总耗时: 12.34 s" in window.summary_text
     assert "总时长: 12.3 s" in window.summary_text
     assert "CAN 1 已绑定" in window.summary_text
     assert "CAN 2 未绑定" in window.summary_text
+    assert window.summary_text.endswith("CAN 2 未绑定: 原始帧导出关闭")
     assert window.summary.toPlainText() == window.summary_text
-    assert window.summary_status.text() == "已完成 · 12.3 s · 1 条警告"
+    assert window.summary_status.text() == "转换完成 · 总耗时 12.3 s · 1 条警告"
     assert window.summary_button.isEnabled()
 
 

@@ -554,6 +554,7 @@ def test_convert_cancel_resets_state(window, qapp, tmp_path, monkeypatch):
     assert window.progress.value() == 0
     assert window.convert_btn.isEnabled(), "转换按钮应恢复可用"
     assert window.summary_status.text() == "已取消"
+    assert "转换已取消" in window.summary_text, "取消应记入日志"
     assert boxes == [], "取消不是错误/成功，不应弹任何框"
     window.close()
 
@@ -592,3 +593,97 @@ def test_close_during_convert_returns_promptly(window, qapp, tmp_path,
     assert window.worker_thread is not None and window.worker_thread.isRunning()
     window.close()  # 未置取消事件会卡住（桩循环永不退出）
     assert window.worker_thread is None, "关窗后转换线程应收尾"
+
+
+# ---- 日志（加载/转换计时记录） ----
+
+def test_blf_load_logs_duration_into_log(window):
+    """BLF 加载完成：耗时记入日志（时间戳前缀），底条显示短状态、
+    按钮启用、隐藏缓冲同步。"""
+    import re
+    import time
+
+    class FakeWorker:
+        path = r"E:\data\run001.blf"
+    window.scan_worker = FakeWorker()
+    window._load_start = time.perf_counter() - 2.0
+    window._on_scan_done([1, 2])
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]", window.summary_text)
+    assert "输入BLF 完成" in window.summary_text
+    assert window.summary_status.text().startswith("输入BLF 完成: 2.")
+    assert window.summary_button.isEnabled()
+    assert window.summary.toPlainText() == window.summary_text
+
+
+def test_scan_done_without_load_start_logs_no_crash(window):
+    """测试直调 _on_scan_done（无 _load_start）不崩溃：记无耗时的完成行。"""
+    class FakeWorker:
+        path = r"E:\data\run001.blf"
+    window.scan_worker = FakeWorker()
+    window._on_scan_done([1, 2])  # getattr 兜底，不记录耗时
+    assert "输入BLF 完成" in window.summary_text
+    assert window.summary_status.text() == "输入BLF 完成"
+
+
+def test_start_convert_does_not_prefill_log_buffer(window, qapp, tmp_path,
+                                                   monkeypatch):
+    """探针契约：_start_convert 不预写日志缓冲——frozen_gui_probe 以
+    summary.toPlainText() 非空判断「转换完成」，转换中不得提前写入。"""
+    import gui.main_window as mw
+
+    blf = tmp_path / "run001.blf"
+    blf.write_bytes(b"\x00")
+    out = tmp_path / "run001_t.mdf"
+    monkeypatch.setattr(mw, "convert", _looping_convert_until_cancel())
+    window.blf_path = str(blf)
+    window.out_edit.setText(str(out))
+    window._rebuild_channel_table([1])
+    window.show()
+    qapp.processEvents()
+    window._start_convert()
+    assert window.summary_text == ""
+    assert window.summary.toPlainText() == ""
+    window.btn_convert_cancel.click()  # 收尾：取消并等待线程结束
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+    window.close()
+
+
+def test_log_accumulates_across_events(window, monkeypatch):
+    """日志会话内累积：BLF 完成行与转换完成块并存，底条为最后事件状态。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from core.converter import ChannelSummary, ConversionResult
+
+    class FakeWorker:
+        path = r"E:\data\run001.blf"
+    window.scan_worker = FakeWorker()
+    window._load_start = 0.0
+    window._on_scan_done([1])
+    result = ConversionResult(
+        summaries=[ChannelSummary(channel=1, bound=True)],
+        duration_seconds=3.0,
+        timings=[("读入 BLF", 1.0), ("解码 CAN1", 0.5),
+                 ("统计聚合", 0.1), ("写 MDF", 0.2), ("总耗时", 1.9)],
+    )
+    monkeypatch.setattr(window, "_finish", lambda: None)
+    monkeypatch.setattr(QMessageBox, "exec",
+                        lambda self: QMessageBox.StandardButton.Ok)
+    window._on_done(result)
+    assert "输入BLF 完成" in window.summary_text
+    assert "转换完成" in window.summary_text
+    assert "读入 BLF: 1.00 s" in window.summary_text
+    assert window.summary_status.text() == "转换完成 · 总耗时 1.9 s"
+
+
+def test_convert_error_logs_failure_line(window, monkeypatch):
+    """转换失败：错误信息记入日志、底条「转换失败」，仍弹 critical。"""
+    import gui.main_window as mw
+
+    errors = []
+    monkeypatch.setattr(mw.QMessageBox, "critical",
+                        lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(window, "_finish", lambda: None)
+    window._on_error("boom")
+    assert "转换失败: boom" in window.summary_text
+    assert window.summary_status.text() == "转换失败"
+    assert errors, "critical 应被调用"

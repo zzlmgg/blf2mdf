@@ -1,7 +1,8 @@
 """转换编排：多通道聚合 → 单个 MDF。"""
 import os
+import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,11 @@ class ChannelSummary:
 class ConversionResult:
     summaries: list[ChannelSummary]
     duration_seconds: float
+    # 各阶段耗时（按时间顺序：读入 BLF → [并行] 解码墙钟（并行）→
+    # 解码 CANn → 统计聚合 → 写 MDF → 总耗时）。串行「解码 CANn」为
+    # 该通道墙钟；并行「解码 CANn」为该通道累计解码工作量（各通道互相
+    # 重叠，之和可大于解码墙钟）。取消/异常路径不返回（随异常丢弃）。
+    timings: list[tuple[str, float]] = field(default_factory=list)
 
 
 def _normalize_id(fr) -> int:
@@ -113,6 +119,12 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     total = len(channels)
     all_series, raw_groups, summaries = [], [], []
     min_ts, max_ts = float("inf"), float("-inf")
+    # 各阶段计时（GUI 日志用）：总耗时入口 → 读入 → [并行] 解码墙钟 →
+    # 解码×n → 聚合 → 写。串行「解码 CANn」= 该通道墙钟（逐通道顺序执行）；
+    # 并行「解码 CANn」= 该通道累计工作量（finish_all 内 worker 实测求和），
+    # 与「解码墙钟（并行）」行并存使日志可对账。
+    t_total = time.perf_counter()
+    timings: list[tuple[str, float]] = []
 
     def note_range(ts_arr):
         nonlocal min_ts, max_ts
@@ -164,6 +176,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         # 35MB 样例 52s 里 50s 在读取，逐容器上报让进度条全程前进）
         read_cb = (lambda f: progress_cb("读取 BLF", 5 + 5 * f / 100)) \
             if progress_cb else None
+        t_read = time.perf_counter()
         for fr in blf_reader.iter_all_messages(blf_path, progress_cb=read_cb,
                                                cancel_cb=cancel_cb):
             ch = fr.channel
@@ -178,6 +191,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 dec.feed(fr)
             elif raw_export and ch in raw_bufs:
                 raw_bufs[ch].append(fr)
+        timings.append(("读入 BLF", time.perf_counter() - t_read))
         # 取消检查点：读取完毕、解码前（取消则不再启动解码/池回收）
         _check_cancel(cancel_cb)
 
@@ -190,9 +204,17 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
 
         # ── 解码阶段：并行（方案 G，per-bucket）或串行（现状语义）──
         if pool is not None:
+            ch_times: dict[int, float] = {}
+            t_decode = time.perf_counter()
             results = mp_finish.finish_all(decoders, sorted(decoders),
                                            progress_cb=progress_cb, pool=pool,
-                                           cancel_cb=cancel_cb)
+                                           cancel_cb=cancel_cb,
+                                           timings=ch_times)
+            # 解码阶段墙钟：读入 + 本行 + 聚合 + 写 ≈ 总耗时（日志可对账）
+            timings.append(("解码墙钟（并行）", time.perf_counter() - t_decode))
+            for ch in sorted(decoders):
+                # 该通道累计解码工作量；零桶通道无桶任务，finish_all 兜底 0.0
+                timings.append((f"解码 CAN{ch}", ch_times.get(ch, 0.0)))
         else:
             results = {}
             for i, ch in enumerate(sorted(decoders)):
@@ -200,7 +222,9 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
                 # 取消检查点：串行解码逐通道
                 _check_cancel(cancel_cb)
+                t_ch = time.perf_counter()
                 results[ch] = decoders[ch].finish()
+                timings.append((f"解码 CAN{ch}", time.perf_counter() - t_ch))
 
         for i, ch in enumerate(channels):
             dbc = bindings.get(ch)
@@ -249,6 +273,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         # BLF 中不存在的通道直接全 0。
         stats_groups = []
         if stats_export:
+            t_stats = time.perf_counter()
             if progress_cb:
                 progress_cb("聚合总线统计", 92)
             global_end = 0.0
@@ -269,11 +294,13 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     np.asarray(r, dtype=bool),
                     np.asarray(er, dtype=bool),
                     global_end))
+            timings.append(("统计聚合", time.perf_counter() - t_stats))
 
         if progress_cb:
             progress_cb("写 MDF", 95)
         # 取消检查点：写 MDF 前（取消则不写，无输出残留）
         _check_cancel(cancel_cb)
+        t_write = time.perf_counter()
         try:
             mdf_writer.write_mdf(all_series, raw_groups, out_path,
                                  abs_start_seconds=abs_start_time,
@@ -291,11 +318,14 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 if os.path.exists(p):
                     os.remove(p)
             raise ScanCancelled()
+        timings.append(("写 MDF", time.perf_counter() - t_write))
         if progress_cb:
             progress_cb("完成", 100)
+        timings.append(("总耗时", time.perf_counter() - t_total))
         return ConversionResult(
             summaries=summaries,
             duration_seconds=(max_ts - min_ts) if min_ts <= max_ts else 0.0,
+            timings=timings,
         )
     finally:
         # 池生命周期：正常/异常路径均回收（feed 异常、write 异常等）
