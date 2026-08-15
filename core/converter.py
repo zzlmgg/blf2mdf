@@ -70,17 +70,31 @@ def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return cf.ts[sel], lens, block
 
 
-def _append_bucket_rows(b, ts, lens, block) -> None:
-    """数组桶追加行：data 列宽按需 pad（L 单调增，总拷贝 O(N×Lmax)）。"""
-    cur = b["data"]
-    L = max(cur.shape[1], block.shape[1])
-    if cur.shape[1] < L:
-        cur = np.pad(cur, ((0, 0), (0, L - cur.shape[1])))
-    if block.shape[1] < L:
-        block = np.pad(block, ((0, 0), (0, L - block.shape[1])))
-    b["data"] = np.concatenate([cur, block])
-    b["ts"] = np.concatenate([b["ts"], ts])
-    b["lens"] = np.concatenate([b["lens"], lens])
+def _assemble_bucket(b) -> None:
+    """块列表 → 数组桶（ts/lens/data），与逐容器追加产物逐位一致。
+
+    一次末态连接替代逐容器 np.concatenate 重分配（H2a：实测 3774 次追加
+    拷贝 4.83GB、其中 4.67GB 可避免、函数内 1.65s → 块切片批量拷贝，
+    每字节只写一次；不用 row/col 散点——桶规模 1.6 亿位置 × int64 索引
+    数组的 fancy indexing 实测 7.6s，比块拷贝慢一个数量级）。
+    """
+    ts = np.concatenate(b["ts_blocks"])
+    lens = np.concatenate(b["lens_blocks"])
+    n = len(ts)
+    L = max(int(blk.shape[1]) for blk in b["blocks"]) if b["blocks"] else 0
+    data = np.zeros((n, L), dtype=np.uint8)
+    start = 0
+    for blk, bl in zip(b["blocks"], b["lens_blocks"]):
+        m = len(bl)
+        if m:
+            if blk.shape[1] < L:
+                blk = np.pad(blk, ((0, 0), (0, L - blk.shape[1])))
+            data[start:start + m] = blk
+        start += m
+    b["ts"] = ts
+    b["lens"] = lens
+    b["data"] = data
+    del b["blocks"], b["ts_blocks"], b["lens_blocks"]
 
 
 def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
@@ -147,11 +161,14 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
                 b = dec.buckets.get(arb)
                 if b is None:
                     dec.buckets[arb] = {
-                        "ts": ts, "lens": lens, "data": block,
+                        "blocks": [block], "ts_blocks": [ts],
+                        "lens_blocks": [lens],
                         "arb": arb, "raw_id": int(cf.arb[sel][0]), "md": md,
                     }
                 else:
-                    _append_bucket_rows(b, ts, lens, block)
+                    b["blocks"].append(block)
+                    b["ts_blocks"].append(ts)
+                    b["lens_blocks"].append(lens)
         # ── 原始帧块（raw_export 未绑定通道；known_ids 过滤在块内完成）──
         for ch in raw_chs:
             m = cf.channel == ch
@@ -171,6 +188,10 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
                 raw_chunks[ch][0].append(
                     (ts, cf.arb[sel], cf.dlc[sel], lens, block,
                      cf.is_ext[sel], cf.is_fd[sel]))
+    # 桶装配：块列表 → 数组桶（读入后一次成型，下游 finish/阈值计按数组消费）
+    for dec in decoders.values():
+        for b in dec.buckets.values():
+            _assemble_bucket(b)
 
 
 def _block_rows(block: np.ndarray, lens: np.ndarray) -> np.ndarray:
@@ -182,6 +203,14 @@ def _block_rows(block: np.ndarray, lens: np.ndarray) -> np.ndarray:
     col = np.arange(int(lens.sum())) \
         - np.repeat(np.concatenate(([0], np.cumsum(lens)[:-1])), lens)
     return block[row, col]
+
+
+def _fill_var_rows(data: np.ndarray, lens: np.ndarray, flat: np.ndarray) -> None:
+    """(N, L) 零数组按变长行填充：row/col 散点（flat = 各行前 lens 字节拼串）。"""
+    row = np.repeat(np.arange(len(lens)), lens)
+    col = np.arange(len(row)) \
+        - np.repeat(np.concatenate(([0], np.cumsum(lens)[:-1])), lens)
+    data[row, col] = flat
 
 
 def _assemble_raw(blocks, channel: int, unknown_frames: int, unknown_ids: set):
@@ -211,11 +240,8 @@ def _assemble_raw(blocks, channel: int, unknown_frames: int, unknown_ids: set):
     L = int(dlcs.max())
     data_array = np.zeros((len(ts), L), dtype=np.uint8)
     if len(ts):
-        row = np.repeat(np.arange(len(ts)), lens)
-        col = np.arange(len(row)) \
-            - np.repeat(np.concatenate(([0], np.cumsum(lens)[:-1])), lens)
-        flat = np.concatenate([_block_rows(b[4], b[3]) for b in blocks])
-        data_array[row, col] = flat
+        _fill_var_rows(data_array, lens,
+                       np.concatenate([_block_rows(b[4], b[3]) for b in blocks]))
     return (
         mdf_writer.RawGroup(
             channel=channel,
