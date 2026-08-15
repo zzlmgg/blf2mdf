@@ -354,3 +354,86 @@ def test_convert_cancel_discards_timings(tmp_path, blf_and_dbc):
     with pytest.raises(ScanCancelled):
         convert(blf, {1: load(dbc_path)}, str(tmp_path / "x.mdf"),
                 cancel_cb=lambda: True)
+
+
+# ---- H1 Step 4：FD/扩展/变长向量化读入结构测试（A/B 开关已删除）----
+
+INLINE_DBC_FD = '''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 512 ABC2: 8 ECU
+ SG_ Speed2 : 0|16@1+ (0.01,0) [0|655.35] "km/h" ECU
+
+BO_ 768 MSG300: 8 ECU
+ SG_ Dummy3 : 0|8@1+ (1,0) [0|255] "" ECU
+'''
+
+
+@pytest.fixture()
+def blf_and_dbc_fd(tmp_path):
+    """FD 帧 + 变长载荷 + 扩展帧夹具：exercises 桶块拼接（lens 8→24 pad）、
+    原始组行宽（FD dlc2len 48 / 经典 dlc 1）、扩展帧归一化键。"""
+    import can
+
+    blf = tmp_path / "fd.blf"
+    with can.BLFWriter(str(blf)) as w:
+        # 0x200（标准 FD）：8 字节（入桶，lens=8）
+        w.on_message_received(can.Message(arbitration_id=0x200, is_extended_id=False,
+                                          is_fd=True, data=bytes(range(8)),
+                                          channel=3, timestamp=1784716800.0))
+        # 0x200（标准 FD）：24 字节（同桶追加，lens=24，触发 data 列宽 pad）
+        w.on_message_received(can.Message(arbitration_id=0x200, is_extended_id=False,
+                                          is_fd=True, data=bytes(range(24)),
+                                          channel=3, timestamp=1784716801.0))
+        # 0x200（扩展帧）：归一化键含 EFF 位 → 与标准帧不同桶，且无 DBC 定义
+        w.on_message_received(can.Message(arbitration_id=0x200, is_extended_id=True,
+                                          data=b"\x01\x02", channel=3,
+                                          timestamp=1784716802.0))
+        # 通道 5 原始：0x300 FD 48 字节（行宽 = dlc2len 48）+ 0x200 短帧
+        # （经典 dlc 原值 1）；0x300 在 DBC 中有定义 → 不被过滤
+        w.on_message_received(can.Message(arbitration_id=0x300, is_extended_id=False,
+                                          is_fd=True, data=bytes(range(48)),
+                                          channel=5, timestamp=1784716803.0))
+        w.on_message_received(can.Message(arbitration_id=0x200, is_extended_id=False,
+                                          data=b"\xAA", channel=5,
+                                          timestamp=1784716804.0))
+    dbc = tmp_path / "t_fd.dbc"
+    dbc.write_text(INLINE_DBC_FD, encoding="utf-8")
+    return str(blf), str(dbc)
+
+
+def test_convert_fd_bucketing_and_raw_assembly(tmp_path, blf_and_dbc_fd):
+    """FD/扩展/变长帧经向量化单遍扫描：解码桶（8→24 pad 后同桶两样本）、
+    扩展帧归未知、原始组行宽 max(dlc2len)=48 且短帧补零。"""
+    blf, dbc_path = blf_and_dbc_fd
+    out = tmp_path / "fd_out.mdf"
+    result = convert(blf, {3: load(dbc_path), 5: None}, str(out),
+                     raw_export=True, stats_export=False)
+
+    by_ch = {s.channel: s for s in result.summaries}
+    s3 = by_ch[3]
+    assert s3.bound and s3.decoded_frames == 2
+    assert s3.unknown_frames == 1 and s3.unknown_ids == 1   # 扩展帧 0x200 无定义
+    s5 = by_ch[5]
+    assert not s5.bound and s5.raw_frames == 2
+    assert s5.unknown_frames == 0 and s5.unknown_ids == 0   # 0x300 在 DBC 有定义
+
+    m = MDF(str(out))
+    gi = next(i for i, g in enumerate(m.groups)
+              if g.channel_group.acq_name == "Raw::CAN5")
+    assert {g.channel_group.acq_name for g in m.groups} == {"ABC2", "Raw::CAN5"}
+    assert np.allclose(m.get("Speed2").samples, [2.56, 2.56])  # 0x0100 × 0.01
+    assert np.allclose(m.get("t", group=0).samples, [0.0, 1.0])
+    assert m.get("ID", group=gi).samples.tolist() == [0x300, 0x200]
+    assert m.get("DLC", group=gi).samples.tolist() == [48, 1]
+    data = np.asarray(m.get("Data", group=gi).samples)
+    assert data.shape == (2, 48)
+    assert data[0].tolist() == list(range(48))
+    assert data[1][0] == 0xAA and not data[1][1:].any()      # 短帧补零
+    assert m.get("IsFD", group=gi).samples.tolist() == [1, 0]
+    assert np.allclose(m.get("t", group=gi).samples, [3.0, 4.0])

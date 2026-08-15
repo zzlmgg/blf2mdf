@@ -147,6 +147,20 @@ def _bucket_data_array(data_bytes: list[bytes], max_len: int) -> np.ndarray:
     return arr
 
 
+def _normalize_bucket(b) -> None:
+    """桶表示归一化（H1 Step 2，幂等）：feed 列表路径 → 数组表示。
+
+    数组桶契约：ts float64 (N,)、lens int64 (N,)、data (N, L) uint8
+    （L = max(lens)，补零）。向量化路由（Step 3）直接装配数组，无此转换。
+    """
+    if not isinstance(b["data"], list):
+        return
+    lens = np.fromiter((len(d) for d in b["data"]), dtype=np.intp, count=len(b["ts"]))
+    b["lens"] = lens
+    b["data"] = _bucket_data_array(b["data"], int(lens.max()) if len(lens) else 0)
+    b["ts"] = np.asarray(b["ts"], dtype=np.float64)
+
+
 def _choices_lookup(sd: SignalDef, raw: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
     """choices 键查询 → (排序键数组, in_table 掩码)；无 choices → (None, None)。
 
@@ -201,18 +215,29 @@ def _physical(sd: SignalDef, raw: np.ndarray) -> np.ndarray:
 
 def _text_array(sd: SignalDef, raw: np.ndarray, keys: np.ndarray,
                 in_table: np.ndarray) -> np.ndarray:
-    """文本存储：表内值 → 定宽 UTF-8 bytes（= 最长观察值），表外/非活跃 → b''。"""
+    """文本存储：表内值 → 定宽 UTF-8 bytes（= 最长观察值），表外/非活跃 → b''。
+
+    逐样本 Python 编码在 27.5M 样本上实测 ~30s（genexpr 求宽 + 逐样本
+    encode），改为表级一次编码：宽度 = 观察到的表项编码长度最大值，
+    输出 = (k, w) 编码矩阵 take + view（同语义逐位一致）。
+    """
     n = len(raw)
     if not in_table.any():
         return np.zeros(n, dtype="|S1")
     texts = np.array([sd.choices[k] for k in keys.tolist()], dtype=object)
     ai = np.where(in_table)[0]
-    matched = texts[np.searchsorted(keys, raw[ai], side="left")]
+    idx = np.searchsorted(keys, raw[ai], side="left")
+    enc_table = [t.encode("utf-8") for t in texts.tolist()]
+    len_table = np.fromiter((len(e) for e in enc_table), dtype=np.int64,
+                            count=len(enc_table))
     # 宽度按 UTF-8 字节数（= 参考 str(v).encode("utf-8") 的字节长度；
     # 按 len(t) 字符数会对非 ASCII 文本（GBK 中文）定宽不足而截断）
-    w = max((len(t.encode("utf-8")) for t in matched), default=1)
+    w = int(np.max(len_table[idx], initial=1))
+    # 未观察表项可能长于 w：截断安全（idx 只指向观察到的表项，长度 ≤ w）
+    mat = np.array([list(e.ljust(w, b"\x00")[:w]) for e in enc_table],
+                   dtype=np.uint8)
     out = np.zeros(n, dtype=f"|S{w}")
-    out[ai] = np.asarray([t.encode("utf-8") for t in matched.tolist()], dtype=out.dtype)
+    out[ai] = mat[idx].view(f"|S{w}").reshape(-1)   # w=1 时 view 不塌缩末轴
     return out
 
 
@@ -262,17 +287,19 @@ def _mux_plan(md: MessageDef) -> tuple[SignalDef, dict[int, list[SignalDef]]] | 
 
 
 def _finish_bucket_vectorized(dbc, channel, b, stats) -> list[SignalSeries]:
-    """单桶向量化解码（无 mux 或单级 mux），与逐帧参考实现逐点等价。"""
+    """单桶向量化解码（无 mux 或单级 mux），与逐帧参考实现逐点等价。
+
+    H1 Step 2：桶为数组表示（ts float64 (N,)、lens int64 (N,)、data
+    (N, L) uint8——feed 列表路径由 finish() 归一化，向量化路由直接装配）。
+    """
     md = b["md"]
     n = len(b["ts"])
-    data_bytes = b["data"]
-    lens = np.fromiter((len(d) for d in data_bytes), dtype=np.intp, count=n)
+    lens = b["lens"]
     valid = lens >= md.frame_length      # 短帧 DecodeError → 未知
     decodable = valid.copy()
     plan = _mux_plan(md)
     if plan is not None:
-        raw_data = _bucket_data_array(data_bytes, int(lens.max()))
-        data64 = _pad_to_64(raw_data).view("<u8")
+        data64 = _pad_to_64(b["data"]).view("<u8")
         selector, children = plan
         sel_raw = _extract_signal(data64, selector)
         known_arr = np.array(sorted(children), dtype=sel_raw.dtype)
@@ -285,8 +312,7 @@ def _finish_bucket_vectorized(dbc, channel, b, stats) -> list[SignalSeries]:
     if not decodable.any():
         return []
     if plan is None:
-        raw_data = _bucket_data_array(data_bytes, int(lens.max()))
-        data64 = _pad_to_64(raw_data).view("<u8")
+        data64 = _pad_to_64(b["data"]).view("<u8")
     d64 = data64[decodable]
     timestamps = np.asarray(b["ts"], dtype=np.float64)[decodable]
     n_ok = int(decodable.sum())
@@ -313,6 +339,7 @@ def _decode_bucket_reference(dbc, channel, b, stats) -> list[SignalSeries]:
     """非向量化报文（mux 报文）回退：逐帧 cantools 解码。
 
     逐帧语义与方案C前完全一致（decode_message/未知帧分类/值累积/收尾类型判定）。
+    H1 Step 2：数组表示——data (N, L) uint8 按 lens 行切片还原帧字节。
     """
     from cantools.database.errors import DecodeError
     from cantools.database.namedsignalvalue import NamedSignalValue
@@ -320,10 +347,10 @@ def _decode_bucket_reference(dbc, channel, b, stats) -> list[SignalSeries]:
     md = b["md"]
     vals_by_sig = {s.name: [] for s in md.signals}
     ts_ok = []
-    for ts, data in zip(b["ts"], b["data"]):
+    for ts, ln, row in zip(b["ts"], b["lens"], b["data"]):
         try:
             # 归一化键（含 EFF 位）与 feed/参考实现对拍一致（rulings 修正 2）
-            decoded = dbc.db.decode_message(b["arb"], data)
+            decoded = dbc.db.decode_message(b["arb"], row[:ln].tobytes())
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(b["raw_id"])
@@ -408,6 +435,7 @@ class ChannelDecoder:
     def finish(self) -> tuple[list[SignalSeries], DecodeStats]:
         series = []
         for arb, b in self.buckets.items():
+            _normalize_bucket(b)
             md = b["md"]
             if not _msg_vectorizable(md):
                 series.extend(_decode_bucket_reference(self.dbc, self.channel, b, self.stats))

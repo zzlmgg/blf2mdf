@@ -25,7 +25,7 @@ import numpy as np
 
 from core.blf_reader import ScanCancelled
 from core.decoder import DecodeStats, _decode_bucket_reference, \
-    _finish_bucket_vectorized, _msg_vectorizable
+    _finish_bucket_vectorized, _msg_vectorizable, _normalize_bucket
 
 
 def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
@@ -38,6 +38,7 @@ def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
     """
     t0 = time.perf_counter()
     stats = DecodeStats()
+    _normalize_bucket(bucket)   # 列表桶 → 数组表示（幂等；H1 Step 2）
     md = bucket["md"]
     if not _msg_vectorizable(md):
         # 回退路径需要 cantools Database（_decode_bucket_reference 用 dbc.db）
@@ -54,9 +55,14 @@ def _noop():
 
 
 def warm_up(pool: ProcessPoolExecutor) -> None:
-    """扫描期预热：提交一个 no-op 任务并等待，让全部 worker 的 spawn +
-    import（numpy/cantools）耗时藏在扫描期（实测 8 worker ~1.7s）。"""
-    pool.submit(_noop).result()
+    """扫描期预热：每个 worker 槽提交一个 no-op 任务并等待，让全部 worker
+    的 spawn + import（numpy/cantools）耗时藏在扫描期（实测 8 worker
+    ~1.7s）。注意只提交 1 个任务时 ProcessPoolExecutor 惰性只拉起 1 个
+    worker，其余 spawn 会落到首个真实任务提交时（H1 后解码墙钟实测
+    ~1.7s 虚增）——必须按 max_workers 全量预热。"""
+    futures = [pool.submit(_noop) for _ in range(pool._max_workers)]
+    for f in futures:
+        f.result()
 
 
 def make_pool(channels: list[int],
@@ -74,11 +80,19 @@ def make_pool(channels: list[int],
 
 
 def bucket_bytes(decoders, channels: list[int]) -> int:
-    """桶内存估算（帧 ts float 对象 ~32B + data 字节；阈值回退用，见 §5.7）。"""
+    """桶内存估算（阈值回退用，见 §5.7）。
+
+    H1 Step 2 多态：feed 列表路径按帧 ts float 对象 ~32B + data 字节估算；
+    数组表示（H1 向量化路由装配或 finish 归一化后）按 nbytes 精确计。
+    """
     total = 0
     for ch in channels:
         for b in decoders[ch].buckets.values():
-            total += len(b["ts"]) * 32 + sum(len(d) for d in b["data"])
+            if isinstance(b["data"], list):
+                total += len(b["ts"]) * 32 + sum(len(d) for d in b["data"])
+            else:
+                total += int(b["ts"].nbytes) + int(b["data"].nbytes) \
+                    + int(b["lens"].nbytes)
     return total
 
 

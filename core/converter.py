@@ -9,6 +9,7 @@ import numpy as np
 
 from core import blf_reader, mdf_writer, mp_finish
 from core.blf_reader import ScanCancelled
+from core.blf_vector import iter_container_frames
 from core.decoder import ChannelDecoder
 from core.dbc_loader import DbcDef
 from core import stats as stats_mod
@@ -18,6 +19,217 @@ def _check_cancel(cancel_cb) -> None:
     """转换检查点：cancel_cb 置位 → raise ScanCancelled（GUI 取消按钮）。"""
     if cancel_cb is not None and cancel_cb():
         raise ScanCancelled()
+
+
+# ── H1 Step 3：向量化单遍扫描（读入路由 + 桶装配）──
+def _prep_decode_info(decoders) -> dict[int, tuple[np.ndarray, np.ndarray, list]]:
+    """解码路由预计算：每通道 (排序键 uint32, 帧长 int64, MessageDef 表)。
+
+    键 = 归一化键（原始 id 含 EFF 位），与 dbc.messages 键契约一致。
+    """
+    info = {}
+    for ch, dec in decoders.items():
+        keys = sorted(dec.dbc.messages)
+        info[ch] = (
+            np.asarray(keys, dtype=np.uint32),
+            np.asarray([dec.dbc.messages[k].frame_length for k in keys],
+                       dtype=np.int64),
+            [dec.dbc.messages[k] for k in keys],
+        )
+    return info
+
+
+def _lookup(keys: np.ndarray, vals: np.ndarray) -> np.ndarray:
+    """排序键二分：vals 是否在表内（searchsorted + 判等，O(n log m)）。"""
+    if len(keys) == 0:
+        return np.zeros(len(vals), dtype=bool)
+    pos = np.searchsorted(keys, vals)
+    ok = pos < len(keys)
+    safe = np.where(ok, pos, 0)
+    return ok & (keys[safe] == vals)
+
+
+def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """容器内帧子集（bool 掩码或整数索引）→ 桶块 (ts, lens, (N, L) data)。
+
+    row/col 摊平 gather（2×np.repeat + 散点）在 5.6M 帧上实测 ~3.7s，
+    改为定宽单次 take（快路径定跨距 / 回退变长两种 data8 布局均按
+    data_off/data_len 自洽寻址）；lens < L 的行尾补 0（原 zeros 语义，
+    消费者按 lens 界定，保持逐位一致防御）。
+    """
+    lens = cf.data_len[sel]
+    n = len(lens)
+    if n == 0:
+        return cf.ts[sel], lens, np.zeros((0, 0), dtype=np.uint8)
+    L = int(lens.max())
+    idt = np.int32 if cf.data8.size < 2 ** 31 else np.int64
+    src2 = cf.data_off[sel].astype(idt)[:, None] + np.arange(L, dtype=idt)
+    block = np.take(cf.data8, src2, mode="clip")   # 越界位 → 下式清零
+    if not bool(np.all(lens == L)):
+        block[np.arange(L)[None, :] >= lens[:, None]] = 0
+    return cf.ts[sel], lens, block
+
+
+def _append_bucket_rows(b, ts, lens, block) -> None:
+    """数组桶追加行：data 列宽按需 pad（L 单调增，总拷贝 O(N×Lmax)）。"""
+    cur = b["data"]
+    L = max(cur.shape[1], block.shape[1])
+    if cur.shape[1] < L:
+        cur = np.pad(cur, ((0, 0), (0, L - cur.shape[1])))
+    if block.shape[1] < L:
+        block = np.pad(block, ((0, 0), (0, L - block.shape[1])))
+    b["data"] = np.concatenate([cur, block])
+    b["ts"] = np.concatenate([b["ts"], ts])
+    b["lens"] = np.concatenate([b["lens"], lens])
+
+
+def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
+                     raw_chunks, known_keys, read_cb, cancel_cb) -> None:
+    """H1 向量化单遍扫描（计划 §9.1.3）：逐容器路由解码桶/统计/原始帧。
+
+    直接填充 decoders[ch].buckets（数组桶）、decoders[ch].stats（feed 期
+    计数语义）、stats_bufs 块列表、raw_chunks 块列表——下游（finish/统计
+    聚合/raw 组装）输出与旧 feed 循环逐位一致。
+    """
+    info = _prep_decode_info(decoders)
+    for cf in iter_container_frames(blf_path, progress_cb=read_cb,
+                                    cancel_cb=cancel_cb):
+        n = len(cf.channel)
+        if n == 0:
+            continue
+        arb_norm = cf.arb | np.where(cf.is_ext, np.uint32(0x80000000),
+                                     np.uint32(0))
+        # ── 统计块（仅 STAT_CHANNELS 被聚合消费；与旧路径逐帧追加等价）──
+        if stats_export:
+            for ch in stats_mod.STAT_CHANNELS:
+                m = cf.channel == ch
+                if m.any():
+                    t, e, r, er = stats_bufs[ch]
+                    t.append(cf.ts[m])
+                    e.append(cf.is_ext[m])
+                    r.append(cf.is_remote[m])
+                    er.append(cf.is_error[m])
+        # ── 解码桶（逐通道路由）──
+        for ch, dec in decoders.items():
+            m = cf.channel == ch
+            idx_m = np.flatnonzero(m)
+            cnt = len(idx_m)
+            if cnt == 0:
+                continue
+            dec.stats.total_frames += cnt
+            keys, lens_tab, mds = info[ch]
+            if len(keys) == 0:
+                dec.stats.unknown_frames += cnt
+                dec.stats.unknown_ids.update(cf.arb[idx_m].tolist())
+                continue
+            norm = arb_norm[idx_m]
+            pos = np.searchsorted(keys, norm)
+            ok = pos < len(keys)
+            safe = np.where(ok, pos, 0)
+            found = ok & (keys[safe] == norm)
+            fl = np.where(ok, lens_tab[safe], np.int64(0))
+            valid = found & (cf.data_len[idx_m] >= fl)   # 短帧 → 未知（feed 预检同义）
+            bad = cnt - int(valid.sum())
+            if bad:
+                dec.stats.unknown_frames += bad
+                dec.stats.unknown_ids.update(cf.arb[idx_m][~valid].tolist())
+            if not valid.any():
+                continue
+            # 桶分组：首现序 = 桶插入序（feed setdefault 首次出现序）
+            vkeys = norm[valid]
+            uniq, first_i = np.unique(vkeys, return_index=True)
+            for k in uniq[np.argsort(first_i, kind="stable")]:
+                grp = valid & (norm == k)
+                sel = idx_m[grp]
+                arb = int(k)
+                md = mds[int(np.searchsorted(keys, k))]
+                ts, lens, block = _bucket_block(cf, sel)
+                b = dec.buckets.get(arb)
+                if b is None:
+                    dec.buckets[arb] = {
+                        "ts": ts, "lens": lens, "data": block,
+                        "arb": arb, "raw_id": int(cf.arb[sel][0]), "md": md,
+                    }
+                else:
+                    _append_bucket_rows(b, ts, lens, block)
+        # ── 原始帧块（raw_export 未绑定通道；known_ids 过滤在块内完成）──
+        for ch in raw_chs:
+            m = cf.channel == ch
+            idx_m = np.flatnonzero(m)
+            if len(idx_m) == 0:
+                continue
+            sel = idx_m
+            if known_keys is not None:
+                found = _lookup(known_keys, arb_norm[idx_m])
+                bad = int((~found).sum())
+                if bad:
+                    raw_chunks[ch][1] += bad
+                    raw_chunks[ch][2].update(cf.arb[idx_m][~found].tolist())
+                sel = idx_m[found]
+            if len(sel):
+                ts, lens, block = _bucket_block(cf, sel)
+                raw_chunks[ch][0].append(
+                    (ts, cf.arb[sel], cf.dlc[sel], lens, block,
+                     cf.is_ext[sel], cf.is_fd[sel]))
+
+
+def _block_rows(block: np.ndarray, lens: np.ndarray) -> np.ndarray:
+    """块 (N, L) 按帧长摊平 → 变长行拼串 (M,) uint8（row/col 技巧）。"""
+    n = len(lens)
+    if n == 0:
+        return np.zeros(0, dtype=np.uint8)
+    row = np.repeat(np.arange(n), lens)
+    col = np.arange(int(lens.sum())) \
+        - np.repeat(np.concatenate(([0], np.cumsum(lens)[:-1])), lens)
+    return block[row, col]
+
+
+def _assemble_raw(blocks, channel: int, unknown_frames: int, unknown_ids: set):
+    """向量化原始帧块 → RawGroup（= 旧逐帧收集实现语义，H1 已替换）。
+
+    data_array 行宽 = max(dlc)（帧 dlc 原值：经典帧可为 >8 原值，FD 帧
+    为 dlc2len 值），填充按帧 data 长度——与旧逐帧收集实现逐位一致。
+    """
+    if not blocks:
+        return (
+            mdf_writer.RawGroup(
+                channel=channel,
+                timestamps=np.empty(0, dtype=np.float64),
+                ids=np.empty(0, dtype=np.uint32),
+                dlcs=np.empty(0, dtype=np.uint8),
+                data_array=np.zeros((0, 1), dtype=np.uint8),
+                is_extended=np.empty(0, dtype=bool),
+                is_fd=np.empty(0, dtype=bool),
+            ),
+            unknown_frames, unknown_ids)
+    ts = np.concatenate([b[0] for b in blocks])
+    ids = np.concatenate([b[1] for b in blocks])
+    dlcs = np.concatenate([b[2] for b in blocks])
+    lens = np.concatenate([b[3] for b in blocks])
+    is_ext = np.concatenate([b[5] for b in blocks])
+    is_fd = np.concatenate([b[6] for b in blocks])
+    L = int(dlcs.max())
+    data_array = np.zeros((len(ts), L), dtype=np.uint8)
+    if len(ts):
+        row = np.repeat(np.arange(len(ts)), lens)
+        col = np.arange(len(row)) \
+            - np.repeat(np.concatenate(([0], np.cumsum(lens)[:-1])), lens)
+        flat = np.concatenate([_block_rows(b[4], b[3]) for b in blocks])
+        data_array[row, col] = flat
+    return (
+        mdf_writer.RawGroup(
+            channel=channel,
+            timestamps=ts,
+            ids=ids,
+            dlcs=dlcs,
+            data_array=data_array,
+            is_extended=is_ext,
+            is_fd=is_fd,
+        ),
+        unknown_frames,
+        unknown_ids,
+    )
+
 
 # 方案 G：并行解码的桶内存阈值（估算，超阈值回退串行，env 可覆盖；见 §5.7）
 _MP_MEM_THRESHOLD = float(os.environ.get("BLF_MP_MEM_THRESHOLD", 1.5e9))
@@ -46,53 +258,6 @@ class ConversionResult:
     timings: list[tuple[str, float]] = field(default_factory=list)
 
 
-def _normalize_id(fr) -> int:
-    """原始帧 id → 含 EFF 位的归一化键，与 dbc_loader.messages 的键契约一致。"""
-    return fr.arbitration_id | (0x80000000 if fr.is_extended else 0)
-
-
-def _collect_raw(frames, channel: int,
-                 known_ids: set[int] | None) -> tuple[mdf_writer.RawGroup, int, set[int]]:
-    """收集原始帧组；known_ids 非 None 时只保留 DBC 中有报文定义的帧。
-
-    返回 (组, 丢弃帧数, 被丢弃帧的原始 id 集合)。无 DBC 参与（known_ids=None）
-    时不过滤，保持原始导出的全量语义。
-    """
-    ts, ids, dlcs, datas, is_ext, is_fd = [], [], [], [], [], []
-    unknown_frames = 0
-    unknown_ids = set()
-    max_dlc = 0
-    for fr in frames:
-        if known_ids is not None and _normalize_id(fr) not in known_ids:
-            unknown_frames += 1
-            unknown_ids.add(fr.arbitration_id)
-            continue
-        ts.append(fr.ts_seconds)
-        ids.append(fr.arbitration_id)
-        dlcs.append(fr.dlc)
-        datas.append(fr.data)
-        is_ext.append(bool(fr.is_extended))
-        is_fd.append(bool(fr.is_fd))
-        max_dlc = max(max_dlc, fr.dlc)
-    n = len(ts)
-    data_array = np.zeros((n, max_dlc), dtype=np.uint8) if n else np.zeros((0, 1), dtype=np.uint8)
-    for i, d in enumerate(datas):
-        data_array[i, : len(d)] = np.frombuffer(d, dtype=np.uint8)
-    return (
-        mdf_writer.RawGroup(
-            channel=channel,
-            timestamps=np.asarray(ts, dtype=np.float64),
-            ids=np.asarray(ids, dtype=np.uint32),
-            dlcs=np.asarray(dlcs, dtype=np.uint8),
-            data_array=data_array,
-            is_extended=np.asarray(is_ext, dtype=bool),
-            is_fd=np.asarray(is_fd, dtype=bool),
-        ),
-        unknown_frames,
-        unknown_ids,
-    )
-
-
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             progress_cb=None, raw_export: bool = False,
             stats_export: bool = True, parallel: bool = False,
@@ -100,7 +265,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     """多通道 BLF → 单个 MDF。
 
     raw_export=False（默认，与 CANoe 一致）：未绑定 DBC 的通道不导出原始帧，
-    只保留解码信号组；True 时未绑定通道收集为 Raw::CANn 组（见 _collect_raw）。
+    只保留解码信号组；True 时未绑定通道收集为 Raw::CANn 组（见 _assemble_raw）。
 
     stats_export=True（默认，与 CANoe 一致）：输出 1s 总线统计组（修复项 4
     阶段 1，10 项 × 16 通道，覆盖 0-15 全部通道与 DBC 绑定无关）。
@@ -155,9 +320,14 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     # 逻辑），统计输入逐通道列表（= 原 scan_channels 输出）。
     decoders = {ch: ChannelDecoder(dbc, ch)
                 for ch, dbc in bindings.items() if dbc is not None}
-    raw_bufs = {ch: [] for ch, dbc in bindings.items() if dbc is None} \
-        if raw_export else {}
+    raw_chs = {ch for ch, dbc in bindings.items() if dbc is None} if raw_export else set()
     stats_bufs = defaultdict(lambda: ([], [], [], []))  # ch -> (ts, ext, remote, err)
+
+    # 原始通道过滤键（向量化二分用排序数组）
+    known_keys_arr = np.asarray(sorted(known_ids), dtype=np.uint32) \
+        if known_ids is not None else None
+    # 向量化原始块收集（ch -> [块列表, 丢弃帧数, 被丢弃帧原始 id 集合]）
+    raw_chunks = {ch: [[], 0, set()] for ch in raw_chs}
 
     # 方案 G：多进程并行解码（可选，默认关）。池在 feed 前创建 + 预热
     # （spawn 成本藏在扫描期，原型实测 8 worker ~1.7s）；单通道短路；
@@ -177,20 +347,20 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         read_cb = (lambda f: progress_cb("读取 BLF", 5 + 5 * f / 100)) \
             if progress_cb else None
         t_read = time.perf_counter()
-        for fr in blf_reader.iter_all_messages(blf_path, progress_cb=read_cb,
-                                               cancel_cb=cancel_cb):
-            ch = fr.channel
-            if stats_export:
-                t, e, r, er = stats_bufs[ch]
-                t.append(fr.ts_seconds)
-                e.append(fr.is_extended)
-                r.append(fr.is_remote)
-                er.append(fr.is_error)
-            dec = decoders.get(ch)
-            if dec is not None:
-                dec.feed(fr)
-            elif raw_export and ch in raw_bufs:
-                raw_bufs[ch].append(fr)
+        # H1 向量化单遍扫描：路由解码桶/统计/原始帧（数组桶 + 块列表，
+        # 见 _read_vectorized；产物与旧 feed 循环逐位一致）
+        _read_vectorized(blf_path, decoders, list(raw_chunks),
+                         stats_export, stats_bufs, raw_chunks,
+                         known_keys_arr, read_cb, cancel_cb)
+        # 统计块列表 → 单数组（下游聚合代码不变）
+        for ch, (t, e, r, er) in list(stats_bufs.items()):
+            if not t or not isinstance(t[0], np.ndarray):
+                continue
+            stats_bufs[ch] = (
+                np.concatenate(t) if t else np.empty(0, dtype=np.float64),
+                np.concatenate(e) if e else np.empty(0, dtype=bool),
+                np.concatenate(r) if r else np.empty(0, dtype=bool),
+                np.concatenate(er) if er else np.empty(0, dtype=bool))
         timings.append(("读入 BLF", time.perf_counter() - t_read))
         # 取消检查点：读取完毕、解码前（取消则不再启动解码/池回收）
         _check_cancel(cancel_cb)
@@ -244,7 +414,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 all_series.extend(series)
             else:
                 if raw_export:
-                    raw, unk_frames, unk_ids = _collect_raw(raw_bufs[ch], ch, known_ids)
+                    blocks, uf, ui = raw_chunks[ch]
+                    raw, unk_frames, unk_ids = _assemble_raw(blocks, ch, uf, ui)
                     if len(raw.timestamps):
                         note_range(raw.timestamps)
                         raw_groups.append(raw)
@@ -279,8 +450,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             global_end = 0.0
             for ch in stats_mod.STAT_CHANNELS:
                 ts = stats_bufs.get(ch, ((), None, None, None))[0]
-                if ts:
-                    global_end = max(global_end, max(ts))
+                if len(ts):
+                    global_end = max(global_end, float(np.max(ts)))
             n_stats = len(stats_mod.STAT_CHANNELS)
             for i, ch in enumerate(stats_mod.STAT_CHANNELS):
                 # 逐通道上报 92→95：聚合 16 通道实测 ~1.4s，不再停在 92%
