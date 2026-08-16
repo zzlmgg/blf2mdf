@@ -52,10 +52,11 @@ def _lookup(keys: np.ndarray, vals: np.ndarray) -> np.ndarray:
 def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """容器内帧子集（bool 掩码或整数索引）→ 桶块 (ts, lens, (N, L) data)。
 
-    row/col 摊平 gather（2×np.repeat + 散点）在 5.6M 帧上实测 ~3.7s，
-    改为定宽单次 take（快路径定跨距 / 回退变长两种 data8 布局均按
-    data_off/data_len 自洽寻址）；lens < L 的行尾补 0（原 zeros 语义，
-    消费者按 lens 界定，保持逐位一致防御）。
+    packed（回退/旧路径）：data8 定跨距块，按 data_off/data_len 自洽寻址；
+    scattered（H7b 快路径）：data8 = 容器字节视图，data_off = 容器内绝对
+    偏移，行尾补零按 glen（含 FD64 截断 ljust）掩码——载荷只拷一次。
+    row/col 摊平 gather 实测 ~3.7s 已弃（H2a 教训：大数据路径禁散点索引）；
+    定宽单次 take 为固有成本（载荷必须离开容器缓冲进桶）。
     """
     lens = cf.data_len[sel]
     n = len(lens)
@@ -64,9 +65,14 @@ def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     L = int(lens.max())
     idt = np.int32 if cf.data8.size < 2 ** 31 else np.int64
     src2 = cf.data_off[sel].astype(idt)[:, None] + np.arange(L, dtype=idt)
-    block = np.take(cf.data8, src2, mode="clip")   # 越界位 → 下式清零
-    if not bool(np.all(lens == L)):
-        block[np.arange(L)[None, :] >= lens[:, None]] = 0
+    block = np.take(cf.data8, src2, mode="clip")   # 越界位 → 掩码清零兜底
+    if cf.scattered:
+        gsel = cf.glen[sel]
+        if not bool(np.all(gsel == L)):   # 全满桶跳过掩码（同现优化）
+            block[np.arange(L)[None, :] >= gsel[:, None]] = 0
+    else:
+        if not bool(np.all(lens == L)):
+            block[np.arange(L)[None, :] >= lens[:, None]] = 0
     return cf.ts[sel], lens, block
 
 

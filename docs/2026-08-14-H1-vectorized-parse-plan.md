@@ -36,7 +36,7 @@
 
 - 基础头（16B，`<4sHHLL`）：header_size(u16@+4)、header_version(u16@+6)、obj_size(u32@+8)、obj_type(u32@+12)。
 - `next_pos = pos + obj_size`；`next_pos > max_pos` → 尾部（对象跨容器，留待下一容器衔接）。
-- 版本 1：V1 头 16B，flags=u32@+16，rel=u64@+24；版本 2：V2 头 24B，flags=**u8**@+16，rel=u64@+24。
+- 版本 1：V1 头 16B，flags=u32@+16，rel=u64@+24；版本 2：V2 头 24B（`<LBxHQ8x`），flags=**u32**@+16，rel=u64@+24（2026-08-14 实施核对修正：V2 flags 为 L 字段 u32，非 u8）。
 - 时间单位：`flags == 1`（精确相等，非位测试）→ rel×10000（10µs 单位）；否则 rel 按 1ns 计。
 - 未知版本：整体跳过（pos = 对象末尾），**不做**版本头解包、不发射。
 - 版本头解包 struct.error → **未捕获异常**（现行实现行为，非尾部）：obj_size 虚假偏小时可达。
@@ -47,11 +47,11 @@
 |---|---|---|---|---|---|---|---|
 | CAN_MESSAGE(1)/CAN_MESSAGE2(86) | `<HBBL8s` | u16@0 −1 | u8@2 & 0x80 | u8@3（原值，**不** dlc2len） | u32@4 | False | @8，长 min(dlc,8) |
 | CAN_ERROR_EXT(73) | `<HHLBBBxLLH2x8s` | u16@0 −1 | —（远程 False） | u8@10（原值） | u32@16 | False | @24，长 min(dlc,8)，is_error=True |
-| CAN_FD_MESSAGE(100) | `<HBBLLBBB5x64s` | u16@0 −1 | u8@2 & 0x80 | dlc2len(u8@3) | u32@4 | u8@13 & 0x1 | @20，长 min(valid_bytes(u8@14),64) |
+| CAN_FD_MESSAGE(100) | `<HBBLLBBB5x64s` | u16@0 −1 | u8@2 & 0x80 | dlc2len(u8@3) | u32@4 | u8@12 & 0x1 | @20，长 min(valid_bytes(u8@13),64) |
 | CAN_FD_MESSAGE_64(101) | `<BBBBLLLLLLLHBBL` | u8@0 −1 | fd_flags(u32@12) & 0x0010 | dlc2len(u8@1) | u32@4 | fd_flags & 0x1000 | @40 |
 
 - `arbitration_id = can_id & 0x1FFFFFFF`；`is_extended = bool(can_id & 0x80000000)`。
-- FD64 数据长度（python-can issue:1905）：`dfl = min(valid_bytes(u8@2), (ext_data_offset(u16@37) or obj_size) − header_size − 40)`；`msg_data = data[msg_off : msg_off + dfl]`（**切片按容器尾截断**）再 `.ljust(valid_bytes, b"\x00")` → **最终长度 = valid_bytes（可能 >64，≤255）**。
+- FD64 数据长度（python-can issue:1905）：`dfl = min(valid_bytes(u8@2), (ext_data_offset(u8@35，即 m[13]) or obj_size) − header_size − 40)`；`msg_data = data[msg_off : msg_off + dfl]`（**切片按容器尾截断**）再 `.ljust(valid_bytes, b"\x00")` → **最终长度 = valid_bytes（可能 >64，≤255）**。
 - dlc2len 表：`[0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64]`（dlc>15 → 64，python-can `can/util.py` 实测）。
 - 消息结构体解包 struct.error → **尾部**（容器级兜底，从 obj_start 起）。
 

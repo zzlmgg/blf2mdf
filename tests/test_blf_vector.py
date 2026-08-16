@@ -17,7 +17,9 @@ import pytest
 from core import blf_reader
 from core.blf_reader import (ScanCancelled, _iter_containers, _ms_part_ns,
                              _walk_container)
-from core.blf_vector import _parse_fast, iter_container_frames
+from core.blf_vector import (_parse_fast, _u16_at, _u16_at_v, _u32_at,
+                             _u32_at_v, _u64_at, _u64_at_v,
+                             iter_container_frames)
 
 from can.io.blf import (
     BLFParseError,
@@ -109,6 +111,15 @@ def _fd64(channel, can_id, data, *, flags=0, rel=0, version=1, dlc=None,
 
 
 # ── 容器级对拍 ──
+def _payload(cf, i):
+    """帧载荷重建：scattered = 容器字节切片 + 补零（ljust 语义）；packed = 直接切片。"""
+    o = int(cf.data_off[i]); n = int(cf.data_len[i])
+    if cf.scattered:
+        g = int(cf.glen[i])
+        return bytes(cf.data8[o:o + g]) + b"\x00" * (n - g)
+    return bytes(cf.data8[o:o + n])
+
+
 def _assert_eq(frames, tail, res):
     cf, ftail = res
     assert ftail == tail, "尾部字节不一致"
@@ -123,7 +134,7 @@ def _assert_eq(frames, tail, res):
         assert bool(cf.is_error[i]) == bool(f.is_error), f"[{i}] is_error"
         assert bool(cf.is_fd[i]) == bool(f.is_fd), f"[{i}] is_fd"
         assert cf.dlc[i] == f.dlc, f"[{i}] dlc"
-        d = bytes(cf.data8[cf.data_off[i]:cf.data_off[i] + cf.data_len[i]])
+        d = _payload(cf, i)
         assert d == f.data, f"[{i}] data"
 
 
@@ -220,30 +231,37 @@ def test_unknown_obj_type_skipped():
     assert len(cf.channel) == 2
 
 
-def test_false_positive_in_payload_rejected():
-    # "LOBJ" 在对象体内 → 候选 ∈ (c, e) → 条件 3 违反 → 快路径拒绝（回退=oracle）
+def test_false_positive_in_payload_parsed_identically():
+    # H7a 语义翻转："LOBJ" 在对象体内、fp@42 ≡ 2 mod 4（单类扫描不可见）
+    # → 候选 {0,48} 全有效 → 接受且与 walk 同解析（旧 4 类扫描把 fp 判为
+    # 窗口违约 → 回退；输出一致，仅「拒绝 ↔ 接受」互换）
     data = _msg(1, 0x100, b"ABLOBJCD") + _msg(1, 0x101, b"\x02")
-    assert _check(data) is None
+    res = _check(data)
+    assert res is not None, "fp 不可见后应接受并与 oracle 同解析"
+    cf, _ = res
+    assert len(cf.channel) == 2
+    assert cf.arb[0] == 0x100 and cf.arb[1] == 0x101
 
 
 def test_false_positive_in_window_parsed_identically():
-    # 窗口内假阳性（e ≤ c' ≤ e+4）：参考实现当真对象解析——快路径同解析
+    # 窗口内假阳性 fp@50（≡2 mod 4，单类扫描不可见）→ 末探针命中 → 回退
+    # （walk 同解析 2 帧；快路径拒绝合法）
     body = CAN_MSG_STRUCT.pack(5, 0, 1, 0x777, b"\x55" + b"\x00" * 7)
     fp = _base(32, 1, 32 + 16, CAN_MESSAGE) + _v1() + body
     data = _msg(1, 0x100, b"\x01") + b"\x00\x00" + fp
-    res = _check(data)
-    assert res is not None
-    cf, _ = res
-    assert len(cf.channel) == 2
-    assert cf.channel[1] == 4 and cf.arb[1] == 0x777 and cf.data_len[1] == 1
-    assert bytes(cf.data8[cf.data_off[1]:cf.data_off[1] + 1]) == b"\x55"
+    assert _check(data) is None, "末探针应命中并回退"
 
 
 def test_gap_in_window_0_to_4():
-    for k in range(5):
+    # k=0/4：第二对象 ≡0 mod 4 → 单类扫描可见，gap ≤ 4 → 接受
+    for k in (0, 4):
         data = _msg(1, 0x100, b"\x01") + b"\x00" * k + _msg(1, 0x101, b"\x02")
         res = _check(data)
         assert res is not None, f"空洞 {k} 字节应命中窗口"
+    # k=1..3：第二对象错位 → 单类扫描不可见 → 末探针命中 → 回退（walk 同解析）
+    for k in (1, 2, 3):
+        data = _msg(1, 0x100, b"\x01") + b"\x00" * k + _msg(1, 0x101, b"\x02")
+        assert _check(data) is None, f"空洞 {k} 字节：末探针应命中回退"
 
 
 def test_gap_beyond_window_raises_or_tails():
@@ -324,7 +342,7 @@ def test_dlc_out_of_range_classic():
         assert res is not None
         cf, _ = res
         assert cf.dlc[0] == dlc and cf.data_len[0] == 8
-        assert bytes(cf.data8) == b"\xAA" * 8
+        assert _payload(cf, 0) == b"\xAA" * 8
 
 
 def test_fd_dlc_codes():
@@ -345,7 +363,8 @@ def test_fd64_valid_bytes_padding():
     assert res is not None
     cf, _ = res
     assert cf.dlc[0] == 64 and cf.data_len[0] == 60
-    assert bytes(cf.data8) == b"\xCC" * 30 + b"\x00" * 30
+    assert cf.glen[0] == 30
+    assert _payload(cf, 0) == b"\xCC" * 30 + b"\x00" * 30
 
 
 def test_fd64_ext_data_offset():
@@ -355,13 +374,13 @@ def test_fd64_ext_data_offset():
     res = _check(data)
     assert res is not None
     cf, _ = res
-    assert bytes(cf.data8) == b"\xDD" * 40 + b"\x00" * 20
+    assert _payload(cf, 0) == b"\xDD" * 40 + b"\x00" * 20
     # ext_off 超长：dfl = vb，切片按容器尾截断 → 40 字节
     data2 = _fd64(1, 0x100, b"\xEE" * 40, valid_bytes=60,
                   ext_data_offset=200)
     res2 = _check(data2)
     assert res2 is not None
-    assert bytes(res2[0].data8) == b"\xEE" * 40 + b"\x00" * 20
+    assert _payload(res2[0], 0) == b"\xEE" * 40 + b"\x00" * 20
 
 
 def test_fd64_lying_header_size_field():
@@ -373,7 +392,8 @@ def test_fd64_lying_header_size_field():
     assert res is not None
     cf, _ = res
     assert cf.data_len[0] == 60
-    assert bytes(cf.data8) == b"\x00" * 60
+    assert cf.glen[0] == 0
+    assert _payload(cf, 0) == b"\x00" * 60
 
 
 def test_remote_and_fd_flags():
@@ -523,7 +543,7 @@ def _assert_streams_equal(ref, gots):
             assert f.dlc == cf.dlc[i]
             assert f.is_remote == bool(cf.is_remote[i])
             assert f.is_error == bool(cf.is_error[i])
-            d = bytes(cf.data8[cf.data_off[i]:cf.data_off[i] + cf.data_len[i]])
+            d = _payload(cf, i)
             assert f.data == d
     with pytest.raises(StopIteration):
         next(it)
@@ -591,3 +611,17 @@ def test_sample_full_bitwise_and_fast_engagement():
     _assert_streams_equal(ref, iter_container_frames(str(blf)))
     _assert_streams_equal(ref,
                           iter_container_frames(str(blf), _force_fallback=True))
+
+
+def test_view_helpers_bitwise_equal_byte_helpers():
+    """H7e：对齐位置上视图读与字节 gather 逐位同值（含两侧越界回退位）。"""
+    rng = np.random.default_rng(20260816)
+    for n in (16, 20, 33, 100):
+        data = rng.bytes(n)
+        b8 = np.frombuffer(data, dtype=np.uint8)
+        v32 = np.frombuffer(data, dtype="<u4", count=n // 4)
+        q = np.arange(-4, n + 4, 4, dtype=np.int64)   # 对齐扫掠（两侧越界）
+        q = np.concatenate((q, [2 ** 40]))
+        assert np.array_equal(_u32_at_v(v32, q, n), _u32_at(b8, q, n))
+        assert np.array_equal(_u64_at_v(v32, q, n), _u64_at(b8, q, n))
+        assert np.array_equal(_u16_at_v(v32, q, n), _u16_at(b8, q, n))

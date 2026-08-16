@@ -33,7 +33,12 @@ _DLC2LEN = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64],
 
 @dataclass
 class ContainerFrames:
-    """一个容器解析出的全部帧（快路径/回退同构表示，计划 §3）。"""
+    """一个容器解析出的全部帧（快路径/回退同构表示，计划 §3）。
+
+    data8 双契约（H7b）：packed（回退/旧路径）定跨距打包块，data_off 为块内
+    起点、data_len 界定行长；scattered（快路径）data8 = 容器字节零拷贝视图，
+    data_off 为容器内绝对偏移，行尾补零按 glen（FD64 可 < data_len）掩码。
+    """
     channel: np.ndarray    # int64 (N,) 0-based
     ts: np.ndarray         # float64 (N,)（整数 ns 构造，与 Frame.ts_seconds 同语义）
     arb: np.ndarray        # uint32 (N,)（不含 EFF 位）
@@ -42,9 +47,11 @@ class ContainerFrames:
     is_error: np.ndarray   # bool (N,)
     is_fd: np.ndarray      # bool (N,)
     dlc: np.ndarray        # uint8 (N,)（经典=原值；FD=dlc2len，与 Frame.dlc 同语义）
-    data8: np.ndarray      # uint8 (M,) 打包载荷（FD64 已含补零）
-    data_off: np.ndarray   # int64 (N,) 帧载荷在 data8 中的起点
+    data8: np.ndarray      # uint8 (M,)（packed=打包载荷；scattered=容器字节视图）
+    data_off: np.ndarray   # int64 (N,) 帧载荷在 data8 中的起点（绝对/块内视契约）
     data_len: np.ndarray   # int64 (N,)（= len(Frame.data)）
+    scattered: bool = False            # H7b：快路径散点契约（data8=容器字节视图）
+    glen: np.ndarray | None = None     # H7b：实际载荷字节数（FD64 可 < data_len）
 
 
 def _empty_container_frames() -> ContainerFrames:
@@ -100,25 +107,56 @@ def _u8_at(b8: np.ndarray, p: np.ndarray, max_pos: int) -> np.ndarray:
     return b8[np.where(safe, p, 0)]
 
 
-def _candidates(data: bytes) -> np.ndarray:
-    """全部 "LOBJ" 候选位置（int64，升序）：4 个对齐偏移的 u32 比较。
+def _u32_at_v(v32: np.ndarray, p: np.ndarray, max_pos: int) -> np.ndarray:
+    """u32 视图读（候选全 4 对齐时与 _u32_at 逐位同值；p 不齐勿用）。"""
+    if p.dtype != np.int64:
+        p = p.astype(np.int64)
+    safe = (p >= 0) & (p + 4 <= max_pos)
+    q = np.where(safe, p, 0)
+    return v32[q >> 2]   # p+4 ≤ max_pos ⇒ p>>2 < len(v32)
 
-    frombuffer(offset, count) 零拷贝视图（切片 data[o:...] 会全量拷贝，
-    626MB 实测 ~3.6s → ~1s）。
+
+def _u64_at_v(v32: np.ndarray, p: np.ndarray, max_pos: int) -> np.ndarray:
+    """u64 视图读 = 两个 u32 对拼（c+24/c+28 均 4 对齐；无 8 对齐分支）。"""
+    if p.dtype != np.int64:
+        p = p.astype(np.int64)
+    safe = (p >= 0) & (p + 8 <= max_pos)
+    q = np.where(safe, p, 0)
+    lo = v32[q >> 2].astype(np.uint64)
+    hi = v32[(q + 4) >> 2].astype(np.uint64)   # q+8 ≤ max_pos ⇒ (q+4)>>2 < len(v32)
+    return lo | (hi << np.uint64(32))
+
+
+def _u16_at_v(v32: np.ndarray, p: np.ndarray, max_pos: int) -> np.ndarray:
+    """u16 视图读 = u32 低 16 位（p 4 对齐时与 _u16_at 逐位同值）。"""
+    if p.dtype != np.int64:
+        p = p.astype(np.int64)
+    safe = (p >= 0) & (p + 2 <= max_pos)
+    q = np.where(safe, p, 0)
+    return v32[q >> 2] & np.uint32(0xFFFF)
+
+
+def _candidates(data: bytes):
+    """单对齐类扫描：起始窗口探测定类 o，只扫 ≡ o mod 4 的 LOBJ。
+
+    起始探测复刻 walk 首窗口 [0,8)（can/io/blf.py:242，命中 p ≤ 4）。
+    返回 (候选位置 int64 升序, j_first；起始窗口无 LOBJ 则 -1)。
+    单类 + 免排序（AHT 实测候选 100% 单类，4 遍扫描 0.60s → 一遍）。
     """
-    parts = []
     L = len(data)
-    for o in range(4):
-        n = (L - o) // 4
-        if n > 0:
-            v = np.frombuffer(data, dtype="<u4", count=n, offset=o)
-            parts.append(np.nonzero(v == _LOBJ)[0].astype(np.int64) * 4 + o)
-    if not parts:
-        return np.empty(0, dtype=np.int64)
-    c = np.concatenate(parts)
-    if len(parts) > 1:
-        c = np.sort(c)
-    return c
+    j_first = -1
+    for j in range(5):
+        if j + 4 <= L and data[j:j + 4] == b"LOBJ":
+            j_first = j
+            break
+    if j_first < 0:
+        return np.empty(0, dtype=np.int64), -1
+    o = j_first % 4
+    n = (L - o) // 4
+    if n <= 0:
+        return np.empty(0, dtype=np.int64), j_first
+    v = np.frombuffer(data, dtype="<u4", count=n, offset=o)   # 零拷贝（勿切片）
+    return np.nonzero(v == _LOBJ)[0].astype(np.int64) * 4 + o, j_first
 
 
 def _parse_fast(data: bytes, ms_part: int):
@@ -132,22 +170,40 @@ def _parse_fast(data: bytes, ms_part: int):
 
     max_pos = len(data)
     b8 = np.frombuffer(data, dtype=np.uint8)
-    c = _candidates(data)
+    c, j_first = _candidates(data)
     N = len(c)
     if N == 0:
-        # 无候选：max_pos < 8 → 尾部（含 0 字节空容器）；否则 raise（§2.1）
+        # 无候选：max_pos < 8 → 尾部（含 0 字节空容器）；否则起始窗口有
+        # LOBJ（全错位病态容器，防御分支）→ 回退（勿 raise：标量正常而
+        # 快路径抛异常 = 违约）；否则 raise（§2.1）
         if max_pos < 8:
             return _empty_container_frames(), data
+        if j_first >= 0:
+            return None
         raise BLFParseError("Could not find next object")
     if max_pos < 16:
         # 任意候选都无法通过 base_fit（c+16 ≤ max_pos），且提取 helper 的
         # 回退位置 0 需读至 b8[7] → 直接回退
         return None
 
+    # ── H7e 字段提取分派：候选全 4 对齐（实测 100%）→ u32 视图一次
+    # gather（4 次字节散点 → 1 次视图读）；错位容器（fuzz/手工构造）
+    # 走字节 gather 现路径——两读法读同一字节串，逐位相同
+    aligned = bool(np.all((c & 3) == 0))
+    if aligned:
+        v32 = np.frombuffer(data, dtype="<u4", count=max_pos // 4)
+        u32 = lambda p, mp: _u32_at_v(v32, p, mp)
+        u64 = lambda p, mp: _u64_at_v(v32, p, mp)
+        u16 = lambda p, mp: _u16_at_v(v32, p, mp)
+    else:
+        u32 = lambda p, mp: _u32_at(b8, p, mp)
+        u64 = lambda p, mp: _u64_at(b8, p, mp)
+        u16 = lambda p, mp: _u16_at(b8, p, mp)
+
     # ── 对象头字段（裁剪安全域读出，垃圾值由后续掩码屏蔽）──
-    obj_size = _u32_at(b8, c + 8, max_pos)
-    obj_type = _u32_at(b8, c + 12, max_pos)
-    hdr_word = _u32_at(b8, c + 4, max_pos)
+    obj_size = u32(c + 8, max_pos)
+    obj_type = u32(c + 12, max_pos)
+    hdr_word = u32(c + 4, max_pos)
     hdr_size = (hdr_word & np.uint32(0xFFFF)).astype(np.int64)  # u16 字段（≠ 实际 hsz）
     hdr_ver = hdr_word >> np.uint32(16)
     e = c + obj_size.astype(np.int64)
@@ -181,6 +237,24 @@ def _parse_fast(data: bytes, ms_part: int):
     if first < N and int(c[first]) < int(s[first]):
         return None   # 防御：候选落窗口下界之前（不变量破坏）→ 回退
 
+    # H7a 双探针：重叠定理下仅两处窗口可能有扫描不可见的 walk 命中
+    # （gap > 4 的首坏轮 / first == N 的末窗口）；探针命中即回退。
+    # 有效轮（gap ∈ {0,4}）由重叠定理保证 walk 首窗命中 = 扫描候选。
+    # 全窗口 j∈[0,4]：obj_size ≢ 0 mod 4（fuzz FD64）可使 s ≢ o mod 4，
+    # 此时 j=0/j=4 的 LOBJ 对扫描与 (1,2,3) 探针双不可见而 walk 会命中
+    # （fuzz 裁决修复；探针两分支的窗口内可见 LOBJ 由前置条件排除，
+    # 检查全部 5 位与只查不可见位等价）。
+    if first < N and int(c[first]) - int(s[first]) > 4:
+        w = int(s[first])
+        for j in range(5):
+            if w + j + 4 <= max_pos and data[w + j:w + j + 4] == b"LOBJ":
+                return None
+    if first == N and N >= 1:
+        s_end = int(s[N - 1]) + int(obj_size[N - 1])   # walk 末轮后的搜索起点
+        for j in range(5):
+            if s_end + j + 4 <= max_pos and data[s_end + j:s_end + j + 4] == b"LOBJ":
+                return None
+
     # ── 发射（§4.3）：use = 版本已知 ∧ 四类消息，截断至 first 前
     # （walk 在轮 first 失败后返回已累积帧 + tail，§4.4 核对修正）──
     emit = ((v1 | v2) & (t_cls | t_err | t_fd | t_fd64)).copy()
@@ -192,8 +266,8 @@ def _parse_fast(data: bytes, ms_part: int):
     # 条件 6（§4.2.6）：时间守卫仅作用于解析轮（walk 不读跳过对象的时间
     # 头），按 flags 单位分判（10µs 单位先除再比，杜绝 rel×10000 的
     # uint64 回绕假守卫）
-    flags = _u32_at(b8, c + 16, max_pos)   # V1/V2 均为 u32（核对修正）
-    rel = _u64_at(b8, c + 24, max_pos)
+    flags = u32(c + 16, max_pos)   # V1/V2 均为 u32（核对修正）
+    rel = u64(c + 24, max_pos)
     unit = np.where(flags == 1, np.uint64(10000), np.uint64(1))
     rel_max = (np.uint64(2 ** 53) - np.uint64(ms_part)) // unit
     if not bool(np.all(~use | (rel <= rel_max))):
@@ -215,10 +289,10 @@ def _parse_fast(data: bytes, ms_part: int):
     m = use & t_cls
     if m.any():
         p = pos[m]
-        ch_full[m] = _u16_at(b8, p, max_pos) - 1
+        ch_full[m] = u16(p, max_pos) - 1
         fl8 = _u8_at(b8, p + 2, max_pos)
         dlc_full[m] = _u8_at(b8, p + 3, max_pos)
-        can_id = _u32_at(b8, p + 4, max_pos)
+        can_id = u32(p + 4, max_pos)
         arb_full[m] = can_id & np.uint32(0x1FFFFFFF)
         ext_full[m] = (can_id & np.uint32(0x80000000)) != 0
         remote_full[m] = (fl8 & np.uint8(0x80)) != 0
@@ -228,9 +302,9 @@ def _parse_fast(data: bytes, ms_part: int):
     m = use & t_err
     if m.any():
         p = pos[m]
-        ch_full[m] = _u16_at(b8, p, max_pos) - 1
+        ch_full[m] = u16(p, max_pos) - 1
         dlc_full[m] = _u8_at(b8, p + 10, max_pos)
-        can_id = _u32_at(b8, p + 16, max_pos)
+        can_id = u32(p + 16, max_pos)
         arb_full[m] = can_id & np.uint32(0x1FFFFFFF)
         ext_full[m] = (can_id & np.uint32(0x80000000)) != 0
         err_full[m] = True
@@ -240,12 +314,12 @@ def _parse_fast(data: bytes, ms_part: int):
     m = use & t_fd
     if m.any():
         p = pos[m]
-        ch_full[m] = _u16_at(b8, p, max_pos) - 1
+        ch_full[m] = u16(p, max_pos) - 1
         fl8 = _u8_at(b8, p + 2, max_pos)
         dlc_code = _u8_at(b8, p + 3, max_pos)
         dlc_full[m] = np.where(dlc_code <= 15,
                                _DLC2LEN[np.minimum(dlc_code, 15)], 64)
-        can_id = _u32_at(b8, p + 4, max_pos)
+        can_id = u32(p + 4, max_pos)
         arb_full[m] = can_id & np.uint32(0x1FFFFFFF)
         ext_full[m] = (can_id & np.uint32(0x80000000)) != 0
         fd_full[m] = (_u8_at(b8, p + 13, max_pos) & np.uint8(0x1)) != 0
@@ -261,10 +335,10 @@ def _parse_fast(data: bytes, ms_part: int):
         dlc_full[m] = np.where(dlc_code <= 15,
                                _DLC2LEN[np.minimum(dlc_code, 15)], 64)
         vb = _u8_at(b8, p + 2, max_pos).astype(np.int64)
-        can_id = _u32_at(b8, p + 4, max_pos)
+        can_id = u32(p + 4, max_pos)
         arb_full[m] = can_id & np.uint32(0x1FFFFFFF)
         ext_full[m] = (can_id & np.uint32(0x80000000)) != 0
-        fd_flags = _u32_at(b8, p + 12, max_pos)
+        fd_flags = u32(p + 12, max_pos)
         fd_full[m] = (fd_flags & np.uint32(0x1000)) != 0
         remote_full[m] = (fd_flags & np.uint32(0x0010)) != 0
         ext_off = _u8_at(b8, p + 35, max_pos).astype(np.int64)  # m[13]
@@ -279,27 +353,20 @@ def _parse_fast(data: bytes, ms_part: int):
     not_fd64 = use & ~t_fd64
     glen_full[not_fd64] = dlen_full[not_fd64]
 
-    # ── 载荷打包（定宽 (n, Lmax) 块 + 单次 take）──
-    # 变长 row/col 摊平在 5.6M 帧上实测 ~10s（M 尺度随机 gather ×4），
-    # 定宽块只需一次 (n, Lmax) gather；行尾垃圾字节由 data_len 界定，
-    # FD64 可用字节之外补零 = walk ljust 语义。data_off = i*Lmax 定跨距
-    # （契约仅要求 data_off/data_len 自洽，消费者按两者切片）。
+    # ── 载荷散点输出（H7b）：快路径不再打包——data8 = 容器字节零拷贝
+    # 视图、data_off = 帧载荷容器内绝对偏移；补零语义（FD64 截断 ljust）
+    # 下沉消费者 _bucket_block（按 glen 掩码）。容器级打包拷贝（362MB
+    # 结果 + 1.45GB 索引）整体删除，载荷只拷一次（桶级固有拷贝 164MB）。
     lens = dlen_full[idx]
     n_emit = len(idx)
     if n_emit:
-        Lmax = int(lens.max())
-        idt = np.int32 if max_pos < 2 ** 31 else np.int64
-        src2 = doff_full[idx].astype(idt)[:, None] + np.arange(Lmax, dtype=idt)
-        blk = np.take(b8, src2, mode="clip")   # 越界索引 clip → 垃圾位不读
-        glens = glen_full[idx]
-        if not bool(np.all(glens == lens)):
-            # 仅 FD64 截断行需要补零（walk ljust 语义）；全满容器跳过
-            blk[np.arange(Lmax)[None, :] >= glens[:, None]] = 0
-        data8 = blk.ravel()
-        data_off = np.arange(n_emit, dtype=np.int64) * Lmax
+        data8 = b8
+        data_off = doff_full[idx]
+        glen = glen_full[idx]
     else:
         data8 = np.zeros(0, dtype=np.uint8)
         data_off = np.zeros(0, dtype=np.int64)
+        glen = np.zeros(0, dtype=np.int64)
 
     # ── 时间戳：守卫保证 ms_part + rel_ns ≤ 2^53，int→float64 精确 ──
     rel_ns = np.where(flags == 1, rel * np.uint64(10000), rel)
@@ -309,7 +376,7 @@ def _parse_fast(data: bytes, ms_part: int):
         channel=ch_full[idx], ts=ts, arb=arb_full[idx], is_ext=ext_full[idx],
         is_remote=remote_full[idx], is_error=err_full[idx], is_fd=fd_full[idx],
         dlc=dlc_full[idx], data8=data8, data_off=data_off,
-        data_len=lens)
+        data_len=lens, scattered=True, glen=glen)
 
     # ── 早退轮（§4.4 核对修正）：walk 在轮 first 失败后返回已累积帧 +
     # tail = data[s[first]:]（窗口下界为界，含未消费 padding）──
