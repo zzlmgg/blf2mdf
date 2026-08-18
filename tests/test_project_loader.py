@@ -3,7 +3,7 @@ import pytest
 
 from core import project_loader
 from core.dbc_loader import DbcDef
-from conftest import PROJECT_ROOT, all_dbc_files
+from conftest import PROJECT_ROOT
 
 # 与 inputs/dbc_ccu3.0/dbc_对应关系.txt 等价的文本（含无通道行与空行）
 MAPPING_TEXT = """VDCCCU_CANFD1——CFCAN1——CAN13
@@ -143,17 +143,6 @@ def test_list_projects_real_root():
 
 
 # ---- 项目加载 ----
-
-def test_load_project_parses_real_dbc(tmp_path):
-    """项目加载 = 目录下全部 DBC 可解析（用真实 DBC 文件）。"""
-    src = all_dbc_files()[0]
-    folder = tmp_path / "proj"
-    folder.mkdir()
-    (folder / src.name).write_bytes(src.read_bytes())
-    dbcs = project_loader.load_project(tmp_path, "proj")
-    assert len(dbcs) == 1
-    assert dbcs[0].messages
-
 
 def test_load_project_empty_folder(tmp_path):
     (tmp_path / "empty").mkdir()

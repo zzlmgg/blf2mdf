@@ -30,7 +30,7 @@
 
 按系统化调试流程执行：
 
-1. **结构对比**：读取两个 MDF 的全部组（ChannelGroup）、通道（Channel）——组名、通道数、信号名、单位、数据类型（`tools/compare_mdf.py`）。
+1. **结构对比**：读取两个 MDF 的全部组（ChannelGroup）、通道（Channel）——组名、通道数、信号名、单位、数据类型（现为 `tools/mdf_compare.py` 的 structure 维度，经 `tools/full_compare.py` 调用；原 `tools/compare_mdf.py` 已并入，2026-08-18 收口）。
 2. **组匹配**：以"组内信号名集合"为键，将两侧组逐一配对（`tools/full_compare.py`）。
 3. **数据对比**：对匹配组逐组核对通道数、每信号采样数、时间范围；再对共同信号做数值抽样对比（时间偏移对齐 + 窗口内最近邻，容差 1e-6）。
 4. **通道归属还原**：读取 CANoe 导出配置 `inputs/mdf/BLF_MDF_13.0.cfg` 的 DBC↔通道绑定；逐通道重放 BLF 帧，确认各通道帧 ID 与 DBC 报文 ID 的归属。
@@ -183,8 +183,10 @@ MinSendDist, BurstTime, FramesPerBurst, TransceiverErrors, Bursts
 对比脚本（调查产物，位于 `tools/`）：
 
 ```bash
-# 结构对比（组/通道/信号名/单位/类型）
-conda run -n blfmdf python tools/compare_mdf.py outputs/20260805_115505.mdf inputs/mdf/_T058.mdf
+# 结构对比（组/通道/信号名/单位/类型）——原 compare_mdf.py 已并入 mdf_compare 的 structure 维度：
+conda run -n blfmdf python tools/full_compare.py outputs/20260805_115505.mdf inputs/mdf/_T058.mdf \
+    --stats-ref-block 22 --stats-ref-idx "StdData:4,StdDataRate:5,ExtData:6,ExtDataRate:7,StdRemote:8,StdRemoteRate:9,ExtRemote:10,ExtRemoteRate:11,ErrorFrames:12,ErrorFrameRate:13" \
+    --skip-header --skip-values --skip-stats
 # 信号级全量对比（组匹配 + 采样数 + 时间范围 + 抽样数值）
 conda run -n blfmdf python tools/full_compare.py outputs/20260805_115505.mdf inputs/mdf/_T058.mdf
 # 金标准回归（信号覆盖 ≥90% + 抽样数值 + 时长）

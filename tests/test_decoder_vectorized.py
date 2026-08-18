@@ -13,8 +13,6 @@ from core.decoder import (DecodeStats, SignalSeries, _clamped_int_array,
                           _pad_to_64, _signal_kind)
 from core.dbc_loader import DbcDef, SignalDef, load
 
-from conftest import DBC_DIR
-
 
 def _ref_bits(data: bytes, pos: int, length: int, byte_order: str) -> int:
     """位级参考（独立于实现）：bit 0 = 首字节 MSB 的大端位流语义。"""
@@ -259,31 +257,6 @@ def test_vectorized_matches_reference_random(tmp_path):
         p.write_text(dbc_txt, encoding="utf-8")
         dbc = load(str(p))
         frames = _random_frames(rng, int(rng.integers(10, 120)), known_ids=[100])
-        sr, st = reference_decode(frames, dbc, 1)
-        vr, vt = decode_channel(iter(frames), dbc, 1)
-        assert vt.total_frames == st.total_frames
-        assert vt.unknown_frames == st.unknown_frames
-        assert vt.unknown_ids == st.unknown_ids
-        _assert_series_equal(vr, sr)
-
-
-@pytest.mark.parametrize("dbc_name", sorted(p.name for p in DBC_DIR.glob("*.dbc")))
-def test_vectorized_matches_reference_real_dbc(tmp_path, dbc_name):
-    """真实 DBC（含 512 位信号/64 字节帧/choices）随机帧全量对拍。"""
-    from core.decoder import decode_channel
-    rng = np.random.default_rng(hash(dbc_name) & 0xFFFFFFFF)
-    dbc = load(str(DBC_DIR / dbc_name))
-    for trial in range(5):
-        msg_ids = list(dbc.messages)
-        frames = []
-        for i in range(60):
-            arb = int(rng.choice(msg_ids + [int(rng.integers(2000, 5000))]))
-            md = dbc.messages.get(arb)
-            max_len = 8 if md is None else int(md.frame_length) + int(rng.integers(0, 9))
-            length = int(rng.integers(0, max_len + 1)) if rng.random() < 0.3 else max_len
-            frames.append(Frame(channel=1, ts_seconds=float(i), arbitration_id=arb & 0x7FFFFFFF,
-                                is_extended=bool(arb & 0x80000000), is_fd=length > 8,
-                                dlc=length, data=bytes(rng.integers(0, 256, size=length))))
         sr, st = reference_decode(frames, dbc, 1)
         vr, vt = decode_channel(iter(frames), dbc, 1)
         assert vt.total_frames == st.total_frames

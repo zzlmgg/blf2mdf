@@ -31,7 +31,7 @@
 ### 3.1 对比工具
 
 - `tools/full_compare.py`：组匹配/组名/采样数/dtype 抽查/枚举文本抽查/数值抽样/统计逐点（既有）
-- `tools/deep_compare_latest.py`（本次调查新增，可留作回归工具）：
+- `tools/mdf_compare.py`（原 `tools/deep_compare_latest.py` 能力已并入，2026-08-18 收口；CLI 经 `tools/full_compare.py`）：
   - 全文件组/通道结构 dump（组序、t 通道位置）
   - 匹配组**全信号全长度**数值对比（含 |Sn 文本 rstrip 后比较）
   - 组内信号顺序对比、时间通道元数据对比
@@ -148,7 +148,7 @@ cfg DBC 绑定序 × DBC 报文序、通道分组序。判定为 CANoe MDF 导�
   - `core/mdf_writer.py`：t 通道移到组末位（A2）；stats 组移到文件头部（A3）
 - 预期效果：103 组信号组结构（组名/信号序/通道序）与 CANoe 完全一致；
   统计组位置一致
-- 验证：`tools/deep_compare_latest.py` 的 order_compare 应归零；
+- 验证：`tools/mdf_compare.py` 的 reference 入口 structure 维度应无「组内信号序不同」差异行；
   全量数值对比保持零差异；pytest 全量回归
 - 风险：低（纯顺序调整，数值路径不动）
 
@@ -180,8 +180,9 @@ C1/C2/C3 无法通过改代码实现"完全一样"，仅当下游工具严格要
 ```bash
 # 数据层/结构层全量对比（输出见终端 + outputs/mdf_compare/）
 conda run -n blfmdf python tools/full_compare.py outputs/20260806_142147.mdf inputs/mdf/_T058.mdf
-# 深度结构对比（组序/信号序/元数据/全量数值）
-conda run -n blfmdf python tools/deep_compare_latest.py outputs/20260806_142147.mdf inputs/mdf/_T058.mdf
+# 深度结构对比（组序/信号序/元数据/全量数值）——deep_compare_latest 已并入 mdf_compare：
+conda run -n blfmdf python tools/full_compare.py outputs/20260806_142147.mdf inputs/mdf/_T058.mdf \
+    --stats-ref-block 22 --stats-ref-idx "StdData:4,StdDataRate:5,ExtData:6,ExtDataRate:7,StdRemote:8,StdRemoteRate:9,ExtRemote:10,ExtRemoteRate:11,ErrorFrames:12,ErrorFrameRate:13"
 # 金标准回归
 conda run -n blfmdf python -m pytest -m golden
 ```

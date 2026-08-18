@@ -33,12 +33,14 @@
   - 按名匹配全量对比 + 信号组配对 / 统计 t 轴 / 统计值
   - 时间戳量化与 BLF 原始值探测（can.BLFReader 直读 + 当前代码路径模拟）
   - 统计值逐通道×逐项差异量化 + 结构（组序/t 位置/组内信号序）对比
-- 复现命令示例：
+- 复现命令示例（原 compare_mdf_v2 已并入 `tools/mdf_compare.py` 的 reference 入口，
+  2026-08-18 收口；CLI 经 `tools/full_compare.py`）：
   ```bash
-  conda run -n blfmdf python tools/compare_mdf_v2.py <ref.mdf> <ours.mdf>
+  conda run -n blfmdf python tools/full_compare.py <ours.mdf> <ref.mdf> \
+      --stats-ref-block 22 --stats-ref-idx "StdData:4,StdDataRate:5,ExtData:6,ExtDataRate:7,StdRemote:8,StdRemoteRate:9,ExtRemote:10,ExtRemoteRate:11,ErrorFrames:12,ErrorFrameRate:13"
   ```
-  （注：compare_mdf_v2 按组序号对齐，因两侧组序不同其逐点汇总不可直接使用，
-  需按信号名集合配对后对比，见本文 §5 数据。）
+  （注：reference 入口按信号名集合配对组、不按组序号，已修正原 compare_mdf_v2
+  按组序号对齐导致的逐点汇总不可用问题，见本文 §5 数据。）
 
 ## 3. 结论速览
 

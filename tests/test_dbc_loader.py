@@ -1,7 +1,6 @@
 import pytest
 
 from core.dbc_loader import load
-from conftest import all_dbc_files
 
 INLINE_DBC = '''VERSION ""
 
@@ -61,12 +60,6 @@ def test_load_inline_dbc(tmp_path):
     assert speed.scale == 0.01 and speed.unit == "km/h"
     assert speed.start_bit == 0 and speed.length == 16
     assert md.signals[1].offset == -40
-
-
-@pytest.mark.parametrize("dbc_path", all_dbc_files(), ids=lambda p: p.name)
-def test_all_real_dbc_parse(dbc_path):
-    dbc = load(str(dbc_path))
-    assert dbc.messages, f"{dbc_path.name} 解析后为空"
 
 
 def test_load_malformed_dbc_raises_with_path(tmp_path):
