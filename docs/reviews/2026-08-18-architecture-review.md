@@ -1,6 +1,8 @@
 # BLF→MDF 代码架构合理性审查
 
-日期：2026-08-18　|　审查范围：core/（9 模块）、gui/（5 模块）、main.py、tests/（17 文件）、tools/（21 脚本）、blf2mdf.spec　|　分支：arc（92e02b0）
+日期：2026-08-18　|　审查范围：core/（9 模块）、gui/（5 模块）、main.py、tests/（19 文件）、tools/（18 脚本）、blf2mdf.spec　|　分支：arc（22cb7ff，H1 落地后现状）
+
+> **2026-08-18 更新（H1 落地后，基准 commit 22cb7ff）**：§3 H1/H2 均标 ✅ 完成（H2 原为计划状态、H1 无状态）；§2.1 tools/tests 数量刷新（tools 21→18、tests 17→19 文件）；§4 候选 F 已落地、tools 收口范围如实修正；§5 首要建议由「先做 F」改为「D → C → G → B → A」。全量 pytest 现状：**249 passed / 0 失败**（anaconda3 实测，2026-08-18）。
 
 ## 0. 摘要
 
@@ -9,6 +11,8 @@
 审查标准为用户明示的六条：① 架构干净 ② 调用链扁平 ③ 契约明确 ④ 严格收口 ⑤ 易于人类理解维护 ⑥ 无真实必要性不新增抽象和层级。整体上 ①② 达标良好（主链路 6 跳且每层有真实行为；依赖单向无环；GUI↔core seam 干净）；主要偏差集中在 **④ 严格收口**——归一化键、半成品清理、进度带计划、绑定匹配契约等跨模块规则各有多份独立实现；以及 ③ 的部分——桶 dict 三态隐式多态契约。测试体系的 seam 质量两极分化：test_converter 是契约测试标杆，test_gui_binding/test_gui_style 则打在 widget 对象图与实现文本上。
 
 按词汇表表述：core 的深模块（位提取、单遍路由、窗界聚合、ContainerFrames 双契约）分布健康，但三个**真实接缝**（解码桶、绑定匹配、对拍逻辑）的接口仍是隐式多态 dict / 格式化字符串 / 不可 import 的 CLI 函数——接缝真实存在而契约没有显式成型。
+
+**2026-08-18 补充**：本文档三个真实接缝中，对拍逻辑接缝（H1/H2）已显式成型——收口为 tools/mdf_compare.py 双入口深模块并获黄金测试保护，两个「高」级问题全部修复，且修复本身零生产代码改动（core/、gui/ 未触碰）。详见 §3 状态标注。
 
 ---
 
@@ -45,8 +49,8 @@
 | gui/windows_effects.py | 70 | Win11 玻璃/圆角 + 软件回退 | `apply_light_glass`、`sync_rounded_window` |
 | gui/resources.py | 26 | 运行时路径与图标 | `resource_path`、`install_application_icon` |
 | main.py | 27 | 程序入口 | `main()`；`freeze_support()` 铁律 |
-| tests/ | ~4400 | 17 文件 | 见 §5.4 |
-| tools/ | ~1700 | 21 脚本 | 见 §5.4（8 个可删、3 个合并） |
+| tests/ | ~4100 | 19 文件 | 见 §4（17 原始 + mdf_factory.py 共享工厂 + test_compare_cli.py CLI 契约） |
+| tools/ | ~1700 | 18 脚本 | 见 §4（compare 族已收口为 mdf_compare + 2 CLI 薄壳；bench/probe 族 8 个仍可删） |
 
 ### 2.2 依赖方向与主链路
 
@@ -93,13 +97,14 @@ ConvertWorker.run
 - 违反：③ 契约明确、⑤ 易维护
 - 证据：对拍链是项目验收的根基（master plan §8 点名 compare_two_mdf + full_compare），但对比逻辑无法被 import，测试只能复制；oracle 自身没有任何 pytest 保护——oracle 出错则整条对拍链静默失真。
 - 方向：对比逻辑提为可导入函数，工具与测试共用同一实现，CLI 只做参数解析，并补 oracle 自身的回归测试。
+- **状态：✅ 已完成**（2026-08-18）——四项收尾全部落地且**零生产代码改动**（core/、gui/、tools/ 三个被测脚本均未修改）：① pytest.ini 增 `pythonpath = .`，控制台脚本 / `python -m pytest` / IDE runner 任意调用方式下 tools、core 均可导入（H1 前控制台脚本收集即报 `ModuleNotFoundError`——测试保护随调用方式静默消失，与 H1 描述的失败模式同构）；② 黄金套件 15 → 41 用例（header 其余 8 字段 + version no-op、通道元数据 5 字段 + bit_resolution no-op、NaN 两侧语义、整型/dtype/文本差异、stats 逐点、dims 关闭语义；spec 清单两处按实测调整：asammdf 不支持 U dtype append、S 尾随 \x00 被剥除）；③ STAT_NAMES 双副本相等性锁定断言（core/stats 写出布局 vs mdf_compare 消费端，任一侧漂移在 pytest 阶段变响亮而非对拍静默失真）；④ 两 CLI 退出码 subprocess 进程级契约测试（[tests/test_compare_cli.py](../../tests/test_compare_cli.py) 3 项，端到端覆盖 argparse 接线与 dims 映射）。详见 [spec](./h1/2026-08-18-h1-oracle-protection-spec.md) / [plan](./h1/2026-08-18-h1-oracle-protection-plan.md)。
 
 **H2. tools/ 对拍脚本族 7 个各自重实现同一逻辑，能力散落三处**
 - 位置：compare_mdf / compare_mdf_v2 / compare_mdf_deep / deep_compare_mdf / deep_compare_latest / compare_two_mdf / full_compare
 - 违反：④ 严格收口、② 扁平
 - 证据：每个脚本独立重写「加载两组、按名对齐、逐点比较」；头部对比（compare_mdf_v2.py:35-39、compare_mdf_deep.py:48-56）与统计 t 轴细查（deep_compare_latest.py:69-83）是独有能力，必须合并而非纯删；deep_compare_mdf.py docstring 自称「对比两个 MDF」而 main 只读 sys.argv[1]（变质残留）。
 - 方向：收口为两个保留工具（自产对拍 + CANoe 报告），其余删除。
-- **状态：✅ 已完成**（2026-08-18）——收口为 [tools/mdf_compare.py](../../tools/mdf_compare.py) 单一深模块（`compare_files_identical` / `compare_files_reference` 双入口，四维判定默认全开），两个保留 CLI（compare_two_mdf / full_compare）退化为 thin adapter（full_compare 新增必填参考统计布局参数），删除 5 个冗余/变质脚本；oracle 获黄金测试保护（tests/test_mdf_compare.py 13 用例，合成 MDF 无样例依赖），全量 pytest 220 通过。行为等价实证（Task 6）：identical 入口对 AHT 并/串产物与原版输出逐字节一致；reference 入口 3434 处判定差异全部核验为文档已知真实差异（头部 comment、存储表示元数据、41 组组内信号序），values/stats 维度零差异与原版「160 组 × 601 点逐点全部一致」结论吻合。详见 [spec](./2026-08-18-h2-compare-consolidation-spec.md) / [plan](./2026-08-18-h2-compare-consolidation-plan.md) / [验证记录](./2026-08-18-h2-compare-consolidation-verification.md)。
+- **状态：✅ 已完成**（2026-08-18）——收口为 [tools/mdf_compare.py](../../tools/mdf_compare.py) 单一深模块（`compare_files_identical` / `compare_files_reference` 双入口，四维判定默认全开），两个保留 CLI（compare_two_mdf / full_compare）退化为 thin adapter（full_compare 新增必填参考统计布局参数），删除 5 个冗余/变质脚本；oracle 获黄金测试保护（tests/test_mdf_compare.py 15 用例，合成 MDF 无样例依赖；H1 再补至 41 用例）。行为等价实证（Task 6）：identical 入口对 AHT 并/串产物与原版输出逐字节一致；reference 入口 3434 处判定差异全部核验为文档已知真实差异（头部 comment、存储表示元数据、41 组组内信号序），values/stats 维度零差异与原版「160 组 × 601 点逐点全部一致」结论吻合。详见 [spec](./2026-08-18-h2-compare-consolidation-spec.md) / [plan](./2026-08-18-h2-compare-consolidation-plan.md) / [验证记录](./2026-08-18-h2-compare-consolidation-verification.md)。
 
 ### 中（8 项）
 
@@ -178,9 +183,9 @@ ConvertWorker.run
 | A. 桶记录类型化 + owner 集中（M1） | **Strong** | 桶已有两个生产者（feed 列表、向量化 blocks）+ 一个归一化 adapter——接缝真实，但接口是隐式多态 dict。类型化不增层级、只浓缩契约 |
 | B. 绑定决策抽无 Qt 纯函数（M4） | **Strong** | 全 GUI 分区唯一真正的算法，有已发生 bug 史；当前测试面必须穿越 Qt。抽纯后测试成本骤降、981 行主类直接缩短 |
 | C. 归一化键单一来源（M2） | **Strong** | 三处调用点收敛一处，改动小、无争议 |
-| D. write_mdf 失败无残留归 writer（M3） | **Strong** | 直接落实「严格收口」；converter 两个清理分支随之简化 |
+| D. write_mdf 失败无残留归 writer（M3） | ✅ 已 grilling（2026-08-18） | 契约已定：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
-| F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题；对拍 oracle 获得测试保护；tools 目录 21→6~7 个。行为等价验证通过，详见 [验证记录](./2026-08-18-h2-compare-consolidation-verification.md) |
+| F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题：compare 族 7 脚本 → mdf_compare 深模块 + 2 CLI 薄壳（tools 21→18；**8 个 bench/probe 可删脚本未动**——M8/L9 残留，H1 spec 明示 Out of Scope）；oracle 获 41 用例黄金测试 + CLI 退出码进程契约 + STAT_NAMES 双副本锁定。行为等价验证通过（H2 验证记录：identical 与原版逐字节一致、reference 3434 处判定差异全部核验为已知真实差异）；全量 pytest 现状 249 passed / 0 失败。详见 [H2 验证记录](./2026-08-18-h2-compare-consolidation-verification.md) / [H1 spec](./h1/2026-08-18-h1-oracle-protection-spec.md) |
 | G. ChannelStats 通道身份显式化或删死字段（L2） | **Strong** | 消除「顺序即通道」隐式不变量，纯减复杂度；deletion test：无人读它，删之复杂度不转移 |
 | 视觉令牌收敛或双轨明示（GUI P2） | Worth exploring | 同一色值 #207e4b 出现在 theme.py:42 / widgets.py:169 / main_window.py:670 三处；若团队实际迭代方式是就地改色，双轨明示比强制收敛诚实 |
 | 统一两个 worker adapter 骨架（GUI P3） | Worth exploring | 两个 adapter 证明 seam 真实；骨架同构是已兑现成本；合并是否更可读需拿一版对照再定 |
@@ -199,13 +204,15 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**先做 F（对拍工具收口 + 入 pytest），随后按 D → C → G → B → A 的顺序推进。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已 grilling 完毕、spec 已出（2026-08-18）。下一步按原计划顺序推进：D 实施 → C → G → B → A——当前最需要做的是实施 D。**
 
 理由：
-1. F 是唯一同时修复两个「高」级问题的候选，且**与生产代码零接触**——不触碰性能前提与逐位一致对拍链，风险最低、回报是保护项目最独特的资产（对拍链自身获得验收）；
-2. F 自带「减法」：tools/ 21 个脚本中 8 个可直接删（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env / compare_mdf / deep_compare_mdf），3 个合并后删（compare_mdf_v2 / compare_mdf_deep / deep_compare_latest），最终收口约 6~7 个——符合「先做减法再谈抽象」；
-3. D/C/G 是低风险小改动的纯收口，逐项独立可回退，符合「任一验收失败即停」的项目纪律；
-4. B、A 涉及生产代码与 GUI 测试面，是真正的深化项目，放在收口类小改之后单独排期。
+1. **D（write_mdf 失败无残留归 writer）是最小的纯收口**：把「失败无残留」收进 write_mdf 自身契约（内部 try/清理），[converter.py:511-523](../../core/converter.py#L511-L523) 两份硬编码 `<out>.mf4` 清理分支随之删除——deletion test 通过（writer 改临时文件策略不再让 converter 清理静默失效）。单文件改动、不触碰性能前提与对拍链、独立可回退，符合「任一验收失败即停」的项目纪律。**已 grilling 完毕（2026-08-18）**：契约 = 失败清理本次半成品、out_path 保留旧产物（失败 ≠ 全清）、BaseException 覆盖、取消留 converter 侧；测试 seam 2 个均为现有。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md)。
+2. **C（归一化键单一来源）**：三处调用（dbc_loader.py:77 / decoder.py:417 / converter.py:120）收敛一处，改动小无争议，D 后顺手可做。
+3. **G（ChannelStats 死字段）**：deletion test 通过（无人读它），纯减复杂度。
+4. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
+5. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
+6. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
 
 ---
 
@@ -227,4 +234,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：以上候选只描述问题与方向、未设计接口。你想先探索哪一个？选定后进入逐项 grill（约束、依赖、深化后模块的形状、哪些测试存续）。
+**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已 grilling 完毕、spec 已出（2026-08-18）**，实施任务粒度见 [D spec](./2026-08-18-d-write-no-residue-spec.md)；候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，D 实施后的下一候选为 **C（归一化键单一来源）**。
