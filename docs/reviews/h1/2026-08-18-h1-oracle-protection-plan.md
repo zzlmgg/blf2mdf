@@ -52,7 +52,7 @@
 - Consumes: 无（首个任务）。
 - Produces: `pythonpath = .` ini 配置（相对 rootdir 解析 = 项目根）——Task 2-9 所有用例在**任意 pytest 调用方式**下可 `import tools.*` / `import core.*`；同时修复 test_blf_reader 等既有 core 系测试的同类问题（纯收益）。
 
-- [ ] **Step 1: 确认红态（控制台脚本收集失败）**
+- [x] **Step 1: 确认红态（控制台脚本收集失败）**
 
 ```powershell
 cd e:\projects\blf_dbc
@@ -67,7 +67,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `15 passed`。
 
-- [ ] **Step 2: 修改 pytest.ini**
+- [x] **Step 2: 修改 pytest.ini**
 
 把 `[pytest]` 段改为（`pythonpath = .` 是 pytest ≥ 7.0 ini 选项，本环境 8.4.2）：
 
@@ -79,7 +79,7 @@ markers =
     golden: 金标准全量对比测试（较慢，读 35MB 样例）
 ```
 
-- [ ] **Step 3: 验证两种调用方式均绿**
+- [x] **Step 3: 验证两种调用方式均绿**
 
 ```powershell
 pytest tests\test_mdf_compare.py -q
@@ -88,7 +88,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: 两种方式均 `15 passed`。
 
-- [ ] **Step 4: 改动范围核对（不提交）**
+- [x] **Step 4: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -115,7 +115,7 @@ Expected: 仅 `M pytest.ini`。**不要 git commit**（用户指示，提交由�
   - `mdf_factory._simple(comment="t") -> tuple[callable, list, str]`——既有三元组形态：`(_write_mdf, groups, comment)`，G1=[SigA float64, SigB int64]、G2=[SigC S8 文本]。
   - `mdf_factory.REF_LAYOUT: tuple[int, dict[str, int]]`——`(22, {"StdData": 4, "StdDataRate": 5, ..., "ErrorFrameRate": 13})`（参考统计布局，Task 8 由它生成 `--stats-ref-idx` 字符串）。
 
-- [ ] **Step 1: 新建 tests/mdf_factory.py**
+- [x] **Step 1: 新建 tests/mdf_factory.py**
 
 ```python
 """合成 MDF 测试工厂：黄金套件（test_mdf_compare）与 CLI 契约测试（test_compare_cli）共享。
@@ -185,7 +185,7 @@ def _simple(comment="t"):
     return _write_mdf, groups, comment
 ```
 
-- [ ] **Step 2: 改写 test_mdf_compare.py 的助手区**
+- [x] **Step 2: 改写 test_mdf_compare.py 的助手区**
 
 删除文件头部到 `test_identical_equal_files` 之间的本地定义（`REF_LAYOUT` / `_FIXED_START` / `_write_mdf` / `_simple`），替换为：
 
@@ -204,7 +204,7 @@ from tools.mdf_compare import (compare_files_identical, compare_files_reference,
 
 （`from asammdf import MDF, Signal` 是否仍需保留取决于后续用例——Task 5 的 NaN/文本用例会直接构造 groups 列表，需 `np`；`MDF`/`Signal` 若没有新用例用到可从 import 中删掉，但删了也不影响正确性。保留原样最稳妥。）
 
-- [ ] **Step 3: 运行既有 15 用例确认无行为变化**
+- [x] **Step 3: 运行既有 15 用例确认无行为变化**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -212,7 +212,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `15 passed`（收集性依赖 Task 1 已就绪）。
 
-- [ ] **Step 4: 改动范围核对（不提交）**
+- [x] **Step 4: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -233,7 +233,7 @@ Expected: `M pytest.ini`（Task 1 遗留）、`M tests/test_mdf_compare.py`、`?
 - Consumes: `mdf_factory._write_mdf`（`header=` 参数）、`mdf_factory._simple`、`tools.mdf_compare.compare_files_identical`。
 - Produces: 无（纯测试；供后续任务复用的断言风格即本文件的 `any(f"header.{f}" in d for d in diffs)`）。
 
-- [ ] **Step 1: 追加 8 字段参数化用例**
+- [x] **Step 1: 追加 8 字段参数化用例**
 
 在 `test_identical_header_comment` 之后追加：
 
@@ -274,7 +274,7 @@ def test_identical_header_version_noop(tmp_path):
     assert all("header.version" not in d for d in diffs)
 ```
 
-- [ ] **Step 2: 运行新用例确认全绿（9 项）**
+- [x] **Step 2: 运行新用例确认全绿（9 项）**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -282,7 +282,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `24 passed`（15 + 8 参数化 + 1 no-op）。
 
-- [ ] **Step 3: 防空洞自检（一次性）——证明用例确实检测差异**
+- [x] **Step 3: 防空洞自检（一次性）——证明用例确实检测差异**
 
 临时把参数化列表中的 `("author", "author2")` 改为 `("author", "")`（空串 = 默认值，不会产生差异）：
 
@@ -302,7 +302,7 @@ python -m pytest tests\test_mdf_compare.py::test_identical_header_field_diff -q
 
 Expected: `8 passed`。
 
-- [ ] **Step 4: 改动范围核对（不提交）**
+- [x] **Step 4: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -323,7 +323,7 @@ Expected: 仅 `M tests/test_mdf_compare.py`（新增）。**不要 git commit**�
 - Consumes: `mdf_factory._write_mdf`（`chan_mut=` 参数）、`mdf_factory._simple`、`tools.mdf_compare.compare_files_identical`；`asammdf.blocks.v4_blocks.ChannelConversion`（conversion 用例）。
 - Produces: 无。
 
-- [ ] **Step 1: 追加 5 个可构造字段用例 + bit_resolution no-op**
+- [x] **Step 1: 追加 5 个可构造字段用例 + bit_resolution no-op**
 
 在 `test_identical_channel_order` 之后追加：
 
@@ -412,7 +412,7 @@ def test_identical_structure_bit_resolution_noop(tmp_path):
     assert all("bit_resolution" not in d for d in diffs)
 ```
 
-- [ ] **Step 2: 运行确认全绿（+6 项）**
+- [x] **Step 2: 运行确认全绿（+6 项）**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -420,7 +420,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `30 passed`（24 + 6）。
 
-- [ ] **Step 3: 改动范围核对（不提交）**
+- [x] **Step 3: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -444,7 +444,7 @@ Expected: 仅 `M tests/test_mdf_compare.py`（新增）。**不要 git commit**�
 - Consumes: `mdf_factory._write_mdf`、`mdf_factory._simple`、`mdf_factory.REF_LAYOUT`、`tools.mdf_compare.compare_files_identical` / `compare_files_reference`。
 - Produces: 无。
 
-- [ ] **Step 1: 追加 NaN / 整型 / dtype / 文本用例**
+- [x] **Step 1: 追加 NaN / 整型 / dtype / 文本用例**
 
 在 `test_identical_tolerance_boundary` 之后追加：
 
@@ -540,7 +540,7 @@ def test_reference_text_content_diff(tmp_path):
     assert any("文本不一致" in d for d in diffs)
 ```
 
-- [ ] **Step 2: 运行确认全绿（+7 项）**
+- [x] **Step 2: 运行确认全绿（+7 项）**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -548,7 +548,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `37 passed`（30 + 7）。
 
-- [ ] **Step 3: 改动范围核对（不提交）**
+- [x] **Step 3: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -569,7 +569,7 @@ Expected: 仅 `M tests/test_mdf_compare.py`（新增）。**不要 git commit**�
 - Consumes: `mdf_factory._write_mdf`、`mdf_factory._simple`、`mdf_factory.REF_LAYOUT`、`tools.mdf_compare.compare_files_identical` / `compare_files_reference`。
 - Produces: 无。
 
-- [ ] **Step 1: 追加 stats 逐点与 dims 用例**
+- [x] **Step 1: 追加 stats 逐点与 dims 用例**
 
 在 `test_identical_stats_t_axis` 之后追加：
 
@@ -624,7 +624,7 @@ def test_reference_dims_off(tmp_path):
     assert all("header.comment" not in d for d in diffs)
 ```
 
-- [ ] **Step 2: 运行确认全绿（+3 项）**
+- [x] **Step 2: 运行确认全绿（+3 项）**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -632,7 +632,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `40 passed`（37 + 3）。
 
-- [ ] **Step 3: 改动范围核对（不提交）**
+- [x] **Step 3: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -653,7 +653,7 @@ Expected: 仅 `M tests/test_mdf_compare.py`（新增）。**不要 git commit**�
 - Consumes: `tools.mdf_compare.STAT_NAMES`（已有 import）、`core.stats.STAT_NAMES`（新 import）。
 - Produces: 无。
 
-- [ ] **Step 1: 顶部 import 追加 core 侧 STAT_NAMES**
+- [x] **Step 1: 顶部 import 追加 core 侧 STAT_NAMES**
 
 把 Task 2 改写的 import 块改为：
 
@@ -664,7 +664,7 @@ from tools.mdf_compare import (compare_files_identical, compare_files_reference,
 from core.stats import STAT_NAMES as CORE_STAT_NAMES
 ```
 
-- [ ] **Step 2: 文件末尾追加锁定用例**
+- [x] **Step 2: 文件末尾追加锁定用例**
 
 ```python
 def test_stat_names_locked_to_core():
@@ -673,7 +673,7 @@ def test_stat_names_locked_to_core():
     assert STAT_NAMES == CORE_STAT_NAMES
 ```
 
-- [ ] **Step 3: 运行确认全绿（+1 项）**
+- [x] **Step 3: 运行确认全绿（+1 项）**
 
 ```powershell
 python -m pytest tests\test_mdf_compare.py -q
@@ -681,7 +681,7 @@ python -m pytest tests\test_mdf_compare.py -q
 
 Expected: `41 passed`（40 + 1）。
 
-- [ ] **Step 4: 防空洞自检（一次性）——证明锁定有效**
+- [x] **Step 4: 防空洞自检（一次性）——证明锁定有效**
 
 临时把 `test_stat_names_locked_to_core` 的断言改为 `assert STAT_NAMES == ()`（空元组必不等）：
 
@@ -695,7 +695,7 @@ python -m pytest tests\test_mdf_compare.py::test_stat_names_locked_to_core -q
 
 Expected: `1 failed`。还原后重跑，Expected: `1 passed`。
 
-- [ ] **Step 5: 改动范围核对（不提交）**
+- [x] **Step 5: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -717,7 +717,7 @@ Expected: 仅 `M tests/test_mdf_compare.py`（新增）。**不要 git commit**�
 - Consumes: `mdf_factory._write_mdf`、`mdf_factory._simple`、`mdf_factory.REF_LAYOUT`（生成 `--stats-ref-idx` 字符串）。
 - Produces: 无（进程级契约由 returncode 表达）。
 
-- [ ] **Step 1: 新建 tests/test_compare_cli.py**
+- [x] **Step 1: 新建 tests/test_compare_cli.py**
 
 ```python
 """CLI 退出码契约测试：进程级（subprocess），合成 MDF，无样例依赖。
@@ -803,7 +803,7 @@ def test_full_compare_required_args(tmp_path):
     assert r.returncode != 0
 ```
 
-- [ ] **Step 2: 运行确认全绿（+3 项）**
+- [x] **Step 2: 运行确认全绿（+3 项）**
 
 ```powershell
 python -m pytest tests\test_compare_cli.py -q
@@ -811,7 +811,7 @@ python -m pytest tests\test_compare_cli.py -q
 
 Expected: `3 passed`。注意子进程真实执行两个 CLI（每次约 1-3s，全文件约 10s）。
 
-- [ ] **Step 3: 防空洞自检（一次性）——证明 returncode 断言有效**
+- [x] **Step 3: 防空洞自检（一次性）——证明 returncode 断言有效**
 
 临时把 `test_compare_two_mdf_exit_codes` 中相等对的断言改为 `assert r.returncode == 1`（与实际 0 不符）：
 
@@ -825,7 +825,7 @@ python -m pytest tests\test_compare_cli.py::test_compare_two_mdf_exit_codes -q
 
 Expected: `1 failed`。还原后重跑，Expected: `1 passed`。
 
-- [ ] **Step 4: 改动范围核对（不提交）**
+- [x] **Step 4: 改动范围核对（不提交）**
 
 ```powershell
 git status --short
@@ -844,7 +844,7 @@ spec 验收方式：`python -m pytest tests/ -q` 与 `pytest tests/ -q`（控制
 **Interfaces:**
 - Consumes: 全部前序任务产物。
 
-- [ ] **Step 1: python -m 方式全量**
+- [x] **Step 1: python -m 方式全量**
 
 ```powershell
 python -m pytest tests\ -q
@@ -852,7 +852,7 @@ python -m pytest tests\ -q
 
 Expected: 全绿；`41 passed`（test_mdf_compare）+ `3 passed`（test_compare_cli）+ 其余既有用例（约 200，含环境性跳过）。若有个别失败：定位 → 最小修正 → 重验（失败不叠加猜测）。
 
-- [ ] **Step 2: 控制台脚本方式全量（D2 收集性契约的最终验收）**
+- [x] **Step 2: 控制台脚本方式全量（D2 收集性契约的最终验收）**
 
 ```powershell
 pytest tests\ -q
@@ -860,10 +860,10 @@ pytest tests\ -q
 
 Expected: 与 Step 1 相同全绿。此前该方式收集即报 `ModuleNotFoundError: No module named 'tools'`——本步证明收集性修复生效。
 
-- [ ] **Step 3: 行为等价确认**
+- [x] **Step 3: 行为等价确认**
 
 `git diff tests/ pytest.ini` 与 `git diff --stat` 核对：**生产代码（core/、gui/、tools/mdf_compare.py、tools/compare_two_mdf.py、tools/full_compare.py）零改动**——与 spec「本次收尾不改动任何判定行为」一致。
 
-- [ ] **Step 4: 收尾汇报（不提交）**
+- [x] **Step 4: 收尾汇报（不提交）**
 
 在计划执行记录中汇总：新用例清单（41 + 3）、两种调用方式均全绿的实跑输出、防空洞自检结果（Task 3/7/8 各 1 次）、spec 偏差说明（values 行 `\x00`/U 分支不可构造的调整，依据可行性依据 3）。**不要 git commit**（提交由用户执行）。
