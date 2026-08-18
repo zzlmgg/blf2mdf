@@ -7,6 +7,8 @@
 > **2026-08-18 更新（D 实施完成后）**：§3 M3 标 ✅ 完成；§4 候选 D 已落地；§5 首要建议改为「C → G → B → A」；§2.1 行数刷新（converter 536→531、mdf_writer 130→145）；全量 pytest 现状：**253 passed / 0 失败**（anaconda3 实测，2026-08-18，249 基线 + 4 新增）。D 实施按项目惯例未 commit（由用户执行）。
 >
 > **2026-08-18 更新（C 实施完成后）**：§3 M2 标 ✅ 完成；§4 候选 C 已落地；§5 首要建议改为「G → B → A」；§2.1 行数刷新（converter 531→530、dbc_loader 108→126、tests/test_dbc_loader 113→134）；全量 pytest 现状：**259 passed / 0 失败**（anaconda3 实测，2026-08-18，253 基线 + 6 新增边界用例）。C 实施按项目惯例未 commit（由用户执行）。
+>
+> **2026-08-18 更新（G 实施完成后）**：§3 L2 标 ✅ 完成；§4 候选 G 已落地；§5 首要建议改为「B → A」；§2.1 行数刷新（stats 154→152）；CONTEXT.md 新增「统计组布局」词条；全量 pytest 现状：**259 passed / 0 失败**（anaconda3 实测，2026-08-18，用例数不变、零测试改动）。G 实施按项目惯例未 commit（由用户执行）。
 
 ## 0. 摘要
 
@@ -43,7 +45,7 @@
 | core/converter.py | 530 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由） |
 | core/decoder.py | 453 | 帧→信号物理值 | `SignalSeries`、`DecodeStats`、`ChannelDecoder`、`decode_channel`（测试面包装） |
 | core/mp_finish.py | 279 | 并行 per-bucket finish | `make_pool`、`bucket_bytes`、`finish_all`（结果与串行 finish 同形） |
-| core/stats.py | 154 | CANoe 1s 统计语义 | `STAT_NAMES`/`STAT_CHANNELS`、`aggregate_channel`（deep）、`align_timestamps`（时间网格规则唯一实现）、`ChannelStats` |
+| core/stats.py | 152 | CANoe 1s 统计语义 | `STAT_NAMES`/`STAT_CHANNELS`、`aggregate_channel`（deep）、`align_timestamps`（时间网格规则唯一实现）、`ChannelStats`（不含通道身份，见词汇表「统计组布局」） |
 | core/mdf_writer.py | 145 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`（无残留契约：抛出时本次调用不留下任何输出文件）；import 时改 asammdf 全局压缩级别 |
 | core/dbc_loader.py | 126 | DBC 域模型 | `SignalDef`/`MessageDef`/`DbcDef`、`load`；`normalize_id`/`normalize_ids`（归一化键唯一实现，M2 收口后） |
 | core/project_loader.py | 125 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
@@ -166,7 +168,7 @@ ConvertWorker.run
 | # | 位置 | 问题 | 违反 |
 |---|---|---|---|
 | L1 | [mp_finish.py:74-76](../../core/mp_finish.py#L74-L76) vs :157-158 | worker 数决策双实现（env 覆盖仅 converter 路径生效）；`decoders`/`channels` 双真值源无防御 | ④ |
-| L2 | [stats.py:154](../../core/stats.py#L154) | `ChannelStats(channel=0)` 硬编码死字段，mdf_writer 从不读它——通道身份靠「converter 按 STAT_CHANNELS 顺序 append」的未成文不变量 | ③ |
+| L2 | [stats.py:154](../../core/stats.py#L154) | `ChannelStats(channel=0)` 硬编码死字段，mdf_writer 从不读它——通道身份靠「converter 按 STAT_CHANNELS 顺序 append」的未成文不变量。**状态：✅ 已完成**（2026-08-18，候选 G）：`channel`/`signal_names` 双死字段删除（grilling Q1/Q5）、docstring 明示顺序即通道（Q2）、CONTEXT.md 收「统计组布局」词条（Q3）、不补测试（Q4）。详见 [G spec](./g/2026-08-18-g-channelstats-dead-field-spec.md) | ③ |
 | L3 | [mp_finish.py:63](../../core/mp_finish.py#L63) | warm_up 依赖 `pool._max_workers` stdlib 私有属性，make_pool 已知 n 却不传 | ⑤ |
 | L4 | [converter.py:484/493](../../core/converter.py#L484) | 同一「无统计数据」缺省两种元组形状 `((), None, None, None)` vs `((), (), (), ())` | ⑤ |
 | L5 | [mp_finish.py:48-49](../../core/mp_finish.py#L48-L49) | `_finish_bucket_worker` 6 元组位置契约，两处解包靠位置记忆，前两元素被丢弃 | ③ |
@@ -192,7 +194,7 @@ ConvertWorker.run
 | D. write_mdf 失败无残留归 writer（M3） | ✅ 已落地（2026-08-18） | 契约已实施：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化为 unlink(missing_ok=True)。5 个新测试；全量 253 passed。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
 | F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题：compare 族 7 脚本 → mdf_compare 深模块 + 2 CLI 薄壳（tools 21→18；**8 个 bench/probe 可删脚本未动**——M8/L9 残留，H1 spec 明示 Out of Scope）；oracle 获 41 用例黄金测试 + CLI 退出码进程契约 + STAT_NAMES 双副本锁定。行为等价验证通过（H2 验证记录：identical 与原版逐字节一致、reference 3434 处判定差异全部核验为已知真实差异）；全量 pytest 现状 249 passed / 0 失败。详见 [H2 验证记录](./2026-08-18-h2-compare-consolidation-verification.md) / [H1 spec](./h1/2026-08-18-h1-oracle-protection-spec.md) |
-| G. ChannelStats 通道身份显式化或删死字段（L2） | **Strong** | 消除「顺序即通道」隐式不变量，纯减复杂度；deletion test：无人读它，删之复杂度不转移 |
+| G. ChannelStats 通道身份显式化或删死字段（L2） | ✅ 已落地（2026-08-18） | `channel` + 零读者的 `signal_names` 双死字段删除（grilling Q1/Q5）；类 docstring 明示「对象不含通道身份，通道由调用方按 STAT_CHANNELS 顺序持有」（Q2）；CONTEXT.md 新增「统计组布局」词条（Q3）；不补测试、零测试改动（Q4）。259 passed 用例数不变。详见 [G spec](./g/2026-08-18-g-channelstats-dead-field-spec.md) |
 | 视觉令牌收敛或双轨明示（GUI P2） | Worth exploring | 同一色值 #207e4b 出现在 theme.py:42 / widgets.py:169 / main_window.py:670 三处；若团队实际迭代方式是就地改色，双轨明示比强制收敛诚实 |
 | 统一两个 worker adapter 骨架（GUI P3） | Worth exploring | 两个 adapter 证明 seam 真实；骨架同构是已兑现成本；合并是否更可读需拿一版对照再定 |
 | worker 数 / 进度带单一来源（L1/M5） | Worth exploring | 收口方式为最小常量/函数共享，不引入「进度管理器」抽象 |
@@ -210,13 +212,12 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）。下一步按原计划顺序推进：G → B → A——当前最需要做的是 G（ChannelStats 死字段）。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）。下一步按原计划顺序推进：B → A——当前最需要做的是 B（绑定决策抽无 Qt 纯函数）。**
 
 理由：
-1. **G（ChannelStats 死字段）是当前最小的纯减复杂度**：deletion test 通过（`ChannelStats.channel` 无任何读方，通道身份靠「converter 按 STAT_CHANNELS 顺序 append」的未成文不变量维系，写值无人消费），删之复杂度不转移。收口类（C/D/M3）至此全部落地，架构剩余主要工作重心转入 GUI 侧。
-2. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
-3. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
-4. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
+1. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。收口类（C/D/M3/G/L2）至此全部落地，架构剩余主要工作重心转入 GUI 侧。
+2. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
+3. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
 
 ---
 
@@ -238,4 +239,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态。候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **G（ChannelStats 死字段）**。
+**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态；**G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 L2 状态。候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **B（绑定决策抽无 Qt 纯函数）**。

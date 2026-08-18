@@ -66,17 +66,15 @@ def align_timestamps(ts) -> np.ndarray:
 
 
 class ChannelStats:
-    """单通道的 1s 统计结果。"""
+    """一个 1s 统计结果（聚合自单通道帧流）。
 
-    def __init__(self, channel: int, t: np.ndarray,
-                 values: dict[str, np.ndarray]):
-        self.channel = channel
+    对象不含通道身份——通道由调用方按 STAT_CHANNELS 顺序持有；
+    输出组序 = 通道 × 统计项（见词汇表『统计组布局』）。
+    """
+
+    def __init__(self, t: np.ndarray, values: dict[str, np.ndarray]):
         self.t = t                          # float64 (N+1,)
         self.values = values                # 统计名 → int32/float64 (N+1,)
-
-    @property
-    def signal_names(self) -> list[str]:
-        return list(STAT_NAMES)
 
 
 def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
@@ -151,4 +149,4 @@ def aggregate_channel(timestamps: np.ndarray, is_extended: np.ndarray,
     for rn in _RATE_NAMES:
         values[rn] = rates[rn]
 
-    return ChannelStats(channel=0, t=t.astype(np.float64), values=values)
+    return ChannelStats(t=t.astype(np.float64), values=values)
