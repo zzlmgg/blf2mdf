@@ -99,6 +99,7 @@ ConvertWorker.run
 - 违反：④ 严格收口、② 扁平
 - 证据：每个脚本独立重写「加载两组、按名对齐、逐点比较」；头部对比（compare_mdf_v2.py:35-39、compare_mdf_deep.py:48-56）与统计 t 轴细查（deep_compare_latest.py:69-83）是独有能力，必须合并而非纯删；deep_compare_mdf.py docstring 自称「对比两个 MDF」而 main 只读 sys.argv[1]（变质残留）。
 - 方向：收口为两个保留工具（自产对拍 + CANoe 报告），其余删除。
+- **状态：✅ 已完成**（2026-08-18）——收口为 [tools/mdf_compare.py](../../tools/mdf_compare.py) 单一深模块（`compare_files_identical` / `compare_files_reference` 双入口，四维判定默认全开），两个保留 CLI（compare_two_mdf / full_compare）退化为 thin adapter（full_compare 新增必填参考统计布局参数），删除 5 个冗余/变质脚本；oracle 获黄金测试保护（tests/test_mdf_compare.py 13 用例，合成 MDF 无样例依赖），全量 pytest 220 通过。行为等价实证（Task 6）：identical 入口对 AHT 并/串产物与原版输出逐字节一致；reference 入口 3434 处判定差异全部核验为文档已知真实差异（头部 comment、存储表示元数据、41 组组内信号序），values/stats 维度零差异与原版「160 组 × 601 点逐点全部一致」结论吻合。详见 [spec](./2026-08-18-h2-compare-consolidation-spec.md) / [plan](./2026-08-18-h2-compare-consolidation-plan.md) / [验证记录](./2026-08-18-h2-compare-consolidation-verification.md)。
 
 ### 中（8 项）
 
@@ -179,7 +180,7 @@ ConvertWorker.run
 | C. 归一化键单一来源（M2） | **Strong** | 三处调用点收敛一处，改动小、无争议 |
 | D. write_mdf 失败无残留归 writer（M3） | **Strong** | 直接落实「严格收口」；converter 两个清理分支随之简化 |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
-| F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | **Strong** | 修复两个「高」级问题；对拍 oracle 获得测试保护；tools 目录 21→6~7 个 |
+| F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题；对拍 oracle 获得测试保护；tools 目录 21→6~7 个。行为等价验证通过，详见 [验证记录](./2026-08-18-h2-compare-consolidation-verification.md) |
 | G. ChannelStats 通道身份显式化或删死字段（L2） | **Strong** | 消除「顺序即通道」隐式不变量，纯减复杂度；deletion test：无人读它，删之复杂度不转移 |
 | 视觉令牌收敛或双轨明示（GUI P2） | Worth exploring | 同一色值 #207e4b 出现在 theme.py:42 / widgets.py:169 / main_window.py:670 三处；若团队实际迭代方式是就地改色，双轨明示比强制收敛诚实 |
 | 统一两个 worker adapter 骨架（GUI P3） | Worth exploring | 两个 adapter 证明 seam 真实；骨架同构是已兑现成本；合并是否更可读需拿一版对照再定 |

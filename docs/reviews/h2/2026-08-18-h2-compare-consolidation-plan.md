@@ -894,7 +894,7 @@ python tools/full_compare.py <合成自产.mdf> <合成参考.mdf> \
 ```
 Expected: exit 1（构造的差异被判定）+ 报告文件生成
 
-- [ ] **Step 4: 交付点（用户提交）**
+- [x] **Step 4: 交付点（用户提交）**（2026-08-18 用户已提交）
 
 ```bash
 git add tools/full_compare.py
@@ -913,7 +913,7 @@ git commit -m "refactor: full_compare 薄壳化（判定委托共享模块，布
 - Consumes: `compare_files_identical`（Task 1）
 - 语义差异说明：原 `_mdf_equal` 浮点用 `array_equal(equal_nan=True)`；模块 identical 用 `array_equal` + nanmax 有效容差——测试数据无 NaN 时两者等价（本文件测试数据为自产并/串产物，无 NaN）。
 
-- [ ] **Step 1: 删除 `_mdf_equal` 并替换断言**
+- [x] **Step 1: 删除 `_mdf_equal` 并替换断言**（内容已随「提交H2的task1-5」入库，2026-08-18 标记）
 
 删除 [tests/test_parallel_decode.py:216-245](../../tests/test_parallel_decode.py#L216-L245) 的 `_mdf_equal` 定义。替换两处调用：
 
@@ -923,7 +923,7 @@ git commit -m "refactor: full_compare 薄壳化（判定委托共享模块，布
 ```
 （`test_parallel_matches_serial_real_blf` ~264 行、`test_fallback_serial_on_pool_failure` ~309 行；`import` 改为 `from tools.mdf_compare import compare_files_identical`）
 
-- [ ] **Step 2: 补充等价回归断言**
+- [x] **Step 2: 补充等价回归断言**（内容已随「提交H2的task1-5」入库，2026-08-18 标记）
 
 在 `test_parallel_matches_serial_real_blf` 后追加（模块级对拍结果同时覆盖组序/头部，防御未来漂移）：
 
@@ -938,12 +938,12 @@ def test_parallel_identical_with_module_dims(tmp_path):
 
 （说明：真实数据上的逐位一致由 Task 6 验证；此处防回归断言仅校验替换链路。）
 
-- [ ] **Step 3: 跑全量测试**
+- [x] **Step 3: 跑全量测试**（2026-08-18 Task 6 复跑：220 passed）
 
 Run: `python -m pytest tests/ -q`
 Expected: PASS（含真实数据对拍用例——模块替换拷贝后仍全绿）
 
-- [ ] **Step 4: 交付点（用户提交）**
+- [x] **Step 4: 交付点（用户提交）**（2026-08-18 用户已提交）
 
 ```bash
 git add tests/test_parallel_decode.py
@@ -979,7 +979,7 @@ Run: `git rm tools/compare_mdf.py tools/compare_mdf_v2.py tools/compare_mdf_deep
 Run: `python -m pytest tests/ -q`
 Expected: PASS（无测试引用被删脚本——Task 4 已确认测试只经模块）
 
-- [ ] **Step 4: 交付点（用户提交）**（2026-08-18 执行任务时按用户指示**不提交**，交付点由用户执行）
+- [x] **Step 4: 交付点（用户提交）**（2026-08-18 用户已提交）
 
 ```bash
 git add -A
@@ -1043,7 +1043,7 @@ Expected: 其统计 t 轴打印（n/首/末）与收口版判定输出一致（�
 Run: `python -m pytest tests/ -q`；再跑一次 Step 1 命令确认稳定性
 Expected: 全绿；两次 identical 对拍输出一致
 
-- [ ] **Step 5: 交付点（用户提交）**（2026-08-18 执行任务时按用户指示**不提交**，交付点由用户执行；验证记录见 [2026-08-18-h2-compare-consolidation-verification.md](./2026-08-18-h2-compare-consolidation-verification.md)，待提交改动：`tools/compare_two_mdf.py` 汇总行修复）
+- [x] **Step 5: 交付点（用户提交）**（2026-08-18 用户已提交；验证记录见 [2026-08-18-h2-compare-consolidation-verification.md](./2026-08-18-h2-compare-consolidation-verification.md)）
 
 ```bash
 git add -A
