@@ -11,7 +11,7 @@ from core.blf_reader import Frame
 from core.decoder import (DecodeStats, SignalSeries, _clamped_int_array,
                           _extract_bits, _extract_signal, _int_dtype,
                           _pad_to_64, _signal_kind)
-from core.dbc_loader import DbcDef, SignalDef, load
+from core.dbc_loader import DbcDef, SignalDef, load, normalize_id
 
 
 def _ref_bits(data: bytes, pos: int, length: int, byte_order: str) -> int:
@@ -100,7 +100,7 @@ def reference_decode(frames, dbc: DbcDef, channel: int):
     buckets = {}
     for fr in frames:
         stats.total_frames += 1
-        arb = fr.arbitration_id | (0x80000000 if fr.is_extended else 0)
+        arb = normalize_id(fr.arbitration_id, fr.is_extended)
         try:
             decoded = dbc.db.decode_message(arb, fr.data)
         except (KeyError, DecodeError):

@@ -8,7 +8,7 @@ import numpy as np
 from cantools.database.namedsignalvalue import NamedSignalValue
 
 from core.blf_reader import Frame
-from core.dbc_loader import DbcDef, MessageDef, SignalDef
+from core.dbc_loader import DbcDef, MessageDef, SignalDef, normalize_id
 
 
 @dataclass
@@ -414,7 +414,7 @@ class ChannelDecoder:
     def feed(self, fr: Frame) -> None:
         stats = self.stats
         stats.total_frames += 1
-        arb = fr.arbitration_id | (0x80000000 if fr.is_extended else 0)
+        arb = normalize_id(fr.arbitration_id, fr.is_extended)
         md = self.dbc.messages.get(arb)
         if md is None or len(fr.data) < md.frame_length:
             # 未知 ID，或已知 ID 短帧（cantools DecodeError）→ 未知帧。

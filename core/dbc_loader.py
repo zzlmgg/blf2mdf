@@ -3,7 +3,25 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 LOGGER = logging.getLogger(__name__)
+
+# 归一化键的 EFF 位（Extended Frame Flag）：并入原始 id，与 cantools/can 生态一致
+_EFF_BIT = 0x80000000
+
+
+def normalize_id(raw_id: int, is_extended: bool) -> int:
+    """归一化键（标量）：原始 id 并入 EFF 位，即 dbc.messages 键的唯一规则。
+
+    原始 id（29 位扩展 / 11 位标准）本身不含 EFF 位；置位后与帧身份键
+    对齐，标准/扩展报文共用原始 id 时仍可区分。"""
+    return raw_id | (_EFF_BIT if is_extended else 0)
+
+
+def normalize_ids(arbs: np.ndarray, is_ext: np.ndarray) -> np.ndarray:
+    """归一化键（numpy 批量版）：与 normalize_id 逐位一致，dtype 保持 uint32。"""
+    return arbs | np.where(is_ext, np.uint32(_EFF_BIT), np.uint32(0))
 
 
 @dataclass
@@ -74,7 +92,7 @@ def load(path: str) -> DbcDef:
     messages = {}
     seen_ids = set()
     for msg in db.messages:
-        key = msg.frame_id | (0x80000000 if msg.is_extended_frame else 0)
+        key = normalize_id(msg.frame_id, msg.is_extended_frame)
         if msg.frame_id in seen_ids:
             LOGGER.warning(
                 "标准/扩展报文共用原始 id 0x%X，按 EFF 位归一化键后各自保留", msg.frame_id

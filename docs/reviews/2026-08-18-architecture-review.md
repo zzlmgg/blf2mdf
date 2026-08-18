@@ -5,6 +5,8 @@
 > **2026-08-18 更新（H1 落地后，基准 commit 22cb7ff）**：§3 H1/H2 均标 ✅ 完成（H2 原为计划状态、H1 无状态）；§2.1 tools/tests 数量刷新（tools 21→18、tests 17→19 文件）；§4 候选 F 已落地、tools 收口范围如实修正；§5 首要建议由「先做 F」改为「D → C → G → B → A」。全量 pytest 现状：**249 passed / 0 失败**（anaconda3 实测，2026-08-18）。
 >
 > **2026-08-18 更新（D 实施完成后）**：§3 M3 标 ✅ 完成；§4 候选 D 已落地；§5 首要建议改为「C → G → B → A」；§2.1 行数刷新（converter 536→531、mdf_writer 130→145）；全量 pytest 现状：**253 passed / 0 失败**（anaconda3 实测，2026-08-18，249 基线 + 4 新增）。D 实施按项目惯例未 commit（由用户执行）。
+>
+> **2026-08-18 更新（C 实施完成后）**：§3 M2 标 ✅ 完成；§4 候选 C 已落地；§5 首要建议改为「G → B → A」；§2.1 行数刷新（converter 531→530、dbc_loader 108→126、tests/test_dbc_loader 113→134）；全量 pytest 现状：**259 passed / 0 失败**（anaconda3 实测，2026-08-18，253 基线 + 6 新增边界用例）。C 实施按项目惯例未 commit（由用户执行）。
 
 ## 0. 摘要
 
@@ -38,12 +40,12 @@
 |---|---|---|---|
 | core/blf_reader.py | 454 | BLF 标量解析（oracle）+ 探测 | `Frame`、`probe_channels`、`read_start_time`、`list_channels`、`iter_messages`、`ScanCancelled`（全项目取消异常唯一定义点） |
 | core/blf_vector.py | 456 | H1 向量化快路径 + 回退编排 | `ContainerFrames`（packed/scattered 双契约）、`iter_container_frames`（快路径失败回退标量，决策唯一收口点） |
-| core/converter.py | 531 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由） |
+| core/converter.py | 530 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由） |
 | core/decoder.py | 453 | 帧→信号物理值 | `SignalSeries`、`DecodeStats`、`ChannelDecoder`、`decode_channel`（测试面包装） |
 | core/mp_finish.py | 279 | 并行 per-bucket finish | `make_pool`、`bucket_bytes`、`finish_all`（结果与串行 finish 同形） |
 | core/stats.py | 154 | CANoe 1s 统计语义 | `STAT_NAMES`/`STAT_CHANNELS`、`aggregate_channel`（deep）、`align_timestamps`（时间网格规则唯一实现）、`ChannelStats` |
 | core/mdf_writer.py | 145 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`（无残留契约：抛出时本次调用不留下任何输出文件）；import 时改 asammdf 全局压缩级别 |
-| core/dbc_loader.py | 108 | DBC 域模型 | `SignalDef`/`MessageDef`/`DbcDef`（messages 键归一化构造单点）、`load` |
+| core/dbc_loader.py | 126 | DBC 域模型 | `SignalDef`/`MessageDef`/`DbcDef`、`load`；`normalize_id`/`normalize_ids`（归一化键唯一实现，M2 收口后） |
 | core/project_loader.py | 125 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
 | gui/main_window.py | 981 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`_find_ccu3_root` |
 | gui/widgets.py | 421 | 无业务 PySide 展示组件（零 core 依赖） | `AppShell`、`CompactCombo`、`DbcListWidget`、`TitleBar`、`SummaryDialog` 等 |
@@ -121,6 +123,7 @@ ConvertWorker.run
 - 违反：③ 契约明确、④ 收口
 - 证据：[converter.py:28](../../core/converter.py#L28) docstring 承认「与 dbc.messages 键契约一致」——契约靠注释转发而非引用；改键规则（如 FD 专属 ID 空间）需同改 3 模块。
 - 方向：归一化收敛为一个归属点，三处改为调用。
+- **状态：✅ 已完成**（2026-08-18，实施 C）——归一化收口到 dbc_loader 模块级：`normalize_id`（标量）+ `normalize_ids`（numpy 批量）双入口相邻定义，共享私有 `_EFF_BIT = 0x80000000` 常量；三处调用点（dbc_loader 构造键 / decoder feed 查键 / converter 向量化热路径）全部改调，键值逐位不变；oracle（test_decoder_vectorized reference_decode）换调生产 `normalize_id`（H1 先例：测试基准用生产契约函数）；解构方向（blf_vector 掩码解析 is_ext、test_parallel_decode 反解）明确不收口——生产零消费者，YAGNI。测试 6 项：参数化边界 5 例（标准帧高位置 0、扩展帧置位、29 位上限 0x1FFFFFFF 扩展、0x80000000 标准帧 OR 0 幂等、0x80000001 扩展帧幂等）+ 批量版与标量逐位一致且 dtype 保 uint32。双轴 code-review 0 findings。全量 259 passed。
 
 **M3. 半成品 .mf4 清理收口分裂：命名知识泄漏 + 清理双份**
 - 位置：[mdf_writer.py:133-145](../../core/mdf_writer.py#L133-L145)（save/replace 包入 try/except BaseException 自清理，修复前 save/replace 无保护）；converter 修复前 :511-523 两份硬编码 `<out>.mf4` 清理（现已删除，仅剩取消分支 :513-518）
@@ -185,7 +188,7 @@ ConvertWorker.run
 |---|---|---|
 | A. 桶记录类型化 + owner 集中（M1） | **Strong** | 桶已有两个生产者（feed 列表、向量化 blocks）+ 一个归一化 adapter——接缝真实，但接口是隐式多态 dict。类型化不增层级、只浓缩契约 |
 | B. 绑定决策抽无 Qt 纯函数（M4） | **Strong** | 全 GUI 分区唯一真正的算法，有已发生 bug 史；当前测试面必须穿越 Qt。抽纯后测试成本骤降、981 行主类直接缩短 |
-| C. 归一化键单一来源（M2） | **Strong** | 三处调用点收敛一处，改动小、无争议 |
+| C. 归一化键单一来源（M2） | ✅ 已落地（2026-08-18） | 归一化键唯一实现落 dbc_loader（`normalize_id`/`normalize_ids`/`_EFF_BIT`），三处调用点 + oracle 全部改调；6 项边界测试；259 passed。详见 §3 M2 状态 |
 | D. write_mdf 失败无残留归 writer（M3） | ✅ 已落地（2026-08-18） | 契约已实施：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化为 unlink(missing_ok=True)。5 个新测试；全量 253 passed。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
 | F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题：compare 族 7 脚本 → mdf_compare 深模块 + 2 CLI 薄壳（tools 21→18；**8 个 bench/probe 可删脚本未动**——M8/L9 残留，H1 spec 明示 Out of Scope）；oracle 获 41 用例黄金测试 + CLI 退出码进程契约 + STAT_NAMES 双副本锁定。行为等价验证通过（H2 验证记录：identical 与原版逐字节一致、reference 3434 处判定差异全部核验为已知真实差异）；全量 pytest 现状 249 passed / 0 失败。详见 [H2 验证记录](./2026-08-18-h2-compare-consolidation-verification.md) / [H1 spec](./h1/2026-08-18-h1-oracle-protection-spec.md) |
@@ -207,14 +210,13 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）。下一步按原计划顺序推进：C → G → B → A——当前最需要做的是 C（归一化键单一来源）。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）。下一步按原计划顺序推进：G → B → A——当前最需要做的是 G（ChannelStats 死字段）。**
 
 理由：
-1. **C（归一化键单一来源）是当前最小的纯收口**：三处调用（dbc_loader.py:77 / decoder.py:417 / converter.py:120）收敛一处，改动小无争议，不触碰性能前提与对拍链、独立可回退，符合「任一验收失败即停」的项目纪律。C 也是下一轮 warm-up：唯一涉及跨 3 模块修改规则的小改（改键规则需同改 3 处的成本已被 M2 实证）。
-2. **G（ChannelStats 死字段）**：deletion test 通过（无人读它），纯减复杂度，C 后顺手可做。
-3. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
-4. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
-5. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
+1. **G（ChannelStats 死字段）是当前最小的纯减复杂度**：deletion test 通过（`ChannelStats.channel` 无任何读方，通道身份靠「converter 按 STAT_CHANNELS 顺序 append」的未成文不变量维系，写值无人消费），删之复杂度不转移。收口类（C/D/M3）至此全部落地，架构剩余主要工作重心转入 GUI 侧。
+2. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
+3. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
+4. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
 
 ---
 
@@ -236,4 +238,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**，实施记录见 [D spec](./2026-08-18-d-write-no-residue-spec.md)；候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **C（归一化键单一来源）**。
+**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态。候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **G（ChannelStats 死字段）**。

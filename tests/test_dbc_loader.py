@@ -1,6 +1,7 @@
+import numpy as np
 import pytest
 
-from core.dbc_loader import load
+from core.dbc_loader import load, normalize_id, normalize_ids
 
 INLINE_DBC = '''VERSION ""
 
@@ -110,3 +111,24 @@ VAL_ 200 C 0 "off" 1 "on" ;
     m2 = dbc.messages[200]
     assert m2.signals[0].byte_order == "big_endian"
     assert m2.signals[0].choices == {0: "off", 1: "on"}
+
+
+@pytest.mark.parametrize("raw_id,is_extended,expected", [
+    (0x123, False, 0x123),             # 标准帧：EFF 位不置位
+    (0x123, True, 0x80000123),         # 扩展帧：EFF 位置位
+    (0x1FFFFFFF, True, 0x9FFFFFFF),    # 29 位 id 上限的扩展帧
+    (0x80000000, False, 0x80000000),   # 标准帧原始 id 已含 EFF 位模式：OR 0 幂等不清除
+    (0x80000001, True, 0x80000001),    # 扩展帧 EFF 位已置位：OR 幂等
+])
+def test_normalize_id(raw_id, is_extended, expected):
+    """归一化键 = 原始 id 并入 EFF 位（dbc.messages 键的单一来源）。"""
+    assert normalize_id(raw_id, is_extended) == expected
+
+
+def test_normalize_ids_vectorized():
+    """numpy 批量版与标量逐位一致，dtype 保持 uint32。"""
+    arbs = np.array([0x123, 0x123, 0x1FFFFFFF, 0x80000000, 0x80000001], np.uint32)
+    is_ext = np.array([False, True, True, False, True])
+    got = normalize_ids(arbs, is_ext)
+    assert got.dtype == np.uint32
+    assert got.tolist() == [0x123, 0x80000123, 0x9FFFFFFF, 0x80000000, 0x80000001]

@@ -11,7 +11,7 @@ from core import blf_reader, mdf_writer, mp_finish
 from core.blf_reader import ScanCancelled
 from core.blf_vector import iter_container_frames
 from core.decoder import ChannelDecoder
-from core.dbc_loader import DbcDef
+from core.dbc_loader import DbcDef, normalize_ids
 from core import stats as stats_mod
 
 
@@ -25,7 +25,7 @@ def _check_cancel(cancel_cb) -> None:
 def _prep_decode_info(decoders) -> dict[int, tuple[np.ndarray, np.ndarray, list]]:
     """解码路由预计算：每通道 (排序键 uint32, 帧长 int64, MessageDef 表)。
 
-    键 = 归一化键（原始 id 含 EFF 位），与 dbc.messages 键契约一致。
+    键 = 归一化键（原始 id 含 EFF 位），规则见 dbc_loader.normalize_ids。
     """
     info = {}
     for ch, dec in decoders.items():
@@ -117,8 +117,7 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
         n = len(cf.channel)
         if n == 0:
             continue
-        arb_norm = cf.arb | np.where(cf.is_ext, np.uint32(0x80000000),
-                                     np.uint32(0))
+        arb_norm = normalize_ids(cf.arb, cf.is_ext)
         # ── 统计块（仅 STAT_CHANNELS 被聚合消费；与旧路径逐帧追加等价）──
         if stats_export:
             for ch in stats_mod.STAT_CHANNELS:
