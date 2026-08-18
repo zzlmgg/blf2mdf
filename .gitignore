@@ -3,8 +3,10 @@ inputs/
 outputs/
 raw_inputs*
 .codex-pytest*
-.claude
-.agents
+# .claude
+# .agents
+# .codex
+# skills-lock.json
 .superpowers*
 .pytest_cache*
 
