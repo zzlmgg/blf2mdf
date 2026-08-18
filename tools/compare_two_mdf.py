@@ -6,6 +6,8 @@
 import argparse
 import sys
 
+from asammdf import MDF
+
 from mdf_compare import compare_files_identical  # 同目录脚本运行（sys.path[0]=tools/）
 
 _DIMS = ("header", "structure", "values", "stats")
@@ -22,9 +24,14 @@ def main(argv=None):
     diffs = compare_files_identical(args.path_a, args.path_b, dims=dims)
     for line in diffs:
         print(line)
+    # 汇总行带组数（与原文案一致；元数据轻量加载，~0.03s）
+    with MDF(args.path_a) as a:
+        n_groups = len(a.groups)
     if not diffs:
-        print("=== 全部一致 ===")
-    return 1 if diffs else 0
+        print(f"=== {n_groups} 组对拍: 全部一致 ===")
+        return 0
+    print(f"=== {n_groups} 组对拍: {len(diffs)} 处差异 ===")
+    return 1
 
 
 if __name__ == "__main__":

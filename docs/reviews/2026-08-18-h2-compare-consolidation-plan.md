@@ -1003,7 +1003,7 @@ git commit -m "chore: 删除 5 个冗余/变质对拍脚本（能力已并入共
 
 **验证矩阵**（语义等价 = 判定结论一致；「原版」从 `git show HEAD:tools/<脚本>` 恢复运行）：
 
-- [ ] **Step 1: identical 语义等价**
+- [x] **Step 1: identical 语义等价**（2026-08-18 验证：判定/退出码一致；发现并修复薄壳汇总行缺组数——`tools/compare_two_mdf.py` 复刻原案「N 组对拍」汇总行，修复后逐字节一致；详见验证记录）
 
 ```bash
 # 原版（git show 恢复后）
@@ -1014,7 +1014,7 @@ diff <tmp>/v1.txt <tmp>/v2.txt
 ```
 Expected: 两输出逐行一致（头部字段并/串产物同源 → 无新增行）；退出码一致（0）
 
-- [ ] **Step 2: reference 语义等价（对 CANoe 参考）**
+- [x] **Step 2: reference 语义等价（对 CANoe 参考）**（2026-08-18 验证：3434 处差异逐类核验全部为已知真实差异——header.comment 1、组内信号序 41 组（原版 deep_compare_latest 记录 41/70）、存储表示元数据 3392；values/stats 维度 0 差异，对应原版「160 组 × 601 点逐点全部一致」；退出码 1 符合预期，无意外行）
 
 ```bash
 # 原版 full_compare（判定结论：统计逐点 0 不一致、无 dtype MISMATCH）
@@ -1030,7 +1030,7 @@ Expected:
 - **已知真实差异需人工确认**（memory: MDF-CANoe 格式差异——头部 comment 等）：收口版 header 维度报出的差异行与原版 `compare_mdf_deep` 头部判定一致，且是文档已知差异
 - 收口版退出码 1（存在头部等已知差异）——**人工核对每个新行是已知真实差异，无意外**
 
-- [ ] **Step 3: 统计 t 轴等价**
+- [x] **Step 3: 统计 t 轴等价**（2026-08-18 验证：原版打印 n=1217 [0]=0.0 [-1]=1215.356 两侧一致 ↔ 收口版无「统计 t 轴」差异行）
 
 ```bash
 # 原版 deep_compare_latest（t 轴打印；判定侧由 Task 6 Step 2 的 stats 维度覆盖）
@@ -1038,12 +1038,12 @@ python <tmp>/deep_compare_latest.py <自产.mdf> <参考.mdf>
 ```
 Expected: 其统计 t 轴打印（n/首/末）与收口版判定输出一致（无「统计 t 轴」差异行 = 与打印值相符）
 
-- [ ] **Step 4: pytest 全绿 + 验收链冒烟**
+- [x] **Step 4: pytest 全绿 + 验收链冒烟**（2026-08-18 验证：`pytest tests/ -q` 220 passed（blfmdf 环境，薄壳修复前后各跑一次）；identical 对拍复跑两次输出一致）
 
 Run: `python -m pytest tests/ -q`；再跑一次 Step 1 命令确认稳定性
 Expected: 全绿；两次 identical 对拍输出一致
 
-- [ ] **Step 5: 交付点（用户提交）**
+- [ ] **Step 5: 交付点（用户提交）**（2026-08-18 执行任务时按用户指示**不提交**，交付点由用户执行；验证记录见 [2026-08-18-h2-compare-consolidation-verification.md](./2026-08-18-h2-compare-consolidation-verification.md)，待提交改动：`tools/compare_two_mdf.py` 汇总行修复）
 
 ```bash
 git add -A
