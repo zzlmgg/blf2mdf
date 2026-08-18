@@ -3,6 +3,8 @@
 日期：2026-08-18　|　审查范围：core/（9 模块）、gui/（5 模块）、main.py、tests/（19 文件）、tools/（18 脚本）、blf2mdf.spec　|　分支：arc（22cb7ff，H1 落地后现状）
 
 > **2026-08-18 更新（H1 落地后，基准 commit 22cb7ff）**：§3 H1/H2 均标 ✅ 完成（H2 原为计划状态、H1 无状态）；§2.1 tools/tests 数量刷新（tools 21→18、tests 17→19 文件）；§4 候选 F 已落地、tools 收口范围如实修正；§5 首要建议由「先做 F」改为「D → C → G → B → A」。全量 pytest 现状：**249 passed / 0 失败**（anaconda3 实测，2026-08-18）。
+>
+> **2026-08-18 更新（D 实施完成后）**：§3 M3 标 ✅ 完成；§4 候选 D 已落地；§5 首要建议改为「C → G → B → A」；§2.1 行数刷新（converter 536→531、mdf_writer 130→145）；全量 pytest 现状：**253 passed / 0 失败**（anaconda3 实测，2026-08-18，249 基线 + 4 新增）。D 实施按项目惯例未 commit（由用户执行）。
 
 ## 0. 摘要
 
@@ -36,11 +38,11 @@
 |---|---|---|---|
 | core/blf_reader.py | 454 | BLF 标量解析（oracle）+ 探测 | `Frame`、`probe_channels`、`read_start_time`、`list_channels`、`iter_messages`、`ScanCancelled`（全项目取消异常唯一定义点） |
 | core/blf_vector.py | 456 | H1 向量化快路径 + 回退编排 | `ContainerFrames`（packed/scattered 双契约）、`iter_container_frames`（快路径失败回退标量，决策唯一收口点） |
-| core/converter.py | 536 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由） |
+| core/converter.py | 531 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由） |
 | core/decoder.py | 453 | 帧→信号物理值 | `SignalSeries`、`DecodeStats`、`ChannelDecoder`、`decode_channel`（测试面包装） |
 | core/mp_finish.py | 279 | 并行 per-bucket finish | `make_pool`、`bucket_bytes`、`finish_all`（结果与串行 finish 同形） |
 | core/stats.py | 154 | CANoe 1s 统计语义 | `STAT_NAMES`/`STAT_CHANNELS`、`aggregate_channel`（deep）、`align_timestamps`（时间网格规则唯一实现）、`ChannelStats` |
-| core/mdf_writer.py | 130 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`；import 时改 asammdf 全局压缩级别 |
+| core/mdf_writer.py | 145 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`（无残留契约：抛出时本次调用不留下任何输出文件）；import 时改 asammdf 全局压缩级别 |
 | core/dbc_loader.py | 108 | DBC 域模型 | `SignalDef`/`MessageDef`/`DbcDef`（messages 键归一化构造单点）、`load` |
 | core/project_loader.py | 125 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
 | gui/main_window.py | 981 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`_find_ccu3_root` |
@@ -121,10 +123,11 @@ ConvertWorker.run
 - 方向：归一化收敛为一个归属点，三处改为调用。
 
 **M3. 半成品 .mf4 清理收口分裂：命名知识泄漏 + 清理双份**
-- 位置：[mdf_writer.py:129-130](../../core/mdf_writer.py#L129-L130)（save 写 `<out>.mf4` 再 `os.replace`）；[converter.py:511-517](../../core/converter.py#L511-L517) 与 [519-523](../../core/converter.py#L519-L523) 两份硬编码 `<out>.mf4` 清理
+- 位置：[mdf_writer.py:133-145](../../core/mdf_writer.py#L133-L145)（save/replace 包入 try/except BaseException 自清理，修复前 save/replace 无保护）；converter 修复前 :511-523 两份硬编码 `<out>.mf4` 清理（现已删除，仅剩取消分支 :513-518）
 - 违反：④ 收口
 - 证据：converter 复述 writer 的中间文件命名（deletion test：writer 改临时文件策略则 converter 清理静默失效）；writer 自身失败时不清理——任何其他调用方直接调 write_mdf 都会留残留。
 - 方向：「失败无残留」成为 write_mdf 自身契约（内部 try/清理），converter 仅保留取消语义分支。
+- **状态：✅ 已完成**（2026-08-18，[spec D](./2026-08-18-d-write-no-residue-spec.md)）——无残留契约收进 write_mdf：save/replace 包入 try/except BaseException，失败清理本次写出的半成品 `<stem>.mf4`、out_path 保持调用前状态（旧产物保留，失败 ≠ 全清），清理自身失败静默吞掉、主异常优先上抛；converter 异常清理分支整体删除，取消分支简化为 `Path(out_path).unlink(missing_ok=True)`（取消 = 放弃本次转换的 converter 业务语义，不属于 writer 失败契约）。deletion test 通过：writer 改临时文件策略不再让 converter 清理静默失效。测试 5 项：writer 3 个注入点（save 失败 / replace 失败 / KeyboardInterrupt，均断言半成品被清理 + 旧产物保留）+ converter 纯传播测试 + 写后取消状态机测试（取消条件 = write_mdf 完成标志，不依赖检查点计数，对 fixture 通道数变化免疫）。全量 253 passed。
 
 **M4. 绑定匹配契约以「显示名字符串」跨三模块，且决策算法嵌在表格操作里**
 - 位置：display_name 定义 [dbc_loader.py:41-48](../../core/dbc_loader.py#L41-L48)；auto_bindings 返回 {通道: 显示名}（[project_loader.py:112-125](../../core/project_loader.py#L112-L125)，docstring 明说「匹配直接以显示名比对」）；GUI 端 [main_window.py:616-622](../../gui/main_window.py#L616-L622)（combo 文本 in valid）、:811-820（`_dbc_by_display` 逐项文本比对）；决策算法 `_rebuild_channel_table`（:575-633）含双键型契约（auto 键 int、prev 键 "CANn" 字符串，注释明言不可混用）
@@ -183,7 +186,7 @@ ConvertWorker.run
 | A. 桶记录类型化 + owner 集中（M1） | **Strong** | 桶已有两个生产者（feed 列表、向量化 blocks）+ 一个归一化 adapter——接缝真实，但接口是隐式多态 dict。类型化不增层级、只浓缩契约 |
 | B. 绑定决策抽无 Qt 纯函数（M4） | **Strong** | 全 GUI 分区唯一真正的算法，有已发生 bug 史；当前测试面必须穿越 Qt。抽纯后测试成本骤降、981 行主类直接缩短 |
 | C. 归一化键单一来源（M2） | **Strong** | 三处调用点收敛一处，改动小、无争议 |
-| D. write_mdf 失败无残留归 writer（M3） | ✅ 已 grilling（2026-08-18） | 契约已定：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
+| D. write_mdf 失败无残留归 writer（M3） | ✅ 已落地（2026-08-18） | 契约已实施：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化为 unlink(missing_ok=True)。5 个新测试；全量 253 passed。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
 | F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题：compare 族 7 脚本 → mdf_compare 深模块 + 2 CLI 薄壳（tools 21→18；**8 个 bench/probe 可删脚本未动**——M8/L9 残留，H1 spec 明示 Out of Scope）；oracle 获 41 用例黄金测试 + CLI 退出码进程契约 + STAT_NAMES 双副本锁定。行为等价验证通过（H2 验证记录：identical 与原版逐字节一致、reference 3434 处判定差异全部核验为已知真实差异）；全量 pytest 现状 249 passed / 0 失败。详见 [H2 验证记录](./2026-08-18-h2-compare-consolidation-verification.md) / [H1 spec](./h1/2026-08-18-h1-oracle-protection-spec.md) |
 | G. ChannelStats 通道身份显式化或删死字段（L2） | **Strong** | 消除「顺序即通道」隐式不变量，纯减复杂度；deletion test：无人读它，删之复杂度不转移 |
@@ -204,15 +207,14 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已 grilling 完毕、spec 已出（2026-08-18）。下一步按原计划顺序推进：D 实施 → C → G → B → A——当前最需要做的是实施 D。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）。下一步按原计划顺序推进：C → G → B → A——当前最需要做的是 C（归一化键单一来源）。**
 
 理由：
-1. **D（write_mdf 失败无残留归 writer）是最小的纯收口**：把「失败无残留」收进 write_mdf 自身契约（内部 try/清理），[converter.py:511-523](../../core/converter.py#L511-L523) 两份硬编码 `<out>.mf4` 清理分支随之删除——deletion test 通过（writer 改临时文件策略不再让 converter 清理静默失效）。单文件改动、不触碰性能前提与对拍链、独立可回退，符合「任一验收失败即停」的项目纪律。**已 grilling 完毕（2026-08-18）**：契约 = 失败清理本次半成品、out_path 保留旧产物（失败 ≠ 全清）、BaseException 覆盖、取消留 converter 侧；测试 seam 2 个均为现有。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md)。
-2. **C（归一化键单一来源）**：三处调用（dbc_loader.py:77 / decoder.py:417 / converter.py:120）收敛一处，改动小无争议，D 后顺手可做。
-3. **G（ChannelStats 死字段）**：deletion test 通过（无人读它），纯减复杂度。
-4. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
-5. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
-6. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
+1. **C（归一化键单一来源）是当前最小的纯收口**：三处调用（dbc_loader.py:77 / decoder.py:417 / converter.py:120）收敛一处，改动小无争议，不触碰性能前提与对拍链、独立可回退，符合「任一验收失败即停」的项目纪律。C 也是下一轮 warm-up：唯一涉及跨 3 模块修改规则的小改（改键规则需同改 3 处的成本已被 M2 实证）。
+2. **G（ChannelStats 死字段）**：deletion test 通过（无人读它），纯减复杂度，C 后顺手可做。
+3. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。排在收口类之后单独排期。
+4. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
+5. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
 
 ---
 
@@ -234,4 +236,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已 grilling 完毕、spec 已出（2026-08-18）**，实施任务粒度见 [D spec](./2026-08-18-d-write-no-residue-spec.md)；候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，D 实施后的下一候选为 **C（归一化键单一来源）**。
+**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**，实施记录见 [D spec](./2026-08-18-d-write-no-residue-spec.md)；候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **C（归一化键单一来源）**。

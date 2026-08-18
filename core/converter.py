@@ -308,7 +308,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
 
     cancel_cb() 可选：读取（每 1024 帧）、解码（串行逐通道/并行每桶）、
     写 MDF 前后检查，置位即 raise ScanCancelled；写 MDF 期间（asammdf
-    无取消钩子）点取消 → 删除已写输出与半成品 .mf4 后抛出。
+    无取消钩子）点取消 → 删除已写完整输出后抛出（失败清理在 write_mdf
+    内部——无残留契约，见 CONTEXT.md）。
     """
     channels = sorted(bindings)
     if not channels:
@@ -504,22 +505,16 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         # 取消检查点：写 MDF 前（取消则不写，无输出残留）
         _check_cancel(cancel_cb)
         t_write = time.perf_counter()
-        try:
-            mdf_writer.write_mdf(all_series, raw_groups, out_path,
-                                 abs_start_seconds=abs_start_time,
-                                 stats_groups=stats_groups)
-        except Exception:
-            # write_mdf 先写 <out>.mf4 再 rename 成 out_path（见 mdf_writer.py）：
-            # save 失败留 .mf4，rename 失败两者都在，半成品都要清。
-            for p in (out_path, Path(out_path).with_suffix(".mf4")):
-                if os.path.exists(p):
-                    os.remove(p)
-            raise
-        # 取消检查点：写入期间（asammdf 无取消钩子）点取消 → 清理已写输出
+        # 无残留契约在 write_mdf 内部（失败清理本次半成品，见 CONTEXT.md）；
+        # converter 不重复清理（deletion test：writer 改临时文件策略不连带 converter）
+        mdf_writer.write_mdf(all_series, raw_groups, out_path,
+                             abs_start_seconds=abs_start_time,
+                             stats_groups=stats_groups)
+        # 取消检查点：写入期间（asammdf 无取消钩子）点取消 → 删除完整产物
+        #（写成功后 .mf4 已被 replace 消费，无半成品残留；删 out_path 是
+        #「取消 = 放弃本次转换」的 converter 业务语义，不属于 writer 失败契约）
         if cancel_cb is not None and cancel_cb():
-            for p in (out_path, Path(out_path).with_suffix(".mf4")):
-                if os.path.exists(p):
-                    os.remove(p)
+            Path(out_path).unlink(missing_ok=True)
             raise ScanCancelled()
         timings.append(("写 MDF", time.perf_counter() - t_write))
         if progress_cb:

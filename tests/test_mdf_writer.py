@@ -202,3 +202,62 @@ def test_same_message_across_channels_dedupe(tmp_path):
     m = MDF(str(out))
     names = sorted(g.channel_group.acq_name for g in m.groups)
     assert names == ["CAN5::MsgA", "MsgA"]
+
+
+# ---- 无残留契约（2026-08-18 spec D：write_mdf 失败无残留归 writer）----
+
+def test_write_mdf_save_failure_leaves_no_residue(tmp_path, monkeypatch):
+    """无残留（CONTEXT.md）：save 失败时 <stem>.mf4 半成品被清理，out_path 保持
+    调用前状态——旧产物保留，不做「失败即全清」。"""
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "out.mdf"
+    out.write_bytes(b"previous")  # 上一次成功产物
+    mf4 = tmp_path / "out.mf4"
+
+    def boom(self, *args, **kwargs):
+        # 模拟 asammdf save 写出部分内容后失败
+        mf4.write_bytes(b"partial")
+        raise OSError("simulated save failure")
+
+    monkeypatch.setattr(MDF, "save", boom)
+    with pytest.raises(OSError):
+        write_mdf([s], [], str(out))
+    assert not mf4.exists(), "半成品 .mf4 应被清理"
+    assert out.read_bytes() == b"previous", "旧产物应保留（失败 ≠ 全清）"
+
+
+def test_write_mdf_replace_failure_leaves_no_residue(tmp_path, monkeypatch):
+    """无残留：save 成功、os.replace 失败（第二个注入点）——此时 .mf4 半成品
+    真实存在，同样被清理；out_path 未被本次调用触碰，旧产物保留。"""
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "out.mdf"
+    out.write_bytes(b"previous")
+    mf4 = tmp_path / "out.mf4"
+
+    def boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("core.mdf_writer.os.replace", boom)
+    with pytest.raises(OSError):
+        write_mdf([s], [], str(out))
+    assert not mf4.exists(), "save 已完成、replace 失败：半成品 .mf4 应被清理"
+    assert out.read_bytes() == b"previous", "replace 原子失败：out_path 应保持调用前状态"
+
+
+def test_write_mdf_keyboard_interrupt_cleans_partial(tmp_path, monkeypatch):
+    """无残留（D3：BaseException）：KeyboardInterrupt（Ctrl+C）同样清理半成品
+    并上抛——任何异常路径都不留残留，主异常不被吞。"""
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "out.mdf"
+    out.write_bytes(b"previous")
+    mf4 = tmp_path / "out.mf4"
+
+    def boom(self, *args, **kwargs):
+        mf4.write_bytes(b"partial")
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(MDF, "save", boom)
+    with pytest.raises(KeyboardInterrupt):
+        write_mdf([s], [], str(out))
+    assert not mf4.exists(), "KeyboardInterrupt 也应清理半成品 .mf4"
+    assert out.read_bytes() == b"previous"

@@ -189,22 +189,19 @@ def test_convert_no_channels_raises(tmp_path, blf_and_dbc):
         convert(blf, {}, str(tmp_path / "x.mdf"))
 
 
-def test_convert_write_failure_cleans_partial_files(tmp_path, blf_and_dbc, monkeypatch):
-    """写 MDF 失败：异常上抛，且 <out>.mf4 半成品与 out_path 都被清理。"""
+def test_convert_write_failure_propagates(tmp_path, blf_and_dbc, monkeypatch):
+    """写 MDF 失败：convert 上抛且不重复清理——无残留契约归 write_mdf
+    （2026-08-18 spec D），清理语义由 writer 层测试守护，converter 不复述
+    中间文件命名（deletion test：writer 改临时文件策略不连带 converter）。"""
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "out.mdf"
-    mf4 = tmp_path / "out.mf4"
 
     def boom(*args, **kwargs):
-        # 模拟 asammdf save 写出 .mf4 后、rename 前失败
-        mf4.write_bytes(b"partial")
         raise OSError("simulated write failure")
 
     monkeypatch.setattr("core.converter.mdf_writer.write_mdf", boom)
     with pytest.raises(OSError):
         convert(blf, {1: load(dbc_path)}, str(out))
-    assert not out.exists(), "out_path 不应残留"
-    assert not mf4.exists(), "半成品 .mf4 应被删除"
 
 
 def test_convert_stats_export_default_ones_groups(tmp_path, blf_and_dbc):
@@ -325,6 +322,38 @@ def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
         convert(blf, {1: load(dbc_path), 2: load(dbc_path)}, str(out),
                 parallel=True, cancel_cb=cancel)
     assert not out.exists()
+
+
+def test_convert_cancel_after_write_discards_output(tmp_path, blf_and_dbc,
+                                                    monkeypatch):
+    """写后取消分支（2026-08-18 spec D5 唯一剩余清理）：write_mdf 成功返回后
+    cancel_cb 置位 → 完整产物被删除 + ScanCancelled。删除完整产物是
+    「取消 = 放弃本次转换」的 converter 业务语义（CONTEXT.md：取消不是失败）。
+
+    取消条件 = write_mdf 已完成的标志（状态机，非检查点计数）：前面所有
+    检查点（读取后/解码/写前）均放行，第一个写后检查点必然置位——精确命中
+    写后分支，fixture 通道数变化不破坏本测试。written 守护：若写后检查点
+    被移除，convert 正常返回、pytest.raises 失败（测试立即暴露）。"""
+    import core.converter
+
+    blf, dbc_path = blf_and_dbc
+    out = tmp_path / "post_cancel.mdf"
+    state = {"written": False}
+    orig_write = core.converter.mdf_writer.write_mdf
+
+    def tracked_write(*args, **kwargs):
+        state["written"] = True
+        return orig_write(*args, **kwargs)
+
+    monkeypatch.setattr("core.converter.mdf_writer.write_mdf", tracked_write)
+
+    def cancel():
+        return state["written"]
+
+    with pytest.raises(ScanCancelled):
+        convert(blf, {1: load(dbc_path)}, str(out), cancel_cb=cancel)
+    assert state["written"], "取消必须发生在 write_mdf 完成后（否则测试空过）"
+    assert not out.exists(), "取消 = 放弃本次转换：完整产物应被删除"
 
 
 # ---- 阶段计时（GUI 日志用）----

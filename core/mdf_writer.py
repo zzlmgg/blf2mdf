@@ -49,6 +49,10 @@ def write_mdf(signal_series_list: list[SignalSeries],
               raw_groups: list[RawGroup], out_path: str,
               abs_start_seconds: float | None = None,
               stats_groups: list[ChannelStats] | None = None) -> None:
+    """写出 MDF 4.10 文件。无残留契约（CONTEXT.md）：本函数抛出（含
+    BaseException）时，本次调用不留下任何输出文件——半成品被清理，
+    out_path 保持调用前状态（旧产物保留）。"""
+
     # asammdf 8.8：append 无 group_name 参数，组名 = ChannelGroup.acq_name；
     # 每次 append 新建一组，同一组的所有信号须一次传入（列表）。
     # 主时间通道名由首信号的 master_metadata 决定（默认 "time"），
@@ -126,5 +130,16 @@ def write_mdf(signal_series_list: list[SignalSeries],
 
     # compression=2（转置 + deflate）：参考 CANoe 高压缩输出（修复项 7，计划实测 326 MB → 4 MB 量级）；
     # 压缩透明，读回自动解压。asammdf 8.8 的 save 强制 .mf4 后缀。
-    mdf.save(out_path, overwrite=True, compression=2)
-    os.replace(Path(out_path).with_suffix(".mf4"), out_path)
+    try:
+        mdf.save(out_path, overwrite=True, compression=2)
+        os.replace(Path(out_path).with_suffix(".mf4"), out_path)
+    except BaseException:
+        # 无残留契约（2026-08-18 spec D）：失败时清理本次写出的半成品 <stem>.mf4，
+        # out_path 保持调用前状态（旧产物保留）。save 实际写入恒为 <stem>.mf4
+        #（asammdf 无条件 with_suffix(".mf4")）；replace 成功则 .mf4 已消费、此处
+        # no-op。清理自身失败（文件被锁等）静默吞掉，主异常优先上抛。
+        try:
+            Path(out_path).with_suffix(".mf4").unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
