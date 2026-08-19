@@ -9,6 +9,8 @@
 > **2026-08-18 更新（C 实施完成后）**：§3 M2 标 ✅ 完成；§4 候选 C 已落地；§5 首要建议改为「G → B → A」；§2.1 行数刷新（converter 531→530、dbc_loader 108→126、tests/test_dbc_loader 113→134）；全量 pytest 现状：**259 passed / 0 失败**（anaconda3 实测，2026-08-18，253 基线 + 6 新增边界用例）。C 实施按项目惯例未 commit（由用户执行）。
 >
 > **2026-08-18 更新（G 实施完成后）**：§3 L2 标 ✅ 完成；§4 候选 G 已落地；§5 首要建议改为「B → A」；§2.1 行数刷新（stats 154→152）；CONTEXT.md 新增「统计组布局」词条；全量 pytest 现状：**259 passed / 0 失败**（anaconda3 实测，2026-08-18，用例数不变、零测试改动）。G 实施按项目惯例未 commit（由用户执行）。
+>
+> **2026-08-18 更新（B 实施完成后）**：§3 M4 标 ✅ 完成；§4 候选 B 已落地；§5 首要建议改为「A」；§2.1 行数刷新（main_window 981→985 净增 4：决策算法 65 行移出至新文件 gui/binding.py，新增 _collect_prev 等接线；tests 19→20 文件）；全量 pytest 现状：**269 passed / 0 失败**（anaconda3 实测，2026-08-18，259 基线 − 7 迁移 + 14 纯函数 + 3 接线）。B 实施按项目惯例未 commit（由用户执行）。
 
 ## 0. 摘要
 
@@ -18,7 +20,7 @@
 
 按词汇表表述：core 的深模块（位提取、单遍路由、窗界聚合、ContainerFrames 双契约）分布健康，但三个**真实接缝**（解码桶、绑定匹配、对拍逻辑）的接口仍是隐式多态 dict / 格式化字符串 / 不可 import 的 CLI 函数——接缝真实存在而契约没有显式成型。
 
-**2026-08-18 补充**：本文档三个真实接缝中，对拍逻辑接缝（H1/H2）已显式成型——收口为 tools/mdf_compare.py 双入口深模块并获黄金测试保护，两个「高」级问题全部修复，且修复本身零生产代码改动（core/、gui/ 未触碰）。详见 §3 状态标注。
+**2026-08-18 补充**：本文档三个真实接缝中，对拍逻辑接缝（H1/H2）已显式成型——收口为 tools/mdf_compare.py 双入口深模块并获黄金测试保护，两个「高」级问题全部修复，且修复本身零生产代码改动（core/、gui/ 未触碰）；绑定匹配接缝（M4/B）同日成型——决策抽为 gui/binding.py 无 Qt 纯函数、绑定键结构化为 DBC 路径（显示名只作展示），三个接缝仅剩解码桶（M1/A）未显式成型。详见 §3 状态标注。
 
 ---
 
@@ -49,13 +51,14 @@
 | core/mdf_writer.py | 145 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`（无残留契约：抛出时本次调用不留下任何输出文件）；import 时改 asammdf 全局压缩级别 |
 | core/dbc_loader.py | 126 | DBC 域模型 | `SignalDef`/`MessageDef`/`DbcDef`、`load`；`normalize_id`/`normalize_ids`（归一化键唯一实现，M2 收口后） |
 | core/project_loader.py | 125 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
-| gui/main_window.py | 981 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`_find_ccu3_root` |
+| gui/main_window.py | 985 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`_find_ccu3_root` |
+| gui/binding.py | 65 | 绑定决策纯函数（B 落地后新增，零 Qt import） | `BindingRow`、`decide_bindings`、`derive_state`、STATE_* 三态常量 |
 | gui/widgets.py | 421 | 无业务 PySide 展示组件（零 core 依赖） | `AppShell`、`CompactCombo`、`DbcListWidget`、`TitleBar`、`SummaryDialog` 等 |
 | gui/theme.py | 266 | 视觉令牌与 QSS | `WINDOW_WIDTH/HEIGHT`、`APP_QSS`、`apply_theme` |
 | gui/windows_effects.py | 70 | Win11 玻璃/圆角 + 软件回退 | `apply_light_glass`、`sync_rounded_window` |
 | gui/resources.py | 26 | 运行时路径与图标 | `resource_path`、`install_application_icon` |
 | main.py | 27 | 程序入口 | `main()`；`freeze_support()` 铁律 |
-| tests/ | ~4100 | 19 文件 | 见 §4（17 原始 + mdf_factory.py 共享工厂 + test_compare_cli.py CLI 契约） |
+| tests/ | ~5300 | 20 文件 | 见 §4（18 原始 + mdf_factory.py 共享工厂 + test_compare_cli.py CLI 契约；B 落地新增 test_binding.py 纯函数套件） |
 | tools/ | ~1700 | 18 脚本 | 见 §4（compare 族已收口为 mdf_compare + 2 CLI 薄壳；bench/probe 族 8 个仍可删） |
 
 ### 2.2 依赖方向与主链路
@@ -139,6 +142,7 @@ ConvertWorker.run
 - 违反：③ 契约明确、⑤
 - 证据：绑定链路 key 是格式化字符串（`PFCAN1.dbc（A19G1）`），display_name 格式一变绑定静默断裂，仅 [test_gui_binding.py:110-113](../../tests/test_gui_binding.py#L110-L113) 兜底；该文件 docstring（:1-5）记载键型 bug 真实事故史。
 - 方向：匹配键改结构化身份（显示名只作展示）；「(channels, prev, auto_bind, 有效 DBC 名) → 每行选择+状态」决策抽为无 Qt 纯函数，窗口方法退化为渲染。
+- **状态：✅ 已完成**（2026-08-18，实施 B，[spec](./2026-08-18-b-binding-decision-pure-spec.md)）——① 新建 gui/binding.py（65 行，**零 Qt import**）：`BindingRow` dataclass + `decide_bindings`（行集合并集、三态分派：prev 值有效=用户微调优先 / prev=None=显式不绑定压制 auto / prev 值无效=回退 auto 重绑、状态推导）+ `derive_state` + STATE_* 三态常量，测试免 offscreen/qapp；② 绑定键结构化：project_loader `auto_bindings` 返回 `{ch: path}`（显示名只作展示）、combo `userData=DbcDef`、`_start_convert` 直接 `currentData()`、`_dbc_by_display` 删除（零查找、零反查表）；③ `_rebuild_channel_table` 退化为渲染（收集 prev → decide_bindings → 建行/填 combo/设状态），双键型契约归一为 int 通道号 + None 显式不绑定（事故史保留 test_binding.py docstring）；④ 测试：14 纯函数用例（7 迁移 + 7 边界）+ 3 薄接线（test_gui_binding 32→28），UI 显示与操作逻辑零变化（Q9 硬约束，场景矩阵逐项核验）。双轴 code-review：Standards 轴代码 0 findings（4 项 spec 文档漂移已随修订）；Spec 轴捕获 1 个实质问题（prev 失效未回退 auto 违反 Q9 现状语义）已修复并补测试。全量 269 passed。
 
 **M5. 进度百分比带计划散布三模块**
 - 位置：解码 10→90 在 [converter.py:424-425](../../core/converter.py#L424-L425)（串行）与 [mp_finish.py:191-194](../../core/mp_finish.py#L191-L194)（并行）各自写死；读取 5→10、统计 92→95 另在 converter 两处
@@ -189,7 +193,7 @@ ConvertWorker.run
 | 候选 | 强度 | 说明 |
 |---|---|---|
 | A. 桶记录类型化 + owner 集中（M1） | **Strong** | 桶已有两个生产者（feed 列表、向量化 blocks）+ 一个归一化 adapter——接缝真实，但接口是隐式多态 dict。类型化不增层级、只浓缩契约 |
-| B. 绑定决策抽无 Qt 纯函数（M4） | **Strong** | 全 GUI 分区唯一真正的算法，有已发生 bug 史；当前测试面必须穿越 Qt。抽纯后测试成本骤降、981 行主类直接缩短 |
+| B. 绑定决策抽无 Qt 纯函数（M4） | ✅ 已落地（2026-08-18） | 决策抽为 gui/binding.py 纯函数（65 行零 Qt）+ 绑定键结构化（路径）+ userData=DbcDef 直取、`_dbc_by_display` 删除；14 纯函数用例免 Qt + 3 薄接线；双键型契约归一；269 passed。详见 §3 M4 状态 |
 | C. 归一化键单一来源（M2） | ✅ 已落地（2026-08-18） | 归一化键唯一实现落 dbc_loader（`normalize_id`/`normalize_ids`/`_EFF_BIT`），三处调用点 + oracle 全部改调；6 项边界测试；259 passed。详见 §3 M2 状态 |
 | D. write_mdf 失败无残留归 writer（M3） | ✅ 已落地（2026-08-18） | 契约已实施：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化为 unlink(missing_ok=True)。5 个新测试；全量 253 passed。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
 | E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
@@ -212,11 +216,11 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）。下一步按原计划顺序推进：B → A——当前最需要做的是 B（绑定决策抽无 Qt 纯函数）。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）；B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）。下一步：A（桶契约类型化）——唯一剩余 Strong 候选。**
 
 理由：
-1. **B（绑定决策抽无 Qt 纯函数）是真正的深化项目**：全 GUI 分区唯一有 bug 史的算法，当前 35 处测试必须穿越 Qt 对象图；981 行主类靠它缩短。收口类（C/D/M3/G/L2）至此全部落地，架构剩余主要工作重心转入 GUI 侧。
-2. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），留在最后，评估以 master plan 逐位对拍链为验收。
+1. **B（绑定决策抽无 Qt 纯函数）已落地**：全 GUI 分区唯一有 bug 史的算法抽为 gui/binding.py 纯函数，14 个决策用例不再穿越 Qt 对象图；绑定键结构化（路径）后显示名格式变更不再静默断裂。收口类（C/D/M3/G/L2/B/M4）至此全部落地，架构剩余主要工作重心转入 core 侧。
+2. **A（桶契约类型化）触及单遍扫描性能前提**（M1 方向已注明「需评估后动」），是剩余唯一 Strong 候选，评估以 master plan 逐位对拍链为验收。
 3. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
 
 ---
@@ -239,4 +243,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态；**G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 L2 状态。候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **B（绑定决策抽无 Qt 纯函数）**。
+**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态；**G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 L2 状态；**B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）**，实施记录见 §3 M4 状态。候选表中其余条目只描述问题与方向、未设计接口。按 §5 顺序，下一候选为 **A（桶契约类型化）**——最后剩余 Strong 候选，触及单遍扫描性能前提，需评估后动。

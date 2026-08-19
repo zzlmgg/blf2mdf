@@ -65,7 +65,8 @@ def _run_probe() -> int:
     win.out_edit.setText(str(out))
     d = load(str(dbc))
     win.dbc_list = [d]
-    win._rebuild_channel_table([1, 2], auto={1: d.display_name})
+    win.auto_bind = {1: d.path}
+    win._rebuild_channel_table([1, 2], prev=None)
 
     started = time.time()
     win._start_convert()

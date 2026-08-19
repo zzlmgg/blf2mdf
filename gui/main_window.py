@@ -18,6 +18,13 @@ from core import blf_reader, project_loader
 from core.blf_reader import ScanCancelled
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
+from gui.binding import (
+    STATE_BOUND,
+    STATE_NOT_EXPORTED,
+    STATE_NO_DATA,
+    decide_bindings,
+    derive_state,
+)
 from gui.resources import application_icon
 from gui.theme import WINDOW_HEIGHT, WINDOW_WIDTH
 from gui.widgets import (
@@ -164,7 +171,7 @@ class MainWindow(QMainWindow):
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
         self.blf_channels: list[int] = []
         self.dbc_list: list[DbcDef] = []
-        # 当前项目的自动绑定建议 {通道: DBC 显示名}；未选项目为 None。
+        # 当前项目的自动绑定建议 {通道: DBC 文件路径}；未选项目为 None。
         # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
         self.auto_bind: dict[int, str] | None = None
         self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
@@ -526,7 +533,7 @@ class MainWindow(QMainWindow):
         self.blf_path = path
         self.blf_edit.setText(path)
         self.blf_channels = channels
-        self._rebuild_channel_table(channels)
+        self._rebuild_channel_table(channels, prev=self._collect_prev())
         self._set_default_output()
         self.convert_btn.setEnabled(True)
         # 加载耗时记入日志（测试直调 _on_scan_done 时无 _load_start → 不记耗时）
@@ -573,64 +580,67 @@ class MainWindow(QMainWindow):
         self.out_edit.setText(str(source.with_name(f"{source.stem}_t.mdf")))
 
     def _rebuild_channel_table(self, channels: list[int],
-                               auto: dict[int, str] | None = None,
-                               keep_prev: bool = True):
-        """重建通道表。绑定优先级：
+                               prev: dict[int, str | None] | None = None):
+        """重建通道表：绑定决策委托 decide_bindings（gui/binding.py 纯函数）。
 
-        1. auto（选项目时传入）：标准映射为准，覆盖旧选择——
-           选项目 = 重新套用该项目的自动匹配，用户事后微调；
-        2. prev（keep_prev=True 时记录）：添加/移除 DBC 不丢失用户选择；
-        3. self.auto_bind：已选项目但 BLF 后加载时的兜底（此时无 prev）。
-
-        行集合 = BLF 通道 ∪ 映射通道：映射是完整规格（如 PFCAN2—CAN15），
-        日志中无数据的映射通道也显示（状态「无数据」），不让匹配对静默缺失。
+        选择优先级：prev（上次选择，含显式「不绑定」）→ auto 建议 → 不绑定；
+        行集合 = BLF 通道 ∪ 映射通道（映射是完整规格，日志中无数据的映射
+        通道也显示，状态「无数据」）。选项目时传 prev=None（重新套用自动
+        匹配）；添加/移除 DBC 与 BLF 加载时传 _collect_prev()（保留用户选择）。
         """
-        blf_channels = set(channels)
-        mapped = set(self.auto_bind or {})
-        all_channels = sorted(blf_channels | mapped)
-        prev = {}
-        if keep_prev:
-            for r in range(self.table.rowCount()):
-                combo = self.table.cellWidget(r, 1)
-                if combo is not None and self.table.item(r, 0) is not None:
-                    prev[self.table.item(r, 0).text()] = combo.currentText()
+        rows = decide_bindings(channels, self.auto_bind, prev,
+                               [d.path for d in self.dbc_list])
         self.table.setRowCount(0)
-        for ch in all_channels:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            name = f"CAN {ch}"
+        for row in rows:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            name = f"CAN {row.channel}"
             channel_item = QTableWidgetItem(name)
             channel_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
             )
-            self.table.setItem(row, 0, channel_item)
-            self.table.setItem(row, 2, QTableWidgetItem(
-                "无数据" if ch not in blf_channels else "不导出"))
+            self.table.setItem(r, 0, channel_item)
+            self.table.setItem(r, 2, QTableWidgetItem(row.state))
             combo = DbcCombo()
             combo.addItem(UNBOUND)
             for dbc in self.dbc_list:
-                combo.addItem(dbc.display_name)
-            valid = [combo.itemText(i) for i in range(combo.count())]
-            # auto/self.auto_bind 键为 int 通道号（与 auto_bindings 契约一致）；
-            # prev 键为 "CANn" 字符串（来自表格显示名）。键型不可混用。
-            if auto is not None and ch in auto and auto[ch] in valid:
-                combo.setCurrentText(auto[ch])
-            elif name in prev and prev[name] in valid:
-                combo.setCurrentText(prev[name])
-            elif self.auto_bind is not None and ch in self.auto_bind \
-                    and self.auto_bind[ch] in valid:
-                combo.setCurrentText(self.auto_bind[ch])
-            self.table.setCellWidget(row, 1, combo)
+                combo.addItem(dbc.display_name, userData=dbc)
+            if row.binding is not None:
+                for i in range(combo.count()):
+                    data = combo.itemData(i)
+                    if data is not None and data.path == row.binding:
+                        combo.setCurrentIndex(i)
+                        break
+            self.table.setCellWidget(r, 1, combo)
             combo.currentIndexChanged.connect(
-                lambda _idx, r=row: self._update_status(r)
+                lambda _idx, r=r: self._update_status(r)
             )
-            if ch not in blf_channels:
+            if row.state == STATE_NO_DATA:
                 # 无数据行保持「无数据」；用户手动改下拉后由信号接管为绑定态
-                self._set_status_item(row, "无数据")
+                self._set_status_item(r, STATE_NO_DATA)
             else:
-                self._update_status(row)
-        self.channel_count_label.setText(f"{len(all_channels)} 路")
+                self._update_status(r)
+        self.channel_count_label.setText(f"{len(rows)} 路")
         self._apply_column_widths()
+
+    def _collect_prev(self) -> dict[int, str | None]:
+        """收集当前表格的用户选择 {int 通道号: DBC 路径 | None}。
+
+        None = 用户明确选择「不绑定」（重建时压制 auto 建议，与现状
+        keep_prev 收集 "不绑定" 语义一致）；通道号从行显示名解析
+        （"CAN 1" → 1）——prev 键与 auto_bindings 同为 int，双键型
+        契约（auto int / prev "CANn"）在此归一。
+        """
+        prev = {}
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            combo = self.table.cellWidget(r, 1)
+            if item is None or combo is None:
+                continue
+            data = combo.currentData()
+            prev[int(item.text().split()[-1])] = (
+                data.path if data is not None else None)
+        return prev
 
     def _apply_column_widths(self):
         """紧凑通道表列宽：状态列仅保留结果文字所需空间。"""
@@ -657,9 +667,15 @@ class MainWindow(QMainWindow):
         """兼容旧调用；新表格宽度由右侧卡片布局管理。"""
 
     def _update_status(self, row: int):
+        """用户改下拉后的状态接管：以当前选择为准（derive_state(True, _)）。
+
+        无数据行的「无数据」只在初始渲染由 decide_bindings 设定；用户
+        动过下拉后状态由这里接管为绑定态/不导出，不回到「无数据」（Q9）。
+        """
         combo = self.table.cellWidget(row, 1)
-        status = "已绑定" if combo.currentText() != UNBOUND else "不导出"
-        self._set_status_item(row, status)
+        data = combo.currentData()
+        self._set_status_item(
+            row, derive_state(True, data.path if data is not None else None))
 
     def _set_status_item(self, row: int, text: str):
         """统一状态文字、颜色和列内对齐。"""
@@ -667,9 +683,9 @@ class MainWindow(QMainWindow):
         item.setText(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         colors = {
-            "已绑定": "#207e4b",
-            "不导出": "#a56400",
-            "无数据": "#8d9096",
+            STATE_BOUND: "#207e4b",
+            STATE_NOT_EXPORTED: "#a56400",
+            STATE_NO_DATA: "#8d9096",
         }
         item.setForeground(QBrush(QColor(colors[text])))
 
@@ -693,7 +709,8 @@ class MainWindow(QMainWindow):
             return
         self.dbc_list.pop(row)
         self._refresh_dbc_items()
-        self._rebuild_channel_table(self.blf_channels)
+        self._rebuild_channel_table(self.blf_channels,
+                                    prev=self._collect_prev())
 
     def _remove_selected_dbcs(self):
         """从面板移除所有选中 DBC；不影响磁盘上的原始文件。"""
@@ -710,7 +727,8 @@ class MainWindow(QMainWindow):
             if 0 <= row < len(self.dbc_list):
                 self.dbc_list.pop(row)
         self._refresh_dbc_items()
-        self._rebuild_channel_table(self.blf_channels)
+        self._rebuild_channel_table(self.blf_channels,
+                                    prev=self._collect_prev())
 
     def _add_dbc(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择 DBC 文件", "",
@@ -727,7 +745,8 @@ class MainWindow(QMainWindow):
             except Exception as e:  # noqa: BLE001
                 QMessageBox.critical(self, "DBC 解析失败", f"{p}\n{e}")
         self._refresh_dbc_items()
-        self._rebuild_channel_table(self.blf_channels)
+        self._rebuild_channel_table(self.blf_channels,
+                                    prev=self._collect_prev())
 
     def _select_project(self, name: str):
         """选择 ccu3.0 项目：读入该项目全部 DBC（替换现有列表）→ 按映射自动匹配。
@@ -745,8 +764,7 @@ class MainWindow(QMainWindow):
         self.dbc_list = dbcs
         self._refresh_dbc_items()
         self.auto_bind = project_loader.auto_bindings(dbcs, self.mapping)
-        self._rebuild_channel_table(self.blf_channels, auto=self.auto_bind,
-                                    keep_prev=False)
+        self._rebuild_channel_table(self.blf_channels, prev=None)
 
     def _remove_dbc(self):
         row = self.dbc_list_widget.currentRow()
@@ -776,11 +794,8 @@ class MainWindow(QMainWindow):
         bindings = {}
         for r in range(self.table.rowCount()):
             ch = int(self.table.item(r, 0).text().split()[-1])
-            text = self.table.cellWidget(r, 1).currentText()
-            if text == UNBOUND:
-                bindings[ch] = None
-            else:
-                bindings[ch] = self._dbc_by_display(text)
+            # userData = DbcDef；UNBOUND 项无 userData → None（零查找、零反查表）
+            bindings[ch] = self.table.cellWidget(r, 1).currentData()
         self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
         self._set_busy(True)
         self.progress.setValue(0)
@@ -807,17 +822,6 @@ class MainWindow(QMainWindow):
         """取消：复位界面（进度归零、按钮恢复），日志记「已取消」。"""
         self._finish()
         self._log("转换已取消", status="已取消")
-
-    def _dbc_by_display(self, text: str) -> DbcDef | None:
-        """按下拉显示名（文件名 + 文件夹，如 PFCAN2.dbc（AH8））回查 DbcDef。
-
-        同名 DBC 来自不同项目文件夹时，显示名以文件夹后缀区分（A19G1 与
-        AH8 均有 PFCAN2.dbc），逐项比对显示名即可精确命中各自文件；
-        下拉选项全部由 dbc_list 生成，理论上必有匹配，返回 None 仅为
-        防御（状态异常时按未绑定处理，不抛 StopIteration）。
-        """
-        return next((d for d in self.dbc_list if d.display_name == text),
-                    None)
 
     def _set_busy(self, busy: bool):
         for widget in (

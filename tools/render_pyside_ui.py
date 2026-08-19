@@ -41,15 +41,13 @@ def render(output: Path) -> None:
     ]
     window._refresh_dbc_items()
     window.auto_bind = {
-        0: window.dbc_list[0].display_name,
-        1: window.dbc_list[1].display_name,
-        2: window.dbc_list[2].display_name,
-        3: window.dbc_list[3].display_name,
-        8: window.dbc_list[4].display_name,
+        0: window.dbc_list[0].path,
+        1: window.dbc_list[1].path,
+        2: window.dbc_list[2].path,
+        3: window.dbc_list[3].path,
+        8: window.dbc_list[4].path,
     }
-    window._rebuild_channel_table(
-        window.blf_channels, auto=window.auto_bind, keep_prev=False
-    )
+    window._rebuild_channel_table(window.blf_channels, prev=None)
     window.convert_btn.setEnabled(True)
     window.stage_label.setText("就绪 · 已读取 6 路通道")
 

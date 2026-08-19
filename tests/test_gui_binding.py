@@ -31,86 +31,27 @@ def _d(name: str) -> DbcDef:
     return DbcDef(path=str(Path("A19G1") / name), db=None)
 
 
-def test_project_select_applies_auto_bindings(window):
-    """选项目（auto=int 键映射）后，表格每行按映射选中对应 DBC。"""
-    window.dbc_list = [_d("PFCAN1.dbc"), _d("CFCAN1.dbc")]
-    window._rebuild_channel_table([1, 13], auto={1: "PFCAN1.dbc（A19G1）",
-                                                 13: "CFCAN1.dbc（A19G1）"},
-                                  keep_prev=False)
-    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc（A19G1）"
-    assert window.table.cellWidget(1, 1).currentText() == "CFCAN1.dbc（A19G1）"
-    assert window.table.item(0, 2).text() == "已绑定"
+def test_rebuild_renders_decision_rows_to_table(window):
+    """接线：decide_bindings 的行（路径绑定 + 状态）渲染为表格显示名与状态列。
 
-
-def test_auto_bind_fallback_after_blf_load(window):
-    """BLF 晚于项目加载：无 auto 参数时由 self.auto_bind（int 键）兜底。"""
-    window.dbc_list = [_d("PFCAN1.dbc")]
-    window.auto_bind = {1: "PFCAN1.dbc（A19G1）"}
-    window._rebuild_channel_table([1])
-    assert window.table.cellWidget(0, 1).currentText() == "PFCAN1.dbc（A19G1）"
-
-
-def test_prev_selection_preserved_on_rebuild(window):
-    """添加/移除 DBC 重建时不丢失用户手动选择。"""
-    window.dbc_list = [_d("PFCAN1.dbc"), _d("CFCAN1.dbc")]
-    window._rebuild_channel_table([1])
-    combo = window.table.cellWidget(0, 1)
-    combo.setCurrentText("CFCAN1.dbc（A19G1）")
-    window._rebuild_channel_table([1])  # keep_prev=True 默认
-    assert window.table.cellWidget(0, 1).currentText() == "CFCAN1.dbc（A19G1）"
-
-
-def test_auto_bind_missing_dbc_keeps_unbound(window):
-    """auto 映射的 DBC 不在列表（AH8 缺 PFCAN2 场景）→ 保持不绑定。"""
-    window.dbc_list = [_d("PFCAN1.dbc")]
-    window._rebuild_channel_table([15], auto={15: "PFCAN2.dbc（A19G1）"},
-                                  keep_prev=False)
-    assert window.table.cellWidget(0, 1).currentText() == "不绑定"
-
-
-def test_mapping_channel_missing_from_blf_row_added(window):
-    """映射通道不在 BLF（样例 BLF 无 CAN15）：仍显示该行并绑定，
-    状态标记「无数据」——映射是完整规格，不能静默缺失。"""
-    window.dbc_list = [_d("PFCAN2.dbc"), _d("PFCAN1.dbc")]
-    window.auto_bind = {1: "PFCAN1.dbc（A19G1）", 15: "PFCAN2.dbc（A19G1）"}
-    window._rebuild_channel_table([1])  # BLF 只有 CAN1
+    决策层用路径，渲染层负责路径 → display_name 的展示转换；「无数据」
+    行保持「无数据」，用户未动下拉时状态与决策一致。
+    """
+    pfcan1 = _d("PFCAN1.dbc")
+    pfcan2 = _d("PFCAN2.dbc")
+    window.dbc_list = [pfcan1, pfcan2]
+    window.auto_bind = {1: pfcan1.path, 15: pfcan2.path}
+    window._rebuild_channel_table([1], prev=None)
     rows = {window.table.item(r, 0).text(): r
             for r in range(window.table.rowCount())}
-    assert "CAN 15" in rows
-    r15 = rows["CAN 15"]
-    assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc（A19G1）"
-    assert window.table.item(r15, 2).text() == "无数据"
-    # BLF 有的通道不受影响：CAN1 正常绑定
     r1 = rows["CAN 1"]
     assert window.table.cellWidget(r1, 1).currentText() == "PFCAN1.dbc（A19G1）"
+    assert window.table.cellWidget(r1, 1).currentData() is pfcan1
     assert window.table.item(r1, 2).text() == "已绑定"
-
-
-def test_same_name_dbc_from_two_projects_distinguishable(window):
-    """同名 DBC 来自不同项目文件夹（A19G1/AH8 均有 PFCAN2.dbc）：
-    下拉两项并存、自动绑定与手动改选均命中各自文件，不互相串绑。
-
-    场景入口是「添加 DBC…」：选项目会整体替换列表，同名单项不会共存；
-    手动添加后两个 PFCAN2.dbc 同时入列，靠文件夹后缀区分。
-    """
-    a19 = DbcDef(path=str(Path("A19G1") / "PFCAN2.dbc"), db=None)
-    ah8 = DbcDef(path=str(Path("AH8") / "PFCAN2.dbc"), db=None)
-    window.dbc_list = [a19, ah8]
-    window._rebuild_channel_table([15], auto={15: "PFCAN2.dbc（A19G1）"},
-                                  keep_prev=False)
-    combo = window.table.cellWidget(0, 1)
-    items = [combo.itemText(i) for i in range(combo.count())]
-    assert "PFCAN2.dbc（A19G1）" in items
-    assert "PFCAN2.dbc（AH8）" in items
-    assert len(items) == len(set(items))  # 同名不同文件夹 = 两项，不合并
-    # 自动绑定选中 A19G1 那份
-    assert combo.currentText() == "PFCAN2.dbc（A19G1）"
-    # 手动改选 AH8 那份 → 转换回查精确命中 AH8 的文件对象（非同名误绑）
-    combo.setCurrentText("PFCAN2.dbc（AH8）")
-    assert window._dbc_by_display(combo.currentText()) is ah8
-    assert window._dbc_by_display("PFCAN2.dbc（A19G1）") is a19
-    # 防御：未知显示名（如界面状态异常）→ None，不抛 StopIteration
-    assert window._dbc_by_display("PFCAN2.dbc（X）") is None
+    r15 = rows["CAN 15"]
+    assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc（A19G1）"
+    assert window.table.cellWidget(r15, 1).currentData() is pfcan2
+    assert window.table.item(r15, 2).text() == "无数据"
 
 
 def test_dbc_combo_ignores_mouse_wheel(window):
@@ -430,26 +371,74 @@ def test_blf_drop_rejected_during_scan(window, tmp_path, monkeypatch):
         window.scan_thread = None
 
 
-def test_project_switch_drops_stale_mapped_row(window):
-    """换项目后，旧项目映射出的「无数据」行不应残留。
+def test_start_convert_bindings_from_user_data(window, qapp, monkeypatch):
+    """接线：转换绑定从 combo userData 组装——选中行 → 对应 DbcDef 对象
+    （零查找、零反查表，_dbc_by_display 已删）。"""
+    import gui.main_window as mw
 
-    镜像 _select_project 的真实调用：以 self.blf_channels（真实 BLF 通道，
-    与表格当前行无关）作为行集基准。修复前 _select_project 传的是当前
-    表格行，会把上一项目的残留行（如 CAN15）带进来。
-    """
+    from core.converter import ConversionResult
+
+    captured = {}
+
+    def fake_convert(blf_path, bindings, out_path, **kwargs):
+        captured["bindings"] = bindings
+        return ConversionResult(summaries=[], duration_seconds=0.0,
+                                timings=[])
+
+    monkeypatch.setattr(mw, "convert", fake_convert)
+    monkeypatch.setattr(mw.QMessageBox, "exec",
+                        lambda self: mw.QMessageBox.StandardButton.Ok)
+
+    window.blf_path = r"E:\x.blf"
+    window.out_edit.setText(r"E:\x_t.mdf")
+    pfcan1 = _d("PFCAN1.dbc")
+    pfcan2 = _d("PFCAN2.dbc")
+    window.dbc_list = [pfcan1, pfcan2]
+    window.auto_bind = {1: pfcan1.path}
+    window._rebuild_channel_table([1, 15], prev=None)
+    # 行 15（无数据）用户手动改选 PFCAN2 → 绑定该文件对象
+    window.table.cellWidget(1, 1).setCurrentText("PFCAN2.dbc（A19G1）")
+    window._start_convert()
+    assert _wait_until(qapp, lambda: captured.get("bindings") is not None)
+    assert captured["bindings"][1] is pfcan1
+    assert captured["bindings"][15] is pfcan2
+    # 收尾：等 _on_done 执行完（_finish 收掉 worker 线程）再关窗——否则
+    # teardown 时 closeEvent 会因 worker 仍在运行而弹阻塞的确认框
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+    window.close()
+
+
+def test_start_convert_unbound_row_yields_none(window, qapp, monkeypatch):
+    """接线：UNBOUND 行（无 userData）→ bindings 值为 None，与现状
+    「text == UNBOUND → None」语义一致。"""
+    import gui.main_window as mw
+
+    from core.converter import ConversionResult
+
+    captured = {}
+
+    def fake_convert(blf_path, bindings, out_path, **kwargs):
+        captured["bindings"] = bindings
+        return ConversionResult(summaries=[], duration_seconds=0.0,
+                                timings=[])
+
+    monkeypatch.setattr(mw, "convert", fake_convert)
+    monkeypatch.setattr(mw.QMessageBox, "exec",
+                        lambda self: mw.QMessageBox.StandardButton.Ok)
+
+    window.blf_path = r"E:\x.blf"
+    window.out_edit.setText(r"E:\x_t.mdf")
     window.dbc_list = [_d("PFCAN1.dbc")]
-    window.blf_channels = [1]  # 真实 BLF 只有 CAN1
-    # 项目 A：映射含 15
-    window.auto_bind = {1: "PFCAN1.dbc（A19G1）", 15: "PFCAN1.dbc（A19G1）"}
-    window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
-                                  keep_prev=False)
-    assert [window.table.item(r, 0).text()
-            for r in range(window.table.rowCount())] == ["CAN 1", "CAN 15"]
-    window.auto_bind = {1: "PFCAN1.dbc（A19G1）"}  # 项目 B：映射不含 15
-    window._rebuild_channel_table(window.blf_channels, auto=window.auto_bind,
-                                  keep_prev=False)
-    assert [window.table.item(r, 0).text()
-            for r in range(window.table.rowCount())] == ["CAN 1"]
+    window.auto_bind = {1: window.dbc_list[0].path}
+    window._rebuild_channel_table([1], prev=None)
+    window.table.cellWidget(0, 1).setCurrentIndex(0)  # 改回「不绑定」
+    window._start_convert()
+    assert _wait_until(qapp, lambda: captured.get("bindings") is not None)
+    assert captured["bindings"][1] is None
+    # 收尾：等 _on_done 执行完（_finish 收掉 worker 线程）再关窗——否则
+    # teardown 时 closeEvent 会因 worker 仍在运行而弹阻塞的确认框
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+    window.close()
 
 
 # ---- 扫描/转换取消 ----
