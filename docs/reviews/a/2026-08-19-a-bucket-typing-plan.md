@@ -962,10 +962,15 @@ Expected: 全 PASS（5 处 fuzz 对拍断言零改动；oracle 换调后逐帧�
 
 ### Task 5: 全量 pytest + 逐位对拍链
 
+> **实施记录（2026-08-19 执行时标注）**：
+> - Step 1 实测 **289 passed / 0 failed（83.97s，anaconda3 Python 3.13.9）**，与 Task 4 基线一致。两种调用方式在本机不可并行验证：PATH 上 `python` 是商店空壳（WindowsApps stub，直跑 exit 49 无输出）、`pytest` 不在 PATH——唯一可用调用 = `C:/ProgramData/anaconda3/python.exe -m pytest tests/ -q`（6 条 warnings 为 test_compare_cli 既有 GBK 解码环境问题，与 A 无关）。
+> - Step 2 发现计划正文 stdin heredoc 脚本在 Windows spawn 下的缺陷并修正后复跑：① 首跑（按正文 heredoc）worker spawn 全灭（`__mp_main__` 重导入 `<stdin>` → OSError）→ mp_finish BrokenProcessPool → 串行兜底（§5.7），「并行产物」实为串行产物，`对拍差异: []` 是串行对串行的假阳性；② 改真实脚本但漏 `__main__` 守卫 → worker 重执行脚本体 → 转换级联 + 输出文件互抢（WinError 32，残留 .mf4）；③ 加 `if __name__ == "__main__":` 守卫后干净复现：**串行 20.1s / 并行 26.2s / `对拍差异: []`**（exit 0，无 traceback）。并行真实执行证据：进程采样并行窗口内 9 个 python 进程（父 + 8 worker = min(cpu 8, 10 通道)，池关闭后回落 1）+ timings「解码墙钟（并行） 2.17s」vs 逐通道累计工作量 7.09s（CPU 工作量 > 墙钟 = 真并行特征）。临时脚本已删；**后续对拍改用真实脚本文件 + `__main__` 守卫，勿用 stdin heredoc**。
+> - Step 3 随手记：串行 20.1s（读入 8.62 + 解码 2.57 + 聚合 0.39 + 写 MDF 8.44）；并行 26.2s（读入 8.28 + 解码墙钟并行 2.17 + 聚合 0.40 + 写 8.75）。AHT 82MB 上并行反慢 ~6s——解码工作量仅 ~2.5s（读入/写占大头），池 spawn + pickle 开销大于并行收益，符合「并行只作用于解码阶段」的设计；与本机 2026-08-15 基线（29.8s）相比串行更快（机器波动/后续优化，非通过条件）。
+
 **Files:**
 - 无代码改动；验证任务。
 
-- [ ] **Step 1: 全量 pytest（两种调用方式，H1 后 `pythonpath = .` 保证）**
+- [x] **Step 1: 全量 pytest（两种调用方式，H1 后 `pythonpath = .` 保证）**
 
 Run: `python -m pytest tests/ -q`
 Expected: 全 PASS / 0 failed（269 基线 + 新增：Task 1 的 4 + Task 2 的 8 + Task 3 的 1 + Task 4 的 1 ≈ 283；以实际输出为准并记录）。
@@ -973,7 +978,7 @@ Expected: 全 PASS / 0 failed（269 基线 + 新增：Task 1 的 4 + Task 2 的 
 Run: `pytest tests/ -q`
 Expected: 同上全绿。
 
-- [ ] **Step 2: AHT 并/串产物逐位对拍**（样例在场时执行；`inputs/blf/` 无 AHT 文件则跳过并记录）
+- [x] **Step 2: AHT 并/串产物逐位对拍**（样例在场时执行；`inputs/blf/` 无 AHT 文件则跳过并记录）
 
 Run（Git Bash；约 1 分钟）：
 
@@ -1004,28 +1009,33 @@ EOF
 
 Expected: 两行转换输出 + `对拍差异: []`（并行/串行产物四维逐位一致）。
 
-- [ ] **Step 3: 性能随手记（不作通过条件）**
+- [x] **Step 3: 性能随手记（不作通过条件）**
 
 Step 2 的输出已含并/串各自耗时——记录到任务日志；不另行重跑 AHT 基准（spec：类型化只换容器，性能前提由 numpy 运算语义零变化 + H2a 注释随迁保障）。
 
-- [ ] **Step 4: 交付点（提交由用户执行）**
+- [x] **Step 4: 交付点（提交由用户执行）**
 
 ---
 
 ### Task 6: 双轴 code-review（receiving-code-review 流程）
 
-**Files:**
-- 无代码改动；项目惯例审查流程。
+> **实施记录（2026-08-19 执行时标注）**：
+> - Step 1 双轴并行子代理完成：Standards 轴硬性契约全部核验通过（Q11 字段名逐字 / 依赖方向零变化 / 黄金套件断言零改动 / 分类唯一实现 / Bucket 三相位互斥 / finish 断言在位 / isinstance 分派三处消失 / 289 全绿），仅 5 项 nitpick；Spec 轴 **0 findings**（A1-A4 全对位、Out of Scope 零触碰、三处实施澄清均落地且有修订记录）。审查报告存 [2026-08-19-a-bucket-typing-review.md](./2026-08-19-a-bucket-typing-review.md)（docs/reviews/a/，B/D/G 先例同布局）。
+> - Step 2 findings 逐条处置（receiving-code-review：先核验再动作）：S1（plan:517 数字与 spec 269 基线跨时点比对不符）**误报关闭**——plan 数字链自洽（287→288→289 逐任务时点实测）；「N passed」占位为 Task 7 模板，Task 7 执行时填充。S2（spec:63 `add_block` 参数序未同步）**已修订**——spec 签名改为 block 在前并标注 plan 澄清 ③ 理由（spec/文档漂移类随修订关闭，B 先例）。S3（test_dbc_loader.py:137 模块中部重复 import）**已修订**——classify/classify_batch/message_table 并入顶部 import、中部块删除（纯卫生，行为零变化）。S4（oracle KeyError 防御分支不可达）**保留**——oracle 防御无害（mux 无子组仍走 DecodeError），改动属无谓（标准 ⑥）。S5（`_bucket_block` 返回序 vs 入参序双序并存）**保留**——既有函数（A 范围外），调用点解包重排显式且局部（judgement）。
+> - Step 3 全量 pytest 复跑实测 **289 passed / 0 failed（75.97s）**，与处置前一致（处置零行为变化）；0 实质 findings 收尾（blocking 0 / substantive 0）。
 
-- [ ] **Step 1: 触发双轴 review**
+**Files:**
+- 生产代码零改动；测试侧唯一改动 = tests/test_dbc_loader.py import 合并（S3 处置）；文档侧 = spec :63 签名同步（S2 处置）+ 审查报告新增。
+
+- [x] **Step 1: 触发双轴 review**
 
 按项目惯例走 receiving-code-review：Standards 轴（架构干净 / 调用链扁平 / 契约明确 / 严格收口 / 易维护 / 不新增无谓抽象）+ Spec 轴（对照 2026-08-18-a-bucket-typing-spec.md 逐条核验 Q1-Q16 决策落地）。审查报告存 `docs/reviews/`（与 B/D/G 先例同布局）。
 
-- [ ] **Step 2: 处理 findings**
+- [x] **Step 2: 处理 findings**
 
 修复实质问题并补测试（B 先例：Spec 轴曾捕获 1 个实质问题）；spec/文档漂移类 finding 随修订关闭。
 
-- [ ] **Step 3: 0 findings 收尾**
+- [x] **Step 3: 0 findings 收尾**
 
 Expected: 双轴 code-review 0 findings；全量 pytest 复跑全绿。
 
@@ -1033,33 +1043,38 @@ Expected: 双轴 code-review 0 findings；全量 pytest 复跑全绿。
 
 ### Task 7: 审查文档更新（§3 M1 / §4 A / §5 首要建议 / §2.1 行数）+ CONTEXT.md 核对
 
+> **实施记录（2026-08-19 执行时标注）**：
+> - Step 1 CONTEXT.md「解码桶」词条核对通过：arb=归一化键 / raw_id=首帧原始 id / 插入序=系列序 / 只收已通过预检的帧 四句与 spec A1 一致，未改动。
+> - Step 2-6 审查文档（docs/reviews/2026-08-18-architecture-review.md）更新：头部 A 更新块（N=289，269 基线 + 新增 20：test_bucket 9 + test_dbc_loader 10 + test_parallel_decode 1）；§3 M1 状态标注（✅ 已完成，2026-08-19）；§4 候选 A 行改「✅ 已落地」；§5 首要建议首段与理由 2 更新（无剩余 Strong 候选，下一步 M8/L9 bench/probe 清理等）；§2.1 行数刷新（decoder 453→551 / converter 530→472 / mp_finish 279→271 / dbc_loader 126→175，dbc_loader 公开接口列补 classify 族；tests 20→21 文件）。另有超出正文 Step 6 字面、但属同一目标（消除已删函数名漂移）的两处同步：§2.2 主链路图 `_assemble_bucket`/`_normalize_bucket` 改 `Bucket.to_array` 链路；§7「下一步」段收尾（五个 Strong 候选全落地）。
+> - Step 7 全量 pytest 终验实测 **289 passed / 0 failed（71.53s，exit 0）**。
+
 **Files:**
 - Modify: `docs/reviews/2026-08-18-architecture-review.md`
 - Verify: `CONTEXT.md`（「解码桶」词条——spec 阶段已加（Q15 定稿措辞），仅核对无需改动）
 
-- [ ] **Step 1: 核对 CONTEXT.md 词条**
+- [x] **Step 1: 核对 CONTEXT.md 词条**
 
 Read `CONTEXT.md` 第 23-24 行「解码桶」：确认 arb=归一化键 / raw_id=首帧原始 id / 插入序=系列序 / 桶只收已通过预检的帧 四句与 spec A1 一致。已一致则不改动。
 
-- [ ] **Step 2: 文档头部加 A 落地更新块**（文首 2026-08-18 更新列表之后追加；N = Task 5 实测用例数）
+- [x] **Step 2: 文档头部加 A 落地更新块**（文首 2026-08-18 更新列表之后追加；N = Task 5 实测用例数）
 
 ```markdown
 > **2026-08-19 更新（A 实施完成后）**：§3 M1 标 ✅ 完成；§4 候选 A 已落地；§5 首要建议更新（无剩余 Strong 候选）；§2.1 行数刷新（decoder / converter / mp_finish / dbc_loader 按实施后行数、tests 20→21 文件新增 test_bucket.py）；CONTEXT.md「解码桶」词条（spec 阶段已加）；全量 pytest 现状：**N passed / 0 失败**（anaconda3 实测，2026-08-19，269 基线 + 新增）。A 实施按项目惯例未 commit（由用户执行）。
 ```
 
-- [ ] **Step 3: §3 M1 状态标注**（M1 条目内追加状态行，M2/M4 先例同型；N = Task 5 实测用例数）
+- [x] **Step 3: §3 M1 状态标注**（M1 条目内追加状态行，M2/M4 先例同型；N = Task 5 实测用例数）
 
 ```markdown
 - **状态：✅ 已完成**（2026-08-19，实施 A，[spec](./a/2026-08-18-a-bucket-typing-spec.md)）——桶结构收口为 decoder.py 显式状态单类 `Bucket`（三相位互斥字段组 + `from_feed`/`from_blocks`/`add_frame`/`add_block`/`to_array`/`n_frames`/`memory_estimate`，isinstance 分派从 decoder/mp_finish/converter 三处收进类内，H2a 性能注释随迁）；分类规则收口 dbc_loader（`classify`/`classify_batch`/`message_table` 相邻定义，批量与标量等价由属性测试锁定，M2 双入口模板同构）；两条建桶路由（feed/向量化）桶级等价由新增路由等价测试直接对拍（np.unique 首现序 vs setdefault 插入序收口）；finish 防御 length 掩码删除（构造即预检，mux 无子组计数保留）；converter.py:389 死残留清除；oracle（reference_decode）换调生产 classify（解码面保持 cantools 独立）；CONTEXT.md 新增「解码桶」词条。双轴 code-review 0 findings。全量 pytest N passed。
 ```
 
-- [ ] **Step 4: §4 候选 A 行更新**（替换现 A 行）
+- [x] **Step 4: §4 候选 A 行更新**（替换现 A 行）
 
 ```markdown
 | A. 桶记录类型化 + owner 集中（M1） | ✅ 已落地（2026-08-19） | 桶结构收口 decoder.py `Bucket` 显式状态单类（三相位互斥 + 转换方法收敛）；分类规则唯一实现 dbc_loader（classify/classify_batch/message_table）；路由等价测试直接对拍两条建桶路由；finish 防御掩码删除；死残留清除；reference_decode 换调 classify；N passed。详见 [A spec](./a/2026-08-18-a-bucket-typing-spec.md) |
 ```
 
-- [ ] **Step 5: §5 首要建议更新**（替换现首段与理由 2；保留其余结构）
+- [x] **Step 5: §5 首要建议更新**（替换现首段与理由 2；保留其余结构）
 
 ```markdown
 **F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）；B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）；A（桶契约类型化）已实施完毕（2026-08-19，N passed）。五个 Strong 候选（A/B/F/H1/H2）全部落地，无剩余 Strong 候选。下一步：M8/L9 bench/probe 脚本清理（8 个可删脚本）等 Worth exploring 条目。**
@@ -1071,11 +1086,11 @@ Read `CONTEXT.md` 第 23-24 行「解码桶」：确认 arb=归一化键 / raw_i
 2. **A（桶契约类型化）已落地**：解码桶收口为 `Bucket` 显式状态单类，分类规则唯一实现落 dbc_loader，两条建桶路由由路由等价测试直接对拍——M1 的「等价性靠注释声明」结构性收口完成，单遍扫描性能前提（numpy 运算语义零变化 + H2a 注释随迁）未触碰。
 ```
 
-- [ ] **Step 6: §2.1 行数刷新**
+- [x] **Step 6: §2.1 行数刷新**
 
 按 Task 5 后各文件实际行数更新模块地图（decoder / converter / mp_finish / dbc_loader 四行；tests 行 `20 文件` → `21 文件`（新增 test_bucket.py））。
 
-- [ ] **Step 7: 全量 pytest 终验 + 交付点（提交由用户执行）**
+- [x] **Step 7: 全量 pytest 终验 + 交付点（提交由用户执行）**
 
 Run: `python -m pytest tests/ -q`
 Expected: 全 PASS（文档改动不涉代码，终验确认）。

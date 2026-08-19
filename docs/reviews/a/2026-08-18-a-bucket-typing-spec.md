@@ -60,7 +60,7 @@ class Bucket:
     @classmethod from_feed(arb, raw_id, md)          # feed setdefault 建桶（decoder.py:429-431 语义）
     @classmethod from_blocks(arb, raw_id, md, block, ts, lens)  # 向量化路由建桶（converter.py:167-172 语义）
     def add_frame(ts_seconds, data)                 # feed 追加
-    def add_block(ts, lens, block)                  # 向量化追加
+    def add_block(block, ts, lens)                  # 向量化追加（参数序修订：block 在前，与 from_blocks 一致；plan 澄清 ③，2026-08-19 code-review 同步）
     def to_array(self) -> None                      # 幂等：feed/blocks 相位 → 数组相位
     @property def n_frames(self) -> int             # mp_finish 任务/进度用（现 len(b["ts"])）
     def memory_estimate(self) -> int                # bucket_bytes 用（isinstance 分派收进类内）

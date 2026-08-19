@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from core.dbc_loader import load, normalize_id, normalize_ids
+from core.dbc_loader import (classify, classify_batch, load, message_table,
+                             normalize_id, normalize_ids)
 
 INLINE_DBC = '''VERSION ""
 
@@ -132,10 +133,6 @@ def test_normalize_ids_vectorized():
     got = normalize_ids(arbs, is_ext)
     assert got.dtype == np.uint32
     assert got.tolist() == [0x123, 0x80000123, 0x9FFFFFFF, 0x80000000, 0x80000001]
-
-
-from core.dbc_loader import classify, classify_batch, load, message_table, \
-    normalize_id
 
 
 def _classify_dbc(tmp_path):
