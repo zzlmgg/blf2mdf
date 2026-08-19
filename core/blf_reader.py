@@ -59,7 +59,8 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
     """轻量通道枚举：只走容器→对象头，不构造 Message、不解析 payload。
 
     输入阶段专用（GUI 加载 BLF）：86MB/565 万帧样例 list_channels 实测
-    41s，本函数只解对象头里的 channel 字段，预计 5-20 倍加速（需实测）。
+    41s，本函数只解对象头里的 channel 字段。H3 起向量化快路径 _probe_fast
+    优先（行走 ~0.24s），条件不满足回退下方标量 _walk（回退 oracle）。
     行走结构复刻 python-can 的 BLFReader.__iter__/_parse_container/
     _parse_data（can/io/blf.py），复用其常量与 struct——channel 均为各
     消息结构体的首字段（文件 1-based，读出减 1 变 0-based，与 python-can
@@ -73,6 +74,17 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
     对象检查一次，返回 True 即 raise ConversionCancelled（GUI 取消按钮置位）。
     """
     import struct
+
+    import numpy as np
+
+    from core.blf_vector import (  # H3 惰性 import（与 blf_vector 内对向引用同构）
+        _candidates,
+        _u8_at,
+        _u16_at,
+        _u16_at_v,
+        _u32_at,
+        _u32_at_v,
+    )
 
     from can.io.blf import (
         BLFParseError,
@@ -146,13 +158,131 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
                 channels.add(ch)
             pos = next_pos
 
+    def _probe_fast(data: bytes):
+        """向量化探测行走（H3）：返回 (channels, tail)；条件不满足 → None。
+
+        复刻 _walk 语义，与 blf_vector._parse_fast 同款掩码机器（_candidates
+        单类扫描 + 窗口状态机 + 重叠定理双探针），但只提取 channel 字段、
+        不构造帧、不读时间头。终止分型按 probe 的裁剪标量：版本头/消息体
+        截断 → channel 读 struct.error → 尾部（与 _parse_fast 的 ver_fit
+        回退不同——walk_container 会让 struct.error 传播，probe 的 _walk
+        捕获它）。任一条件不满足一律返回 None 交由 _walk 标量回退
+        （回退 oracle：快路径失败不 raise）。
+        """
+        max_pos = len(data)
+        c, j_first = _candidates(data)
+        N = len(c)
+        if N == 0:
+            if max_pos < 8:
+                return set(), data          # 无候选且窗口越界：整块为尾部
+            if j_first >= 0:
+                return None                 # 全错位病态容器（防御分支）→ 回退
+            raise BLFParseError("Could not find next object")
+        if max_pos < 16:
+            return None                     # 候选读安全前提不满足 → 回退
+
+        b8 = np.frombuffer(data, dtype=np.uint8)
+        aligned = bool(np.all((c & 3) == 0))
+        if aligned:
+            v32 = np.frombuffer(data, dtype="<u4", count=max_pos // 4)
+            u32 = lambda p, mp: _u32_at_v(v32, p, mp)
+            u16 = lambda p, mp: _u16_at_v(v32, p, mp)
+        else:
+            u32 = lambda p, mp: _u32_at(b8, p, mp)
+            u16 = lambda p, mp: _u16_at(b8, p, mp)
+
+        obj_size = u32(c + 8, max_pos)
+        obj_type = u32(c + 12, max_pos)
+        hdr_ver = u32(c + 4, max_pos) >> np.uint32(16)
+        e = c + obj_size.astype(np.int64)
+        v1 = hdr_ver == np.uint32(1)
+        v2 = hdr_ver == np.uint32(2)
+        unk = ~(v1 | v2)
+        hsz = np.where(v1, np.int64(32), np.where(v2, np.int64(40), np.int64(0)))
+        t_cls = (obj_type == 1) | (obj_type == 86)
+        t_err = obj_type == 73
+        t_fd = obj_type == 100
+        t_fd64 = obj_type == 101
+        base_fit = c + 16 <= max_pos
+        obj_fit = e <= max_pos
+        ver_fit = unk | (v1 & (c + 32 <= max_pos)) | (v2 & (c + 40 <= max_pos))
+        msg_fit = (unk | (t_cls & (c + hsz + 16 <= max_pos))
+                   | (t_err & (c + hsz + 32 <= max_pos))
+                   | (t_fd & (c + hsz + 84 <= max_pos))
+                   | (t_fd64 & (c + hsz + 40 <= max_pos))
+                   | (~(t_cls | t_err | t_fd | t_fd64)))
+        valid = base_fit & (unk | ver_fit) & (unk | msg_fit) & obj_fit
+
+        s = np.concatenate(([0], np.cumsum(obj_size.astype(np.int64))))[:N]
+        bad = ~valid | (c - s > 4)
+        first = int(np.argmax(bad)) if bool(bad.any()) else N
+        if first < N and int(c[first]) < int(s[first]):
+            return None   # 防御：候选落窗口下界之前（不变量破坏）→ 回退
+
+        # H7a 双探针（同 _parse_fast）：仅两处窗口可能有扫描不可见的
+        # walk 命中；探针命中即回退（快路径无 LOBJ 而标量会继续走）。
+        if first < N and int(c[first]) - int(s[first]) > 4:
+            w = int(s[first])
+            for j in range(5):
+                if w + j + 4 <= max_pos and data[w + j:w + j + 4] == b"LOBJ":
+                    return None
+        if first == N and N >= 1:
+            s_end = int(s[N - 1]) + int(obj_size[N - 1])   # walk 末轮后的搜索起点
+            for j in range(5):
+                if s_end + j + 4 <= max_pos and data[s_end + j:s_end + j + 4] == b"LOBJ":
+                    return None
+
+        # 通道提取：use = 版本已知 ∧ 四类消息，截断至 first 前（walk 在轮
+        # first 失败后返回已累积通道 + 尾部）。cancel 检查点同标量
+        # （每 1024 轮一次，循环内对象数一致）。
+        use = ((v1 | v2) & (t_cls | t_err | t_fd | t_fd64)).copy()
+        if first < N:
+            use[first:] = False
+        if cancel_cb is not None:
+            for i in range(1024, first + 1, 1024):
+                if cancel_cb():
+                    raise ConversionCancelled()
+
+        channels: set[int] = set()
+        if first:
+            pos = c + hsz
+            m = use & t_cls
+            if m.any():
+                channels.update((u16(pos[m], max_pos).astype(np.int64) - 1).tolist())
+            m = use & t_err
+            if m.any():
+                channels.update((u16(pos[m], max_pos).astype(np.int64) - 1).tolist())
+            m = use & t_fd
+            if m.any():
+                channels.update((u16(pos[m], max_pos).astype(np.int64) - 1).tolist())
+            m = use & t_fd64
+            if m.any():
+                channels.update((_u8_at(b8, pos[m], max_pos).astype(np.int64) - 1).tolist())
+
+        # 终止分型（probe 裁剪标量语义，见 docstring）
+        if first < N:
+            if int(c[first]) - int(s[first]) > 4:
+                if int(s[first]) + 8 > max_pos:
+                    return channels, data[int(s[first]):]
+                raise BLFParseError("Could not find next object")
+            return channels, data[int(s[first]):]   # 对象解析失败 → 尾部
+        s_end = int(s[N - 1]) + int(obj_size[N - 1])
+        if s_end + 8 > max_pos:
+            return channels, data[s_end:]
+        raise BLFParseError("Could not find next object")
+
     channels = set()
     tail = b""
     for _, data in iter_containers(path, progress_cb=progress_cb):
         if tail:
             data = tail + data
             tail = b""
-        tail = _walk(data, channels)
+        fast = _probe_fast(data)
+        if fast is not None:
+            ch, tail = fast
+            channels |= ch
+        else:
+            tail = _walk(data, channels)   # 快路径条件不满足：标量回退（回退 oracle）
     return sorted(channels)
 
 

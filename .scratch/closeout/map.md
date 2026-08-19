@@ -20,10 +20,12 @@
 - [01 — E: ContainerFrames → 帧序列转换 adapter](issues/01-e-containerframes-adapter.md) — 采纳并落地：载荷访问面 `payload_block`/`payload` + glen 恒存在归一（scattered 字段退役）；`_bucket_block` 双分支 → 1 行、测试 `_payload` 删除直调 adapter；未来表示变更触达面 7 处 → 1-2 处；289 passed + 230 组对拍 exit 0 + full_compare 与基线同分
 - [03 — GUI 面 Worth exploring 逐条裁决](issues/03-gui-worth-exploring.md) — Q1 双轨明示+代码面收敛（theme 常量 POSITIVE_COLOR/NEGATIVE_COLOR，QSS 轨道保持就地）；Q2 worker 骨架保留现状（不做，入 Out of scope）；Q3 test_gui_binding 状态查询/驱动收口 `binding_row`/`set_binding_selection` 两方法面（`_collect_prev` 转生产消费者）；GUI 63 + 全量 289 passed
 - [04 — core 收口面裁决（含搭车项）](issues/04-core-consolidation.md) — Q1 worker 数/进度带单一来源（resolve_workers + decode_progress）、Q2 find_ccu3_root 下沉 project_loader、Q3 容器流衔接三私有名转正、Q5 退化显式化（ConversionResult.warnings）、Q6 取消协议 ConversionCancelled 全部做；Q4 read_start_time 整数化搁置（入 Out of scope）；291 passed + 230 组逐位一致 + full_compare 同分（3434 已知真实差异）
+- [07 — H3 输入探测提速](issues/07-h3-input-probe.md) — 方案 1 向量化行走单独做（缓存不做）：probe_channels 新增 _probe_fast 复用 _candidates + 掩码提取，终止分型按 probe 裁剪标量、回退 oracle 不 raise；行走 ~6.3s → ~0.24s（96%↓）；输入阶段冷 12.32 → 6.22s、GUI 热口径 ~2.2s（zlib 1.78s 硬下限）；291 passed + 230 组逐位一致 + full_compare 同分
 
 ## Not yet specified
 
-（无——charting 时所有可提问题均已成型为 ticket）
+- **输入阶段 zlib 解压残余**（[07 票](issues/07-h3-input-probe.md) 裁决暴露）：行走归零后 zlib 1.78s 为输入阶段硬下限（本机；v2 测 1.2s 系机器漂移）；并行解压（zlib 释放 GIL，ThreadPool）可压到 ~0.9s 但触达面出 probe 单函数（iter_containers 共用层 + 进度语义）——重启性能线时作 fresh effort 评估
+- **can→asammdf import 链 ~4s**（[07 票](issues/07-h3-input-probe.md) 裁决暴露）：`from can.io.blf import ...` 触发 can.io.logger→mf4→asammdf；GUI 启动经 mdf_writer 已缓存 asammdf，拖入仅残余首拖 ~0.5s；绕过包 __init__ 不可行（blf.py 相对导入）——重启性能线时评估
 
 ## Out of scope
 
