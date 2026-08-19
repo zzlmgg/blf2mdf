@@ -42,16 +42,14 @@ def test_rebuild_renders_decision_rows_to_table(window):
     window.dbc_list = [pfcan1, pfcan2]
     window.auto_bind = {1: pfcan1.path, 15: pfcan2.path}
     window._rebuild_channel_table([1], prev=None)
-    rows = {window.table.item(r, 0).text(): r
+    rows = {window.binding_row(r)[0]: r
             for r in range(window.table.rowCount())}
     r1 = rows["CAN 1"]
-    assert window.table.cellWidget(r1, 1).currentText() == "PFCAN1.dbc（A19G1）"
-    assert window.table.cellWidget(r1, 1).currentData() is pfcan1
-    assert window.table.item(r1, 2).text() == "已绑定"
+    assert window.binding_row(r1) == ("CAN 1", "PFCAN1.dbc（A19G1）",
+                                      pfcan1.path, "已绑定")
     r15 = rows["CAN 15"]
-    assert window.table.cellWidget(r15, 1).currentText() == "PFCAN2.dbc（A19G1）"
-    assert window.table.cellWidget(r15, 1).currentData() is pfcan2
-    assert window.table.item(r15, 2).text() == "无数据"
+    assert window.binding_row(r15) == ("CAN 15", "PFCAN2.dbc（A19G1）",
+                                       pfcan2.path, "无数据")
 
 
 def test_dbc_combo_ignores_mouse_wheel(window):
@@ -397,7 +395,7 @@ def test_start_convert_bindings_from_user_data(window, qapp, monkeypatch):
     window.auto_bind = {1: pfcan1.path}
     window._rebuild_channel_table([1, 15], prev=None)
     # 行 15（无数据）用户手动改选 PFCAN2 → 绑定该文件对象
-    window.table.cellWidget(1, 1).setCurrentText("PFCAN2.dbc（A19G1）")
+    window.set_binding_selection(1, "PFCAN2.dbc（A19G1）")
     window._start_convert()
     assert _wait_until(qapp, lambda: captured.get("bindings") is not None)
     assert captured["bindings"][1] is pfcan1
@@ -431,7 +429,7 @@ def test_start_convert_unbound_row_yields_none(window, qapp, monkeypatch):
     window.dbc_list = [_d("PFCAN1.dbc")]
     window.auto_bind = {1: window.dbc_list[0].path}
     window._rebuild_channel_table([1], prev=None)
-    window.table.cellWidget(0, 1).setCurrentIndex(0)  # 改回「不绑定」
+    window.set_binding_selection(0, mw.UNBOUND)  # 改回「不绑定」
     window._start_convert()
     assert _wait_until(qapp, lambda: captured.get("bindings") is not None)
     assert captured["bindings"][1] is None

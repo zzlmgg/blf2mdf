@@ -26,7 +26,7 @@ from gui.binding import (
     derive_state,
 )
 from gui.resources import application_icon
-from gui.theme import WINDOW_HEIGHT, WINDOW_WIDTH
+from gui.theme import POSITIVE_COLOR, WINDOW_HEIGHT, WINDOW_WIDTH
 from gui.widgets import (
     AppShell,
     CompactCombo,
@@ -633,13 +633,8 @@ class MainWindow(QMainWindow):
         """
         prev = {}
         for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            combo = self.table.cellWidget(r, 1)
-            if item is None or combo is None:
-                continue
-            data = combo.currentData()
-            prev[int(item.text().split()[-1])] = (
-                data.path if data is not None else None)
+            name, _, path, _ = self.binding_row(r)
+            prev[int(name.split()[-1])] = path
         return prev
 
     def _apply_column_widths(self):
@@ -677,13 +672,31 @@ class MainWindow(QMainWindow):
         self._set_status_item(
             row, derive_state(True, data.path if data is not None else None))
 
+    def binding_row(self, row: int) -> tuple[str, str, str | None, str]:
+        """绑定表第 row 行稳定读取面（M7 收口）：(通道名, 下拉显示名,
+        下拉 DBC 路径 | None, 状态文字)，None 即「不绑定」。测试与内部
+        调用经此读表格状态，不穿透 table/cellWidget 对象图。"""
+        combo = self.table.cellWidget(row, 1)
+        data = combo.currentData()
+        return (self.table.item(row, 0).text(),
+                combo.currentText(),
+                data.path if data is not None else None,
+                self.table.item(row, 2).text())
+
+    def set_binding_selection(self, row: int, display_name: str) -> None:
+        """绑定表第 row 行下拉驱动面（M7 收口）：等价于用户改下拉，
+        含状态接管（derive_state 以当前选择为准）。"""
+        combo = self.table.cellWidget(row, 1)
+        combo.setCurrentText(display_name)
+        self._update_status(row)
+
     def _set_status_item(self, row: int, text: str):
         """统一状态文字、颜色和列内对齐。"""
         item = self.table.item(row, 2)
         item.setText(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         colors = {
-            STATE_BOUND: "#207e4b",
+            STATE_BOUND: POSITIVE_COLOR,
             STATE_NOT_EXPORTED: "#a56400",
             STATE_NO_DATA: "#8d9096",
         }

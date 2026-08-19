@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.resources import application_icon
+from gui.theme import NEGATIVE_COLOR, POSITIVE_COLOR
 
 
 class AppShell(QWidget):
@@ -166,7 +167,7 @@ class SemanticIconButton(QPushButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         tone = self.property("tone")
-        color = QColor("#207e4b" if tone == "positive" else "#c93834")
+        color = QColor(POSITIVE_COLOR if tone == "positive" else NEGATIVE_COLOR)
         if not self.isEnabled():
             color.setAlpha(90)
         elif self.underMouse():

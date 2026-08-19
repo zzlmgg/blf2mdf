@@ -1,10 +1,19 @@
-"""应用级视觉令牌与 QSS。"""
+"""应用级视觉令牌与 QSS。
+
+双轨政策（2026-08-19 裁决）：QSS 静态字符串（APP_QSS）内色值就地维护，
+f-string 化不值得，就地改色为常态；代码面（paintEvent 绘制、状态颜色表
+等）一律引用本模块常量（POSITIVE_COLOR/NEGATIVE_COLOR），改色先改这里。
+"""
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 WINDOW_WIDTH = 690
 WINDOW_HEIGHT = 596
+
+# 语义色值（代码面唯一来源；QSS 内色值属独立轨道，见模块 docstring）
+POSITIVE_COLOR = "#207e4b"
+NEGATIVE_COLOR = "#c93834"
 
 APP_QSS = """
 QWidget {
