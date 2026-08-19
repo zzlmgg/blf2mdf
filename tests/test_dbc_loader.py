@@ -132,3 +132,103 @@ def test_normalize_ids_vectorized():
     got = normalize_ids(arbs, is_ext)
     assert got.dtype == np.uint32
     assert got.tolist() == [0x123, 0x80000123, 0x9FFFFFFF, 0x80000000, 0x80000001]
+
+
+from core.dbc_loader import classify, classify_batch, load, message_table, \
+    normalize_id
+
+
+def _classify_dbc(tmp_path):
+    """标准报文 BO_ 100（frame_length 8）+ 扩展报文 BO_ 2147483904（0x80000100，8B）。"""
+    p = tmp_path / "c.dbc"
+    p.write_text('''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 100 ABC: 8 ECU
+ SG_ Speed : 0|16@1+ (0.01,0) [0|655.35] "km/h" ECU
+
+BO_ 2147483904 M2: 8 ECU
+ SG_ B : 0|8@1+ (1,0) [0|255] "" ECU
+''', encoding="utf-8")
+    return load(str(p))
+
+
+@pytest.mark.parametrize("arb,data_len,is_known", [
+    (100, 8, True),            # 已知 ID 标准帧
+    (0x80000100, 8, True),     # 已知扩展帧（EFF 键空间）
+    (100, 9, True),            # 超长帧（FD 变长载荷）有效——只拒绝更短
+    (100, 7, False),           # 已知 ID 短帧 → None
+    (0x80000100, 0, False),    # 扩展帧空载荷 → None
+    (999, 8, False),           # 未知 ID → None
+    (0x100, 8, False),         # 标准帧同 raw id（无 EFF 位）→ 键不存在
+])
+def test_classify_boundaries(tmp_path, arb, data_len, is_known):
+    """分类规则 = 归一化键查找 + 帧长校验（未知 ID/短帧 → None）。"""
+    dbc = _classify_dbc(tmp_path)
+    md = classify(dbc, arb, data_len)
+    if is_known:
+        assert md is dbc.messages[arb]
+    else:
+        assert md is None
+
+
+def test_message_table_contract(tmp_path):
+    """长度表：键 uint32 排序（searchsorted 前提）、lens int64、mds 与键对齐。"""
+    dbc = _classify_dbc(tmp_path)
+    keys, lens, mds = message_table(dbc)
+    assert keys.dtype == np.uint32 and lens.dtype == np.int64
+    assert np.all(np.diff(keys) > 0), "键必须严格排序（searchsorted 前提）"
+    assert keys.tolist() == sorted(dbc.messages)
+    assert lens.tolist() == [dbc.messages[k].frame_length for k in keys]
+    assert [m.name for m in mds] == [dbc.messages[k].name for k in keys]
+
+
+def test_classify_batch_matches_scalar_random(tmp_path):
+    """批量与标量逐元素等价（属性测试）：随机帧 on 随机信号 DBC。
+
+    复用 test_decoder_vectorized 的生成器（spec A4：同 A2 测试节）。
+    每行断言：found = 键在表内；valid = 键在表内且帧长足够（= classify 非 None）。"""
+    from test_decoder_vectorized import _random_frames, _random_signal_dbc
+    rng = np.random.default_rng(20260819)
+    for trial in range(20):
+        frame_len = int(rng.choice([8, 8, 16]))
+        p = tmp_path / f"r{trial}.dbc"
+        p.write_text(_random_signal_dbc(rng, frame_len), encoding="utf-8")
+        dbc = load(str(p))
+        table = message_table(dbc)
+        frames = _random_frames(rng, int(rng.integers(10, 80)), known_ids=[100])
+        arb = np.array([normalize_id(f.arbitration_id, f.is_extended)
+                        for f in frames], dtype=np.uint32)
+        data_len = np.array([len(f.data) for f in frames], dtype=np.int64)
+        found, valid = classify_batch(table, arb, data_len)
+        assert found.dtype == np.bool_ and valid.dtype == np.bool_
+        assert len(found) == len(frames) == len(valid)
+        for i, fr in enumerate(frames):
+            assert bool(found[i]) == (int(arb[i]) in dbc.messages), i
+            md = classify(dbc, int(arb[i]), int(data_len[i]))
+            assert bool(valid[i]) == (md is not None), i
+
+
+def test_classify_batch_empty_table(tmp_path):
+    """空 DBC：classify None；classify_batch 全 False（调用方按 ~valid 全计未知）。"""
+    p = tmp_path / "e.dbc"
+    p.write_text('''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+''', encoding="utf-8")
+    dbc = load(str(p))
+    assert classify(dbc, 1, 8) is None
+    table = message_table(dbc)
+    assert table[0].size == 0 and table[1].size == 0 and table[2] == []
+    found, valid = classify_batch(table, np.array([1, 2], dtype=np.uint32),
+                                  np.array([8, 8], dtype=np.int64))
+    assert not found.any() and not valid.any()

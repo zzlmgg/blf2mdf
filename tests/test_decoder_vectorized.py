@@ -11,7 +11,7 @@ from core.blf_reader import Frame
 from core.decoder import (DecodeStats, SignalSeries, _clamped_int_array,
                           _extract_bits, _extract_signal, _int_dtype,
                           _pad_to_64, _signal_kind)
-from core.dbc_loader import DbcDef, SignalDef, load, normalize_id
+from core.dbc_loader import DbcDef, SignalDef, classify, load, normalize_id
 
 
 def _ref_bits(data: bytes, pos: int, length: int, byte_order: str) -> int:
@@ -96,19 +96,23 @@ def test_extract_signal_truncates_over_64_bits():
 # ── Task 3：逐帧 cantools 参考实现（= 方案C前的 ChannelDecoder 语义，对拍基准）──
 
 def reference_decode(frames, dbc: DbcDef, channel: int):
+    """逐帧 cantools 参考（oracle）：键空间契约（归一化键 + 帧长校验）换调
+    生产 classify（A2 收口，oracle 不复制键规则，M2 normalize_id 先例同型）；
+    解码面保持 cantools decode_message 独立（oracle 语义）。"""
     stats = DecodeStats()
     buckets = {}
     for fr in frames:
         stats.total_frames += 1
         arb = normalize_id(fr.arbitration_id, fr.is_extended)
-        try:
-            decoded = dbc.db.decode_message(arb, fr.data)
-        except (KeyError, DecodeError):
+        md = classify(dbc, arb, len(fr.data))
+        if md is None:
+            # 未知 ID / 已知 ID 短帧 → 未知帧（mux 无子组在解码面仍 DecodeError）
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             continue
-        md = dbc.messages.get(arb)
-        if md is None:
+        try:
+            decoded = dbc.db.decode_message(arb, fr.data)
+        except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             continue

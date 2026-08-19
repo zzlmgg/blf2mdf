@@ -10,8 +10,8 @@ import numpy as np
 from core import blf_reader, mdf_writer, mp_finish
 from core.blf_reader import ScanCancelled
 from core.blf_vector import iter_container_frames
-from core.decoder import ChannelDecoder
-from core.dbc_loader import DbcDef, normalize_ids
+from core.decoder import Bucket, ChannelDecoder
+from core.dbc_loader import DbcDef, classify_batch, message_table, normalize_ids
 from core import stats as stats_mod
 
 
@@ -22,23 +22,6 @@ def _check_cancel(cancel_cb) -> None:
 
 
 # ── H1 Step 3：向量化单遍扫描（读入路由 + 桶装配）──
-def _prep_decode_info(decoders) -> dict[int, tuple[np.ndarray, np.ndarray, list]]:
-    """解码路由预计算：每通道 (排序键 uint32, 帧长 int64, MessageDef 表)。
-
-    键 = 归一化键（原始 id 含 EFF 位），规则见 dbc_loader.normalize_ids。
-    """
-    info = {}
-    for ch, dec in decoders.items():
-        keys = sorted(dec.dbc.messages)
-        info[ch] = (
-            np.asarray(keys, dtype=np.uint32),
-            np.asarray([dec.dbc.messages[k].frame_length for k in keys],
-                       dtype=np.int64),
-            [dec.dbc.messages[k] for k in keys],
-        )
-    return info
-
-
 def _lookup(keys: np.ndarray, vals: np.ndarray) -> np.ndarray:
     """排序键二分：vals 是否在表内（searchsorted + 判等，O(n log m)）。"""
     if len(keys) == 0:
@@ -76,33 +59,6 @@ def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return cf.ts[sel], lens, block
 
 
-def _assemble_bucket(b) -> None:
-    """块列表 → 数组桶（ts/lens/data），与逐容器追加产物逐位一致。
-
-    一次末态连接替代逐容器 np.concatenate 重分配（H2a：实测 3774 次追加
-    拷贝 4.83GB、其中 4.67GB 可避免、函数内 1.65s → 块切片批量拷贝，
-    每字节只写一次；不用 row/col 散点——桶规模 1.6 亿位置 × int64 索引
-    数组的 fancy indexing 实测 7.6s，比块拷贝慢一个数量级）。
-    """
-    ts = np.concatenate(b["ts_blocks"])
-    lens = np.concatenate(b["lens_blocks"])
-    n = len(ts)
-    L = max(int(blk.shape[1]) for blk in b["blocks"]) if b["blocks"] else 0
-    data = np.zeros((n, L), dtype=np.uint8)
-    start = 0
-    for blk, bl in zip(b["blocks"], b["lens_blocks"]):
-        m = len(bl)
-        if m:
-            if blk.shape[1] < L:
-                blk = np.pad(blk, ((0, 0), (0, L - blk.shape[1])))
-            data[start:start + m] = blk
-        start += m
-    b["ts"] = ts
-    b["lens"] = lens
-    b["data"] = data
-    del b["blocks"], b["ts_blocks"], b["lens_blocks"]
-
-
 def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
                      raw_chunks, known_keys, read_cb, cancel_cb) -> None:
     """H1 向量化单遍扫描（计划 §9.1.3）：逐容器路由解码桶/统计/原始帧。
@@ -111,7 +67,7 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
     计数语义）、stats_bufs 块列表、raw_chunks 块列表——下游（finish/统计
     聚合/raw 组装）输出与旧 feed 循环逐位一致。
     """
-    info = _prep_decode_info(decoders)
+    info = {ch: message_table(dec.dbc) for ch, dec in decoders.items()}
     for cf in iter_container_frames(blf_path, progress_cb=read_cb,
                                     cancel_cb=cancel_cb):
         n = len(cf.channel)
@@ -136,24 +92,15 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
             if cnt == 0:
                 continue
             dec.stats.total_frames += cnt
-            keys, lens_tab, mds = info[ch]
-            if len(keys) == 0:
-                dec.stats.unknown_frames += cnt
-                dec.stats.unknown_ids.update(cf.arb[idx_m].tolist())
-                continue
             norm = arb_norm[idx_m]
-            pos = np.searchsorted(keys, norm)
-            ok = pos < len(keys)
-            safe = np.where(ok, pos, 0)
-            found = ok & (keys[safe] == norm)
-            fl = np.where(ok, lens_tab[safe], np.int64(0))
-            valid = found & (cf.data_len[idx_m] >= fl)   # 短帧 → 未知（feed 预检同义）
+            found, valid = classify_batch(info[ch], norm, cf.data_len[idx_m])
             bad = cnt - int(valid.sum())
             if bad:
                 dec.stats.unknown_frames += bad
                 dec.stats.unknown_ids.update(cf.arb[idx_m][~valid].tolist())
             if not valid.any():
                 continue
+            keys, _, mds = info[ch]
             # 桶分组：首现序 = 桶插入序（feed setdefault 首次出现序）
             vkeys = norm[valid]
             uniq, first_i = np.unique(vkeys, return_index=True)
@@ -165,15 +112,10 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
                 ts, lens, block = _bucket_block(cf, sel)
                 b = dec.buckets.get(arb)
                 if b is None:
-                    dec.buckets[arb] = {
-                        "blocks": [block], "ts_blocks": [ts],
-                        "lens_blocks": [lens],
-                        "arb": arb, "raw_id": int(cf.arb[sel][0]), "md": md,
-                    }
+                    dec.buckets[arb] = Bucket.from_blocks(
+                        arb, int(cf.arb[sel][0]), md, block, ts, lens)
                 else:
-                    b["blocks"].append(block)
-                    b["ts_blocks"].append(ts)
-                    b["lens_blocks"].append(lens)
+                    b.add_block(block, ts, lens)      # 参数序按澄清 ③ 修订（block 在前）
         # ── 原始帧块（raw_export 未绑定通道；known_ids 过滤在块内完成）──
         for ch in raw_chs:
             m = cf.channel == ch
@@ -193,10 +135,10 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
                 raw_chunks[ch][0].append(
                     (ts, cf.arb[sel], cf.dlc[sel], lens, block,
                      cf.is_ext[sel], cf.is_fd[sel]))
-    # 桶装配：块列表 → 数组桶（读入后一次成型，下游 finish/阈值计按数组消费）
+    # 桶装配：blocks 相位 → 数组相位（读入后一次成型，下游 finish/阈值计按数组消费）
     for dec in decoders.values():
         for b in dec.buckets.values():
-            _assemble_bucket(b)
+            b.to_array()
 
 
 def _block_rows(block: np.ndarray, lens: np.ndarray) -> np.ndarray:
@@ -386,7 +328,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                          known_keys_arr, read_cb, cancel_cb)
         # 统计块列表 → 单数组（下游聚合代码不变）
         for ch, (t, e, r, er) in list(stats_bufs.items()):
-            if not t or not isinstance(t[0], np.ndarray):
+            if not t:
                 continue
             stats_bufs[ch] = (
                 np.concatenate(t) if t else np.empty(0, dtype=np.float64),

@@ -1,4 +1,6 @@
 """DBC 解析：一次一个文件，不合并。"""
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,53 @@ def normalize_id(raw_id: int, is_extended: bool) -> int:
 def normalize_ids(arbs: np.ndarray, is_ext: np.ndarray) -> np.ndarray:
     """归一化键（numpy 批量版）：与 normalize_id 逐位一致，dtype 保持 uint32。"""
     return arbs | np.where(is_ext, np.uint32(_EFF_BIT), np.uint32(0))
+
+
+def classify(dbc: DbcDef, arb: int, data_len: int) -> MessageDef | None:
+    """报文分类（唯一实现）：归一化键查找 + 帧长校验 → MessageDef 或 None。
+
+    未知 ID，或 data_len < md.frame_length（短帧，cantools DecodeError）→ None。
+    feed 逐帧路由与向量化路由（classify_batch）共用本规则；arb 必须为归一化
+    键（normalize_id 产物）。等价性由属性测试锁定（test_dbc_loader）。"""
+    md = dbc.messages.get(arb)
+    if md is None or data_len < md.frame_length:
+        return None
+    return md
+
+
+def message_table(dbc: DbcDef) -> tuple[np.ndarray, np.ndarray, list[MessageDef]]:
+    """单通道长度表：(键 uint32 排序, 帧长 int64, MessageDef 表)。
+
+    键 = 归一化键（规则见 normalize_ids），searchsorted 前提 = 严格排序；
+    逐通道构造（原 converter._prep_decode_info 语义迁入，调用方包装
+    {ch: message_table(dec.dbc)}）。"""
+    keys = sorted(dbc.messages)
+    return (
+        np.asarray(keys, dtype=np.uint32),
+        np.asarray([dbc.messages[k].frame_length for k in keys], dtype=np.int64),
+        [dbc.messages[k] for k in keys],
+    )
+
+
+def classify_batch(table: tuple[np.ndarray, np.ndarray, list[MessageDef]],
+                   norm: np.ndarray, data_len: np.ndarray) \
+        -> tuple[np.ndarray, np.ndarray]:
+    """批量分类 twin（与 classify 逐元素等价，属性测试锁定）。
+
+    found = 归一化键在表内；valid = found 且 data_len >= frame_length
+    （短帧排除）。空表 → 全 False（调用方按 ~valid 全计未知，与逐帧等价）。
+    """
+    keys, lens_tab, _ = table
+    if len(keys) == 0:
+        return (np.zeros(len(norm), dtype=bool),
+                np.zeros(len(norm), dtype=bool))
+    pos = np.searchsorted(keys, norm)
+    ok = pos < len(keys)
+    safe = np.where(ok, pos, 0)
+    found = ok & (keys[safe] == norm)
+    fl = np.where(ok, lens_tab[safe], np.int64(0))
+    valid = found & (data_len >= fl)
+    return found, valid
 
 
 @dataclass

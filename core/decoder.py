@@ -8,7 +8,7 @@ import numpy as np
 from cantools.database.namedsignalvalue import NamedSignalValue
 
 from core.blf_reader import Frame
-from core.dbc_loader import DbcDef, MessageDef, SignalDef, normalize_id
+from core.dbc_loader import DbcDef, MessageDef, SignalDef, classify, normalize_id
 
 
 @dataclass
@@ -22,6 +22,132 @@ class SignalSeries:
     #   float64 物理值 / 最小整型原值（uint8..int64）/ |Sn 枚举文本 bytes
     values: dict[str, np.ndarray] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Bucket:
+    """解码桶（跨模块契约，词条见 CONTEXT.md「解码桶」）：
+    arb=归一化键（= buckets dict 键，finish 入口断言）；raw_id=首帧原始 id；
+    桶内帧均已分类（构造即预检，finish 不再防御）；插入序=系列序（dict 插入序）。
+    相位互斥（由工厂方法保证）：
+      feed 相位（feed_ts: list[float], feed_data: list[bytes]）→ 数组相位（to_array）
+      blocks 相位（blocks/ts_blocks/lens_blocks: list[ndarray]）→ 数组相位（to_array）
+    数组相位 = ts (N,) float64 / lens (N,) int64 / data (N, L) uint8（finish 消费）。"""
+    arb: int
+    raw_id: int
+    md: MessageDef
+    feed_ts: list[float] | None = None
+    feed_data: list[bytes] | None = None
+    blocks: list[np.ndarray] | None = None
+    ts_blocks: list[np.ndarray] | None = None
+    lens_blocks: list[np.ndarray] | None = None
+    ts: np.ndarray | None = None
+    lens: np.ndarray | None = None
+    data: np.ndarray | None = None
+
+    @classmethod
+    def from_feed(cls, arb: int, raw_id: int, md: MessageDef) -> "Bucket":
+        """feed 路由建桶（decoder.feed setdefault 语义）：raw_id = 首帧原始 id。"""
+        return cls(arb=arb, raw_id=raw_id, md=md, feed_ts=[], feed_data=[])
+
+    @classmethod
+    def from_blocks(cls, arb: int, raw_id: int, md: MessageDef,
+                    block: np.ndarray, ts: np.ndarray, lens: np.ndarray) -> "Bucket":
+        """向量化路由建桶（converter._read_vectorized 语义）：raw_id = 首帧原始 id。"""
+        return cls(arb=arb, raw_id=raw_id, md=md, blocks=[block],
+                   ts_blocks=[ts], lens_blocks=[lens])
+
+    def add_frame(self, ts_seconds: float, data: bytes) -> None:
+        """feed 追加一帧（仅 feed 相位）。"""
+        self.feed_ts.append(ts_seconds)
+        self.feed_data.append(data)
+
+    def add_block(self, block: np.ndarray, ts: np.ndarray, lens: np.ndarray) -> None:
+        """向量化追加一块（仅 blocks 相位；参数序与 from_blocks 一致：block 在前）。"""
+        self.ts_blocks.append(ts)
+        self.lens_blocks.append(lens)
+        self.blocks.append(block)
+
+    def to_array(self) -> None:
+        """三相位 → 数组相位（幂等：数组相位 no-op）。
+
+        feed 相位 → 数组：lens 从 data 字节长推导（原 _normalize_bucket +
+        _bucket_data_array 语义内化）；blocks 相位 → 数组：一次末态连接（原
+        _assemble_bucket 语义内化）。转换后源相位字段置 None（互斥不变式）。
+        """
+        if self.ts is not None:
+            return
+        if self.feed_ts is not None:
+            lens = np.fromiter((len(d) for d in self.feed_data), dtype=np.intp,
+                               count=len(self.feed_ts))
+            n = len(self.feed_data)
+            max_len = int(lens.max()) if n else 0
+            data = np.zeros((n, max_len), dtype=np.uint8)
+            for i, d in enumerate(self.feed_data):
+                if d:
+                    data[i, : len(d)] = np.frombuffer(d, dtype=np.uint8)
+            self.lens = lens
+            self.data = data
+            self.ts = np.asarray(self.feed_ts, dtype=np.float64)
+            self.feed_ts = None
+            self.feed_data = None
+            return
+        # blocks 相位 → 数组（H2a：一次末态连接替代逐容器 np.concatenate
+        # 重分配——实测 3774 次追加拷贝 4.83GB、其中 4.67GB 可避免、函数内
+        # 1.65s → 块切片批量拷贝，每字节只写一次；不用 row/col 散点——桶规模
+        # 1.6 亿位置 × int64 索引数组的 fancy indexing 实测 7.6s，比块拷贝
+        # 慢一个数量级）。单块桶直接复用入桶数组（零拷贝、对象同一性保持——
+        # 数组相位 no-op 测试的同一性前提），多块走一次末态连接。
+        if len(self.ts_blocks) == 1:
+            ts = self.ts_blocks[0]
+            lens = self.lens_blocks[0]
+        else:
+            ts = np.concatenate(self.ts_blocks)
+            lens = np.concatenate(self.lens_blocks)
+        n = len(ts)
+        L = max(int(blk.shape[1]) for blk in self.blocks) if self.blocks else 0
+        if len(self.blocks) == 1 and self.blocks[0].shape[1] == L:
+            data = self.blocks[0]          # 单块且无需补零：直接复用，不拷贝
+        else:
+            data = np.zeros((n, L), dtype=np.uint8)
+            start = 0
+            for blk, bl in zip(self.blocks, self.lens_blocks):
+                m = len(bl)
+                if m:
+                    if blk.shape[1] < L:
+                        blk = np.pad(blk, ((0, 0), (0, L - blk.shape[1])))
+                    data[start:start + m] = blk
+                start += m
+        self.ts = ts
+        self.lens = lens
+        self.data = data
+        self.blocks = None
+        self.ts_blocks = None
+        self.lens_blocks = None
+
+    @property
+    def n_frames(self) -> int:
+        """桶内帧数（三相位）：mp_finish 任务/进度用（现 len(b["ts"])）。"""
+        if self.ts is not None:
+            return len(self.ts)
+        if self.feed_ts is not None:
+            return len(self.feed_ts)
+        if self.ts_blocks is not None:
+            return sum(len(t) for t in self.ts_blocks)
+        return 0
+
+    def memory_estimate(self) -> int:
+        """桶内存估算（三相位）：feed 按帧 ts ~32B + data 字节；blocks/数组按
+        nbytes 求和。bucket_bytes 用（isinstance 分派收进类内）。"""
+        if self.ts is not None:
+            return int(self.ts.nbytes) + int(self.lens.nbytes) + int(self.data.nbytes)
+        if self.feed_ts is not None:
+            return len(self.feed_ts) * 32 + sum(len(d) for d in self.feed_data)
+        if self.ts_blocks is not None:
+            return (sum(t.nbytes for t in self.ts_blocks)
+                    + sum(l.nbytes for l in self.lens_blocks)
+                    + sum(blk.nbytes for blk in self.blocks))
+        return 0
 
 
 # ── 方案C：向量化位提取（与 bitstruct/cantools 逐位等价，测试对拍）──
@@ -135,30 +261,6 @@ def _clamped_int_array(vals: list, dtype: np.dtype) -> np.ndarray:
     half = 1 << (bits - 1)
     return np.where(u.astype(object) >= half,
                     u.astype(object) - (1 << bits), u.astype(object)).astype(dtype)
-
-
-def _bucket_data_array(data_bytes: list[bytes], max_len: int) -> np.ndarray:
-    """bytes 列表 → (N, L) uint8（L = 桶内最大帧长，补零；参考 converter._collect_raw）。"""
-    n = len(data_bytes)
-    arr = np.zeros((n, max_len), dtype=np.uint8)
-    for i, d in enumerate(data_bytes):
-        if d:
-            arr[i, : len(d)] = np.frombuffer(d, dtype=np.uint8)
-    return arr
-
-
-def _normalize_bucket(b) -> None:
-    """桶表示归一化（H1 Step 2，幂等）：feed 列表路径 → 数组表示。
-
-    数组桶契约：ts float64 (N,)、lens int64 (N,)、data (N, L) uint8
-    （L = max(lens)，补零）。向量化路由（Step 3）直接装配数组，无此转换。
-    """
-    if not isinstance(b["data"], list):
-        return
-    lens = np.fromiter((len(d) for d in b["data"]), dtype=np.intp, count=len(b["ts"]))
-    b["lens"] = lens
-    b["data"] = _bucket_data_array(b["data"], int(lens.max()) if len(lens) else 0)
-    b["ts"] = np.asarray(b["ts"], dtype=np.float64)
 
 
 def _choices_lookup(sd: SignalDef, raw: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -289,32 +391,31 @@ def _mux_plan(md: MessageDef) -> tuple[SignalDef, dict[int, list[SignalDef]]] | 
 def _finish_bucket_vectorized(dbc, channel, b, stats) -> list[SignalSeries]:
     """单桶向量化解码（无 mux 或单级 mux），与逐帧参考实现逐点等价。
 
-    H1 Step 2：桶为数组表示（ts float64 (N,)、lens int64 (N,)、data
-    (N, L) uint8——feed 列表路径由 finish() 归一化，向量化路由直接装配）。
+    A：桶为数组相位 Bucket（to_array 收敛：ts float64 (N,)、lens int64
+    (N,)、data (N, L) uint8——feed/向量化路由统一经 to_array 到数组相位）。
     """
-    md = b["md"]
-    n = len(b["ts"])
-    lens = b["lens"]
-    valid = lens >= md.frame_length      # 短帧 DecodeError → 未知
-    decodable = valid.copy()
+    md = b.md
+    n = len(b.ts)
+    # 桶内帧均已分类（构造即预检，见 Bucket docstring）——不再防御短帧
+    decodable = np.ones(n, dtype=bool)
     plan = _mux_plan(md)
     if plan is not None:
-        data64 = _pad_to_64(b["data"]).view("<u8")
+        data64 = _pad_to_64(b.data).view("<u8")
         selector, children = plan
         sel_raw = _extract_signal(data64, selector)
         known_arr = np.array(sorted(children), dtype=sel_raw.dtype)
         bad = ~np.isin(sel_raw, known_arr)      # 无子组的 mux 值 → DecodeError → 未知
-        decodable &= ~bad                        # 短帧已由 valid 排除（& 起点是 valid）
+        decodable &= ~bad
     n_unknown = n - int(decodable.sum())
     if n_unknown:
         stats.unknown_frames += n_unknown
-        stats.unknown_ids.add(b["raw_id"])
+        stats.unknown_ids.add(b.raw_id)
     if not decodable.any():
         return []
     if plan is None:
-        data64 = _pad_to_64(b["data"]).view("<u8")
+        data64 = _pad_to_64(b.data).view("<u8")
     d64 = data64[decodable]
-    timestamps = np.asarray(b["ts"], dtype=np.float64)[decodable]
+    timestamps = np.asarray(b.ts, dtype=np.float64)[decodable]
     n_ok = int(decodable.sum())
     values = {}
     for s in md.signals:
@@ -339,21 +440,21 @@ def _decode_bucket_reference(dbc, channel, b, stats) -> list[SignalSeries]:
     """非向量化报文（mux 报文）回退：逐帧 cantools 解码。
 
     逐帧语义与方案C前完全一致（decode_message/未知帧分类/值累积/收尾类型判定）。
-    H1 Step 2：数组表示——data (N, L) uint8 按 lens 行切片还原帧字节。
+    数组相位（to_array 收敛）——data (N, L) uint8 按 lens 行切片还原帧字节。
     """
     from cantools.database.errors import DecodeError
     from cantools.database.namedsignalvalue import NamedSignalValue
 
-    md = b["md"]
+    md = b.md
     vals_by_sig = {s.name: [] for s in md.signals}
     ts_ok = []
-    for ts, ln, row in zip(b["ts"], b["lens"], b["data"]):
+    for ts, ln, row in zip(b.ts, b.lens, b.data):
         try:
             # 归一化键（含 EFF 位）与 feed/参考实现对拍一致（rulings 修正 2）
-            decoded = dbc.db.decode_message(b["arb"], row[:ln].tobytes())
+            decoded = dbc.db.decode_message(b.arb, row[:ln].tobytes())
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
-            stats.unknown_ids.add(b["raw_id"])
+            stats.unknown_ids.add(b.raw_id)
             continue
         ts_ok.append(ts)
         for s in md.signals:
@@ -409,34 +510,31 @@ class ChannelDecoder:
         self.dbc = dbc
         self.channel = channel
         self.stats = DecodeStats()
-        self.buckets = {}  # arb -> {"ts": [], "data": [], "arb": int, "raw_id": int, "md": MessageDef}
+        self.buckets = {}  # arb -> Bucket（三相位互斥，见 Bucket docstring）
 
     def feed(self, fr: Frame) -> None:
         stats = self.stats
         stats.total_frames += 1
         arb = normalize_id(fr.arbitration_id, fr.is_extended)
-        md = self.dbc.messages.get(arb)
-        if md is None or len(fr.data) < md.frame_length:
+        md = classify(self.dbc, arb, len(fr.data))
+        if md is None:
             # 未知 ID，或已知 ID 短帧（cantools DecodeError）→ 未知帧。
-            # 修正（brief 对已知 ID 短帧也入桶、finish 再计未知）：逐帧参考在
-            # 首个成功解码帧才建桶（短帧不入桶），桶插入顺序 = 系列顺序；
-            # 短帧入桶会使该报文系列位置前移 → 与参考系列顺序不符（真实 DBC
-            # 对拍失败，_assert_series_equal 按顺序 zip）。此处按参考分类逐帧
-            # 预检：短帧直接计未知、不入桶；finish 的 valid 掩码保留为防御。
+            # 桶只收已通过预检的帧：短帧入桶会使系列位置前移，与参考系列
+            # 顺序不符（_assert_series_equal 按顺序 zip）。分类规则唯一实现
+            # 在 dbc_loader.classify（A2：feed 与向量化路由共用）。
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
             return
-        bucket = self.buckets.setdefault(arb, {
-            "ts": [], "data": [], "arb": arb, "raw_id": fr.arbitration_id, "md": md,
-        })
-        bucket["ts"].append(fr.ts_seconds)
-        bucket["data"].append(fr.data)
+        bucket = self.buckets.setdefault(
+            arb, Bucket.from_feed(arb, fr.arbitration_id, md))
+        bucket.add_frame(fr.ts_seconds, fr.data)
 
     def finish(self) -> tuple[list[SignalSeries], DecodeStats]:
         series = []
         for arb, b in self.buckets.items():
-            _normalize_bucket(b)
-            md = b["md"]
+            assert arb == b.arb, f"桶键与字段漂移: {arb} != {b.arb}"
+            b.to_array()
+            md = b.md
             if not _msg_vectorizable(md):
                 series.extend(_decode_bucket_reference(self.dbc, self.channel, b, self.stats))
                 continue

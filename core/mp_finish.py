@@ -13,7 +13,7 @@ CAN3 的 47 桶摊到全部 worker，最大单桶 6 万帧 ≈ 0.8s 解码（桶
 - 统计合并（§5.5）：feed 期计数在父进程；finish 期未知 = Σ桶子进程返回。
 
 任务参数（IPC 最小化）：vectorized 路径不使用 dbc 参数（报文定义在
-bucket["md"]），仅含非向量化报文的通道随任务传 DbcDef（回退路径需要
+bucket.md），仅含非向量化报文的通道随任务传 DbcDef（回退路径需要
 cantools Database）——样例 10 通道全向量化，零 DBC 重复 pickle。
 失败回退：任务异常/池损坏 → 未完成桶原地串行 finish，输出与全串行一致。
 """
@@ -24,11 +24,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
 from core.blf_reader import ScanCancelled
-from core.decoder import DecodeStats, _decode_bucket_reference, \
-    _finish_bucket_vectorized, _msg_vectorizable, _normalize_bucket
+from core.decoder import (Bucket, DecodeStats, _decode_bucket_reference,
+                          _finish_bucket_vectorized, _msg_vectorizable)
 
 
-def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
+def _finish_bucket_worker(channel: int, arb: int, bucket: Bucket, dbc):
     """子进程入口：单桶 finish（= ChannelDecoder.finish() 内同一函数）。
 
     返回 (channel, arb, series 列表, unknown_frames, sorted(unknown_ids),
@@ -38,8 +38,8 @@ def _finish_bucket_worker(channel: int, arb: int, bucket: dict, dbc):
     """
     t0 = time.perf_counter()
     stats = DecodeStats()
-    _normalize_bucket(bucket)   # 列表桶 → 数组表示（幂等；H1 Step 2）
-    md = bucket["md"]
+    bucket.to_array()   # feed/blocks 相位 → 数组相位（幂等；原 _normalize_bucket 职责内化）
+    md = bucket.md
     if not _msg_vectorizable(md):
         # 回退路径需要 cantools Database（_decode_bucket_reference 用 dbc.db）
         series = _decode_bucket_reference(dbc, channel, bucket, stats)
@@ -80,19 +80,11 @@ def make_pool(channels: list[int],
 
 
 def bucket_bytes(decoders, channels: list[int]) -> int:
-    """桶内存估算（阈值回退用，见 §5.7）。
-
-    H1 Step 2 多态：feed 列表路径按帧 ts float 对象 ~32B + data 字节估算；
-    数组表示（H1 向量化路由装配或 finish 归一化后）按 nbytes 精确计。
-    """
+    """桶内存估算（阈值回退用，见 §5.7）：Σ Bucket.memory_estimate()（三相位）。"""
     total = 0
     for ch in channels:
         for b in decoders[ch].buckets.values():
-            if isinstance(b["data"], list):
-                total += len(b["ts"]) * 32 + sum(len(d) for d in b["data"])
-            else:
-                total += int(b["ts"].nbytes) + int(b["data"].nbytes) \
-                    + int(b["lens"].nbytes)
+            total += b.memory_estimate()
     return total
 
 
@@ -162,16 +154,16 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
 
     # ── 任务清单（桶插入序 = 系列顺序）──
     order: dict[int, list[int]] = {ch: [] for ch in channels}   # ch -> [arb]
-    tasks: list[tuple[int, int, dict, int]] = []                # (ch, arb, 桶, 帧数)
+    tasks: list[tuple[int, int, Bucket, int]] = []              # (ch, arb, 桶, 帧数)
     for ch in channels:
         for arb in decoders[ch].buckets:
             b = decoders[ch].buckets[arb]
             order[ch].append(arb)
-            tasks.append((ch, arb, b, len(b["ts"])))
+            tasks.append((ch, arb, b, b.n_frames))
 
     # ── LPT 分派：按桶帧数降序贪心进当前最轻 worker ──
     loads = [0] * n_workers
-    bins: list[list[tuple[int, int, dict, int]]] = [[] for _ in range(n_workers)]
+    bins: list[list[tuple[int, int, Bucket, int]]] = [[] for _ in range(n_workers)]
     for task in sorted(tasks, key=lambda t: -t[3]):
         w = min(range(n_workers), key=lambda i: loads[i])
         bins[w].append(task)
@@ -179,16 +171,16 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
 
     # ── 提交 + 收集 ──
     results: dict[tuple[int, int], tuple[list, int, list[int]]] = {}
-    failed: list[tuple[int, int, dict]] = []
+    failed: list[tuple[int, int, Bucket]] = []
     total_frames = sum(t[3] for t in tasks)
     done_frames = 0
     # 每通道累计解码工作量（timings 请求时）：worker 内实测桶耗时求和
     ch_work: dict[int, float] = {}
 
-    def _report(ch: int, bucket: dict) -> None:
+    def _report(ch: int, bucket: Bucket) -> None:
         """每桶完成上报：percent = 10 + 80 × 累计帧数 / 总帧数（单调）。"""
         nonlocal done_frames
-        done_frames += len(bucket["ts"])
+        done_frames += bucket.n_frames
         if progress_cb and total_frames:
             progress_cb(f"解码 CAN{ch}",
                         10 + 80 * done_frames / total_frames)

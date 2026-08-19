@@ -10,8 +10,8 @@ import can
 import numpy as np
 import pytest
 
-from core import mp_finish
-from core.converter import convert
+from core import blf_reader, mp_finish
+from core.converter import convert, _read_vectorized
 from core.decoder import ChannelDecoder
 from core.dbc_loader import load
 
@@ -118,3 +118,63 @@ def test_parallel_identical_with_module_dims(tmp_path):
     # 复用真实 blf 产物路径参数（与本文件既有真实数据测试同源），
     # 但此处仅断言模块可 import 且签名契约成立（真实等价由既有测试保证）：
     assert callable(compare_files_identical)
+
+
+def test_route_equivalence_buckets(tmp_path):
+    """两条建桶路由（feed 逐帧 / _read_vectorized 向量化）桶级逐元素对拍。
+
+    M1 最脆弱等价点收口：np.unique 首现序 vs setdefault 插入序、未知 ID/短帧
+    分类此前只靠注释声明 + 端到端对拍间接兜底；本测试直接对拍键集、插入序、
+    ts/lens/data、raw_id 与 unknown 记账。feed 侧输入 = 同一文件的标量读回
+    （blf_reader.iter_messages）——与向量化侧同源整数 ns，ts 逐位可比。"""
+    import can
+
+    from test_decoder_vectorized import (MUX_DBC, _random_frames,
+                                         _random_signal_dbc)
+
+    rng = np.random.default_rng(20260819)
+    for trial in range(10):
+        if trial % 2:
+            dbc_txt, known = _random_signal_dbc(rng, 8), [100]
+        else:
+            dbc_txt, known = MUX_DBC, [200]      # mux 报文混入建桶输入面
+        p = tmp_path / f"r{trial}.dbc"
+        p.write_text(dbc_txt, encoding="utf-8")
+        dbc = load(str(p))
+        frames = _random_frames(rng, int(rng.integers(10, 120)), known_ids=known)
+        blf = tmp_path / f"r{trial}.blf"
+        with can.BLFWriter(str(blf), channel=4) as w:
+            for fr in frames:
+                w.on_message_received(can.Message(
+                    timestamp=1784716800.0 + fr.ts_seconds,
+                    arbitration_id=fr.arbitration_id,
+                    is_extended_id=fr.is_extended,
+                    dlc=fr.dlc, data=fr.data, channel=fr.channel))
+                # 与 test_parallel_decode:90-97 先例同形（不写 is_fd：
+                # _random_frames 恒 is_fd=False，BLF 往返标志无关紧要）
+        # feed 路由（to_array 后；输入 = 同一文件标量读回帧）
+        dec_feed = ChannelDecoder(dbc, 1)
+        for fr in blf_reader.iter_messages(str(blf), 1):
+            dec_feed.feed(fr)
+        for b in dec_feed.buckets.values():
+            b.to_array()
+        # 向量化路由（_read_vectorized 装配后 = 数组相位）
+        dec_vec = ChannelDecoder(dbc, 1)
+        # 签名 = (blf_path, decoders, raw_chs, stats_export, stats_bufs,
+        #         raw_chunks, known_keys, read_cb, cancel_cb)——raw_chs=[] 时
+        # 原始帧/known_keys 分支不执行，stats_export=False 时 stats_bufs 不触碰
+        _read_vectorized(str(blf), {1: dec_vec}, [], False, {}, None,
+                         None, None, None)
+        # 桶级逐元素对拍：键集 + 插入序（最脆弱等价点）
+        assert list(dec_vec.buckets) == list(dec_feed.buckets), \
+            f"键集/插入序: {list(dec_vec.buckets)} vs {list(dec_feed.buckets)}"
+        for k in dec_vec.buckets:
+            bv, bf = dec_vec.buckets[k], dec_feed.buckets[k]
+            assert (bv.raw_id, bv.md.name) == (bf.raw_id, bf.md.name), k
+            assert bv.ts.dtype == np.float64 and bf.ts.dtype == np.float64
+            assert bv.lens.dtype == np.int64 and bf.lens.dtype == np.int64
+            assert bv.data.dtype == np.uint8 and bf.data.dtype == np.uint8
+            assert np.array_equal(bv.ts, bf.ts), f"{k} ts"
+            assert np.array_equal(bv.lens, bf.lens), f"{k} lens"
+            assert np.array_equal(bv.data, bf.data), f"{k} data"
+        assert dec_vec.stats == dec_feed.stats, "unknown 记账逐位一致"
