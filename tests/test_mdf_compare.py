@@ -341,6 +341,23 @@ def test_reference_values_tolerance(tmp_path):
     assert compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT) != []
 
 
+def test_reference_timestamps_mismatch(tmp_path):
+    """reference 信号组 t 轴逐位判定：timestamps 偏移 → 报时间戳不一致（组内每信号）。"""
+    _, groups, _ = _simple()
+    p1, p2 = tmp_path / "a.mf4", tmp_path / "b.mf4"
+    _write_mdf(p1, groups)
+    # 显式 t 通道整体偏移 0.5s（_write_mdf：组 timestamps 由显式 t 通道承载）
+    shifted = [("G1", [("SigA", [1.0, 2.0, 3.0], np.float64),
+                       ("SigB", [10, 20, 30], np.int64),
+                       ("t", [0.5, 1.5, 2.5], np.float64)]),
+               ("G2", [("SigC", [b"x", b"y", b"z"], "S8")])]
+    _write_mdf(p2, shifted)
+    diffs = compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT)
+    assert any("SigA" in d and "时间戳不一致" in d for d in diffs)
+    assert any("SigB" in d and "时间戳不一致" in d for d in diffs)
+    assert any("SigC" in d and "时间戳不一致" in d for d in diffs) is False
+
+
 def test_reference_length_mismatch(tmp_path):
     _, groups, _ = _simple()
     p1, p2 = tmp_path / "a.mf4", tmp_path / "b.mf4"
@@ -389,6 +406,22 @@ def test_reference_stats_values(tmp_path):
     diffs = compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT)
     assert any("ch0 StdData" in d and "1 点不一致" in d for d in diffs)
     assert any("ch1" in d for d in diffs) is False  # ch1 未被误报
+
+
+@pytest.mark.parametrize("t_off, expect", [
+    (1e-10, False),  # ULP 级表示噪声（0.1ns）≤ 1ns 网格容差 → 不报
+    (2e-9, True),    # 2ns 超过网格分辨率 → 报
+])
+def test_reference_stats_t_axis_tolerance(tmp_path, t_off, expect):
+    """统计 t 轴 1ns 网格容差：噪声不报、真偏移报。"""
+    nch, npts = 2, 20
+    ours, _ = _stat_groups(nch, npts)
+    _, ref = _stat_groups(nch, npts, t_off=t_off)
+    p1, p2 = tmp_path / "a.mf4", tmp_path / "b.mf4"
+    _write_mdf(p1, ours)
+    _write_mdf(p2, ref)
+    diffs = compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT)
+    assert any("统计 t 轴" in d for d in diffs) is expect
 
 
 def test_reference_stats_t_axis(tmp_path):

@@ -6,7 +6,8 @@
     浮点用「有效容差 atol」：nanmax 差 ≤ atol 视为一致（rtol 仅接口统一，不使用）。
 - compare_files_reference(ref_path, ours_path, *, stats_ref_layout, dims=..., atol=1e-6, rtol=1e-6)
     自产 vs CANoe 参考：按信号集合匹配组；等长全量 isclose(equal_nan=True)；
-    文本定宽重铸比较；统计组逐点验收与 t 轴细查需要显式传入参考统计布局。
+    文本定宽重铸比较；信号时间戳逐位（需求线硬契约）；统计组逐点验收与 t 轴细查
+    需要显式传入参考统计布局。
 
 stats_ref_layout: tuple[int, dict[str, int]] —— (参考每通道统计项数, {统计项名: 组内偏移})，
 必须覆盖 STAT_NAMES 全部 10 项且偏移 ∈ [0, 块大小)；违反则抛 ValueError（错位不静默）。
@@ -180,11 +181,19 @@ def _values_diffs_reference(a, b, ga, gb, atol, rtol):
             continue
         for name in g_a["signals"]:
             label = f"组 {g_a['acq']!r}.{name}"
-            sa = np.asarray(a.get(name, group=g_a["gi"]).samples)
-            sb = np.asarray(b.get(name, group=g_b["gi"]).samples)
+            sig_a = a.get(name, group=g_a["gi"])
+            sig_b = b.get(name, group=g_b["gi"])
+            sa = np.asarray(sig_a.samples)
+            sb = np.asarray(sig_b.samples)
             if len(sa) != len(sb):
                 out.append(f"{label}: 长度 {len(sa)} vs {len(sb)}")
                 continue
+            # 信号时间戳逐位：CANoe 与自产同为整数 ns×1e-9 构造，逐位一致是需求线硬契约
+            ta = np.asarray(sig_a.timestamps)
+            tb = np.asarray(sig_b.timestamps)
+            if not np.array_equal(ta, tb):
+                n = int(np.count_nonzero(ta != tb))
+                out.append(f"{label}: 时间戳不一致 ({n} 点)")
             if sa.dtype.kind in "OSU":
                 if not _text_equal(sa, sb):
                     out.append(f"{label}: 文本不一致")
@@ -227,11 +236,17 @@ def _stats_diffs_reference(a, b, ga, gb, layout):
         if seq != list(STAT_NAMES):
             out.append(f"1s 组内信号序(自产): ch{ch} 与 STAT_NAMES 不符")
             break
-    # 统计 t 轴：自产 ch0 StdData vs 参考 ch0 StdData（layout 显式偏移）
+    # 统计 t 轴：自产 ch0 StdData vs 参考 ch0 StdData（layout 显式偏移）。
+    # 容差 1ns = 整数 ns 网格分辨率：起点带毫秒残值时两侧 float64 运算产生
+    # ULP 级表示噪声（A19G1 实测 ≤3e-5ns），超出网格分辨率才算真实差异。
     ta = np.asarray(a.get("StdData", group=ones_a[0]["gi"]).timestamps)
     tb = np.asarray(b.get("StdData", group=ones_b[offsets["StdData"]]["gi"]).timestamps)
-    if len(ta) != len(tb) or not np.array_equal(ta, tb):
+    if len(ta) != len(tb):
         out.append(f"统计 t 轴: 自产 n={len(ta)} vs 参考 n={len(tb)}")
+    elif np.any(np.abs(ta - tb) > 1e-9):
+        n = int(np.count_nonzero(ta != tb))
+        out.append(f"统计 t 轴: {n} 点不一致 "
+                   f"maxdiff={np.abs(ta - tb).max() * 1e9:.0f}ns")
     # 逐点验收：自产 ch×10+i ↔ 参考 ch×block+offset(name)
     for ch in range(nch):
         for i, name in enumerate(STAT_NAMES):
