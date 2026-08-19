@@ -83,9 +83,9 @@ GUI 探针另加 `-e 's/console=False/console=True/'`），exe 同目录放置
 `VDCCCU_CANFD1.dbc` 现位于 `inputs/dbc_zhilian/`，需先复制到
 `inputs/dbc/` 才能跑通探针：
 - `frozen_probe` 应打印 `PROBE_OK`（验证 multiprocessing spawn 路径）；
-- `frozen_gui_probe`（自动化入口 `tools/run_gui_probe.py`）应打印
-  `GUI_PROBE_OK`，验证真实 GUI 转换期间「BLF → MDF 转换」窗口数恒为 1——
-  即点击转换不会弹出第二个面板（回归防护，见下）。
+- `frozen_gui_probe` 应打印 `GUI_PROBE_OK`，验证真实 GUI 转换期间
+  「BLF → MDF 转换」窗口数恒为 1——即点击转换不会弹出第二个面板
+  （回归防护，见下）。
 
 **冻结打包铁律**：入口脚本 `main.py` 的 `__main__` 块必须调用
 `multiprocessing.freeze_support()`。spawn worker 以
