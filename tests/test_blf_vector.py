@@ -111,15 +111,6 @@ def _fd64(channel, can_id, data, *, flags=0, rel=0, version=1, dlc=None,
 
 
 # ── 容器级对拍 ──
-def _payload(cf, i):
-    """帧载荷重建：scattered = 容器字节切片 + 补零（ljust 语义）；packed = 直接切片。"""
-    o = int(cf.data_off[i]); n = int(cf.data_len[i])
-    if cf.scattered:
-        g = int(cf.glen[i])
-        return bytes(cf.data8[o:o + g]) + b"\x00" * (n - g)
-    return bytes(cf.data8[o:o + n])
-
-
 def _assert_eq(frames, tail, res):
     cf, ftail = res
     assert ftail == tail, "尾部字节不一致"
@@ -134,7 +125,7 @@ def _assert_eq(frames, tail, res):
         assert bool(cf.is_error[i]) == bool(f.is_error), f"[{i}] is_error"
         assert bool(cf.is_fd[i]) == bool(f.is_fd), f"[{i}] is_fd"
         assert cf.dlc[i] == f.dlc, f"[{i}] dlc"
-        d = _payload(cf, i)
+        d = cf.payload(i)
         assert d == f.data, f"[{i}] data"
 
 
@@ -342,7 +333,7 @@ def test_dlc_out_of_range_classic():
         assert res is not None
         cf, _ = res
         assert cf.dlc[0] == dlc and cf.data_len[0] == 8
-        assert _payload(cf, 0) == b"\xAA" * 8
+        assert cf.payload(0) == b"\xAA" * 8
 
 
 def test_fd_dlc_codes():
@@ -364,7 +355,7 @@ def test_fd64_valid_bytes_padding():
     cf, _ = res
     assert cf.dlc[0] == 64 and cf.data_len[0] == 60
     assert cf.glen[0] == 30
-    assert _payload(cf, 0) == b"\xCC" * 30 + b"\x00" * 30
+    assert cf.payload(0) == b"\xCC" * 30 + b"\x00" * 30
 
 
 def test_fd64_ext_data_offset():
@@ -374,13 +365,13 @@ def test_fd64_ext_data_offset():
     res = _check(data)
     assert res is not None
     cf, _ = res
-    assert _payload(cf, 0) == b"\xDD" * 40 + b"\x00" * 20
+    assert cf.payload(0) == b"\xDD" * 40 + b"\x00" * 20
     # ext_off 超长：dfl = vb，切片按容器尾截断 → 40 字节
     data2 = _fd64(1, 0x100, b"\xEE" * 40, valid_bytes=60,
                   ext_data_offset=200)
     res2 = _check(data2)
     assert res2 is not None
-    assert _payload(res2[0], 0) == b"\xEE" * 40 + b"\x00" * 20
+    assert res2[0].payload(0) == b"\xEE" * 40 + b"\x00" * 20
 
 
 def test_fd64_lying_header_size_field():
@@ -393,7 +384,7 @@ def test_fd64_lying_header_size_field():
     cf, _ = res
     assert cf.data_len[0] == 60
     assert cf.glen[0] == 0
-    assert _payload(cf, 0) == b"\x00" * 60
+    assert cf.payload(0) == b"\x00" * 60
 
 
 def test_remote_and_fd_flags():
@@ -543,7 +534,7 @@ def _assert_streams_equal(ref, gots):
             assert f.dlc == cf.dlc[i]
             assert f.is_remote == bool(cf.is_remote[i])
             assert f.is_error == bool(cf.is_error[i])
-            d = _payload(cf, i)
+            d = cf.payload(i)
             assert f.data == d
     with pytest.raises(StopIteration):
         next(it)

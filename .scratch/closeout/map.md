@@ -17,6 +17,7 @@
 <!-- 每张 ticket 解决后在此追加一行：gist + 链接 -->
 
 - [02 — bench/probe 脚本族清理](issues/02-bench-probe-scripts-cleanup.md) — 9 个一次性脚本全部删除（含 3 个 M8「tools 不 import tests」反向依赖）；README 操作指引同步、docs 历史记录保留；全量 pytest 289 passed 无回归
+- [01 — E: ContainerFrames → 帧序列转换 adapter](issues/01-e-containerframes-adapter.md) — 采纳并落地：载荷访问面 `payload_block`/`payload` + glen 恒存在归一（scattered 字段退役）；`_bucket_block` 双分支 → 1 行、测试 `_payload` 删除直调 adapter；未来表示变更触达面 7 处 → 1-2 处；289 passed + 230 组对拍 exit 0 + full_compare 与基线同分
 
 ## Not yet specified
 

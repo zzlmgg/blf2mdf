@@ -35,9 +35,11 @@ _DLC2LEN = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64],
 class ContainerFrames:
     """一个容器解析出的全部帧（快路径/回退同构表示，计划 §3）。
 
-    data8 双契约（H7b）：packed（回退/旧路径）定跨距打包块，data_off 为块内
-    起点、data_len 界定行长；scattered（快路径）data8 = 容器字节零拷贝视图，
-    data_off 为容器内绝对偏移，行尾补零按 glen（FD64 可 < data_len）掩码。
+    载荷消费契约（Proto E 归一，2026-08-19）：glen 恒存在、glen ≤ data_len、
+    data_off + glen ≤ len(data8)；第 i 帧载荷 = data8[data_off:data_off+glen]
+    真实字节 + 行尾补零至 data_len（ljust 语义）。物理布局仍双——packed
+    （回退）定跨距打包块 / scattered（快路径）容器字节零拷贝视图——但布局
+    差异是性能性质，消费方不感知：载荷访问统一走 payload_block / payload。
     """
     channel: np.ndarray    # int64 (N,) 0-based
     ts: np.ndarray         # float64 (N,)（整数 ns 构造，与 Frame.ts_seconds 同语义）
@@ -48,10 +50,33 @@ class ContainerFrames:
     is_fd: np.ndarray      # bool (N,)
     dlc: np.ndarray        # uint8 (N,)（经典=原值；FD=dlc2len，与 Frame.dlc 同语义）
     data8: np.ndarray      # uint8 (M,)（packed=打包载荷；scattered=容器字节视图）
-    data_off: np.ndarray   # int64 (N,) 帧载荷在 data8 中的起点（绝对/块内视契约）
+    data_off: np.ndarray   # int64 (N,) 帧载荷在 data8 中的起点（块内/容器内视布局）
     data_len: np.ndarray   # int64 (N,)（= len(Frame.data)）
-    scattered: bool = False            # H7b：快路径散点契约（data8=容器字节视图）
-    glen: np.ndarray | None = None     # H7b：实际载荷字节数（FD64 可 < data_len）
+    glen: np.ndarray       # int64 (N,) 真实载荷字节数（FD64 可 < data_len；packed = data_len）
+
+    def payload_block(self, sel) -> np.ndarray:
+        """sel 帧子集 → (N, L) 定宽载荷块，补零就位（行尾 ljust 语义）。
+
+        双布局唯一载荷语义实现（Proto E）：向量化零拷贝 gather + glen 掩码，
+        与 H7b scattered 分支逐位相同；全满桶跳过掩码（同现优化）。不变量
+        由生产者保证，本方法消费侧零分支。
+        """
+        lens = self.data_len[sel]
+        n = len(lens)
+        if n == 0:
+            return np.zeros((0, 0), dtype=np.uint8)
+        L = int(lens.max())
+        idt = np.int32 if self.data8.size < 2 ** 31 else np.int64
+        src2 = self.data_off[sel].astype(idt)[:, None] + np.arange(L, dtype=idt)
+        block = np.take(self.data8, src2, mode="clip")
+        if not bool(np.all(self.glen[sel] == L)):
+            block[np.arange(L)[None, :] >= self.glen[sel][:, None]] = 0
+        return block
+
+    def payload(self, i) -> bytes:
+        """单帧载荷（测试面）：真实字节 + 行尾补零（ljust 语义）。"""
+        o = int(self.data_off[i]); n = int(self.data_len[i]); g = int(self.glen[i])
+        return bytes(self.data8[o:o + g]) + b"\x00" * (n - g)
 
 
 def _empty_container_frames() -> ContainerFrames:
@@ -61,7 +86,7 @@ def _empty_container_frames() -> ContainerFrames:
         is_remote=np.empty(0, bool), is_error=np.empty(0, bool),
         is_fd=np.empty(0, bool), dlc=np.empty(0, np.uint8),
         data8=np.empty(0, np.uint8), data_off=np.empty(0, np.int64),
-        data_len=np.empty(0, np.int64))
+        data_len=np.empty(0, np.int64), glen=np.empty(0, np.int64))
 
 
 # ── 移位组装提取（显式小端，机器无关；p 越界处读出垃圾值，由调用方掩码
@@ -353,10 +378,11 @@ def _parse_fast(data: bytes, ms_part: int):
     not_fd64 = use & ~t_fd64
     glen_full[not_fd64] = dlen_full[not_fd64]
 
-    # ── 载荷散点输出（H7b）：快路径不再打包——data8 = 容器字节零拷贝
-    # 视图、data_off = 帧载荷容器内绝对偏移；补零语义（FD64 截断 ljust）
-    # 下沉消费者 _bucket_block（按 glen 掩码）。容器级打包拷贝（362MB
-    # 结果 + 1.45GB 索引）整体删除，载荷只拷一次（桶级固有拷贝 164MB）。
+    # ── 载荷输出（H7b + Proto E 归一）：快路径不打包——data8 = 容器字节
+    # 零拷贝视图、data_off = 帧载荷容器内绝对偏移；glen 恒存在（FD64 截断
+    # 补零由 ContainerFrames.payload_block 按 glen 统一掩码）。容器级打包
+    # 拷贝（362MB 结果 + 1.45GB 索引）整体删除，载荷只拷一次（桶级固有
+    # 拷贝 164MB）。
     lens = dlen_full[idx]
     n_emit = len(idx)
     if n_emit:
@@ -376,7 +402,7 @@ def _parse_fast(data: bytes, ms_part: int):
         channel=ch_full[idx], ts=ts, arb=arb_full[idx], is_ext=ext_full[idx],
         is_remote=remote_full[idx], is_error=err_full[idx], is_fd=fd_full[idx],
         dlc=dlc_full[idx], data8=data8, data_off=data_off,
-        data_len=lens, scattered=True, glen=glen)
+        data_len=lens, glen=glen)
 
     # ── 早退轮（§4.4 核对修正）：walk 在轮 first 失败后返回已累积帧 +
     # tail = data[s[first]:]（窗口下界为界，含未消费 padding）──
@@ -420,7 +446,7 @@ def _frames_to_container(frames: list) -> ContainerFrames:
         is_error=np.fromiter((f.is_error for f in frames), dtype=bool, count=n),
         is_fd=np.fromiter((f.is_fd for f in frames), dtype=bool, count=n),
         dlc=np.fromiter((f.dlc for f in frames), dtype=np.uint8, count=n),
-        data8=data8, data_off=starts[:-1].copy(), data_len=lens)
+        data8=data8, data_off=starts[:-1].copy(), data_len=lens, glen=lens)
 
 
 def iter_container_frames(path: str, progress_cb=None, cancel_cb=None,
