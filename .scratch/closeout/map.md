@@ -1,5 +1,7 @@
 # 综合收尾（Closeout 2026-08）
 
+Status: **completed (2026-08-19)** — 八张 ticket 全闭、map destination 达成（见「最终验收与文档收尾」票）；本图归档保留作决策记录，后续目标按 fresh effort 另开新 map。
+
 ## Destination
 
 把 V1.2 后已知残余收敛到「可宣称收尾」：架构线（E adapter 设计裁决、9 个 bench/probe 脚本清理、Worth exploring 分三组逐条裁决做则落地）+ 性能线（H3 输入探测实施，8.55s → ~1.5s）+ 最终验收（全量 pytest 全绿、对拍链、AHT 计时复测）。终点 = 无未决残余、验收全绿、文档状态与代码一致。
