@@ -11,7 +11,8 @@ from core.dbc_loader import DbcDef, _detect_encoding, load
 LOGGER = logging.getLogger(__name__)
 
 # 映射文件缺失时的内置回退表（与 dbc_对应关系.txt 前 10 行同步；键 = DBC 文件
-# 主名，值 = CAN 通道号）
+# 主名，值 = CAN 通道号）。改表必须同步 dbc_对应关系.txt 与
+# tests/test_project_loader.py 的 EXPECTED_MAPPING（契约测试锚，漂移在 pytest 阶段变响亮）
 DEFAULT_MAPPING = {
     "CFCAN1": 13,
     "CFCAN2": 3,

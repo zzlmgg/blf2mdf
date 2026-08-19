@@ -44,6 +44,12 @@ def test_load_mapping_missing_file_falls_back():
     assert project_loader.load_mapping("不存在的路径.txt") \
         == project_loader.DEFAULT_MAPPING
     assert project_loader.load_mapping() == project_loader.DEFAULT_MAPPING
+
+
+def test_default_mapping_matches_contract_anchor():
+    """契约锚：DEFAULT_MAPPING（发布 exe 无映射文件时的事实源）必须与
+    EXPECTED_MAPPING 逐键一致。改内置映射必须同步 EXPECTED_MAPPING 与
+    dbc_对应关系.txt（源码运行形态的事实源），漂移在此变响亮。"""
     assert project_loader.DEFAULT_MAPPING == EXPECTED_MAPPING
 
 

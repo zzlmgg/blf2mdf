@@ -22,6 +22,7 @@
 - [04 — core 收口面裁决（含搭车项）](issues/04-core-consolidation.md) — Q1 worker 数/进度带单一来源（resolve_workers + decode_progress）、Q2 find_ccu3_root 下沉 project_loader、Q3 容器流衔接三私有名转正、Q5 退化显式化（ConversionResult.warnings）、Q6 取消协议 ConversionCancelled 全部做；Q4 read_start_time 整数化搁置（入 Out of scope）；291 passed + 230 组逐位一致 + full_compare 同分（3434 已知真实差异）
 - [07 — H3 输入探测提速](issues/07-h3-input-probe.md) — 方案 1 向量化行走单独做（缓存不做）：probe_channels 新增 _probe_fast 复用 _candidates + 掩码提取，终止分型按 probe 裁剪标量、回退 oracle 不 raise；行走 ~6.3s → ~0.24s（96%↓）；输入阶段冷 12.32 → 6.22s、GUI 热口径 ~2.2s（zlib 1.78s 硬下限）；291 passed + 230 组逐位一致 + full_compare 同分
 - [05 — 测试基建面裁决](issues/05-test-infra.md) — Q1 conftest 上收做（qapp/window 单一来源、window 统一 yield+close 规范形、删 import 时 mkdir 副作用与无引用常量）、Q2 sample_blf 固定具名 A19G1（删排序取首漂移）、Q3 冻结探针转 subprocess pytest 不做（入 Out of scope）；291 passed = 基线零回归
+- [06 — DEFAULT_MAPPING 单一来源裁决](issues/06-default-mapping-source.md) — 票面「三份」实为两份已删（convert_aht 随 02 票、test_golden 随 H2），轻量收敛已完整落地（MAPPING_TEXT/EXPECTED_MAPPING/真实 txt 四边互锁断言，漂移在 pytest 阶段已响亮）；Q1 档 1 意图显性化做（:47 对拍提为独立契约测试 + DEFAULT_MAPPING 注释指路），Q2 方案 A（数据文件自动生成）不做（机制已反向：txt 优先、DEFAULT 仅回退）入 Out of scope；292 passed 零回归
 
 ## Not yet specified
 
@@ -32,6 +33,7 @@
 
 - **1.28GB ccu3.0 平台 BLF 输入**（20260324 文件）：非本项目输入，转换失败属预期行为（用户 2026-08-19 裁定）；walk 对齐修复已于 2026-08-17 完成
 - **解码路由回归 decoder ownership**：review §4 结论「现有测试锁足够，不必现在动手」
+- **数据文件自动生成 DEFAULT_MAPPING**（[06 票裁决](issues/06-default-mapping-source.md)「Q2 不做」）：机制已反向存在（dbc_对应关系.txt 优先、DEFAULT_MAPPING 仅回退，回退值必须内置代码——发布 exe 不打包 txt）；引入构建/缓存属 Speculative 成本；轻量收敛互锁断言已覆盖漂移
 - **H5 压缩级别 9→6 裁决 / H6 池预热重叠 / H7d 桶分组 / H7c 解压重叠**：用户裁定「现阶段只做 H3」；destination 重画（重启性能线）时可作 fresh effort
 - **H2b/H2c 共享内存回传**：2026-08-15 已否决（收益不抵复杂度）
 - **统一两个 worker adapter 骨架**（GUI P3，[03 票裁决](issues/03-gui-worth-exploring.md)「不做」）：重复面仅 8 行 try/except 骨架；progress 信号载荷不同（(str,float) vs (float)）致基类无法统一信号，合并得不偿失，违背标准⑥
