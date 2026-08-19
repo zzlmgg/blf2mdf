@@ -4,7 +4,7 @@ import pytest
 
 from core.blf_reader import (
     Frame,
-    ScanCancelled,
+    ConversionCancelled,
     iter_all_messages,
     iter_messages,
     list_channels,
@@ -187,10 +187,10 @@ def test_probe_channels_reports_monotonic_progress(tmp_path):
 
 
 def test_probe_channels_cancel(tmp_path):
-    """cancel_cb 置位 → raise ScanCancelled；恒 False → 正常完成。"""
+    """cancel_cb 置位 → raise ConversionCancelled；恒 False → 正常完成。"""
     p = tmp_path / "cancel1.blf"
     _big_blf(p)  # ≥1024 帧，检查点在 1024 帧处触发
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         probe_channels(str(p), cancel_cb=lambda: True)
     assert probe_channels(str(p), cancel_cb=lambda: False), \
         "cancel_cb 恒 False 不应取消"
@@ -200,7 +200,7 @@ def test_iter_all_messages_cancel(tmp_path):
     """iter_all_messages 的 cancel_cb 同款语义（转换读取阶段用）。"""
     p = tmp_path / "cancel2.blf"
     _big_blf(p)
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         list(iter_all_messages(str(p), cancel_cb=lambda: True))
     frames = list(iter_all_messages(str(p), cancel_cb=lambda: False))
     assert len(frames) >= 1024, "恒 False 不应取消"

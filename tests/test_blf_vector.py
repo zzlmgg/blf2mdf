@@ -1,6 +1,6 @@
 """H1 向量化解析器属性对拍（core/blf_vector.py，计划 §9.1.1）。
 
-对拍对象 = 现行标量行走 blf_reader._walk_container（oracle，行为与
+对拍对象 = 现行标量行走 blf_reader.walk_container（oracle，行为与
 python-can _parse_data 一致）。容器字节手工构造（不经 python-can writer），
 覆盖其 writer 不产生的布局：未知版本、对象体内假阳性、窗口内假阳性、
 空洞/垃圾、跨容器截断、损坏头字段、FD64 的 ext_data_offset/说谎字段等。
@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 
 from core import blf_reader
-from core.blf_reader import (ScanCancelled, _iter_containers, _ms_part_ns,
-                             _walk_container)
+from core.blf_reader import (ConversionCancelled, iter_containers, ms_part_ns,
+                             walk_container)
 from core.blf_vector import (_parse_fast, _u16_at, _u16_at_v, _u32_at,
                              _u32_at_v, _u64_at, _u64_at_v,
                              iter_container_frames)
@@ -136,7 +136,7 @@ def _check(data, ms_part=0):
     → None。标量正常而快路径抛异常、或标量抛而快路径产出结果 = 测试失败。
     """
     try:
-        frames, tail = _walk_container(data, ms_part, None)
+        frames, tail = walk_container(data, ms_part, None)
     except Exception as e:
         try:
             res = _parse_fast(data, ms_part)
@@ -261,10 +261,10 @@ def test_gap_beyond_window_raises_or_tails():
         data = _msg(1, 0x100, b"\x01") + b"\x00" * k + _msg(1, 0x101, b"\x02")
         assert _check(data) is None
         with pytest.raises(BLFParseError):
-            _walk_container(data, 0, None)
+            walk_container(data, 0, None)
         # 情形 2：容器在 e_A 后不足 8 字节 → 双双尾部（= 洞字节）
         data2 = _msg(1, 0x100, b"\x01") + b"\x00" * k
-        frames, tail = _walk_container(data2, 0, None)
+        frames, tail = walk_container(data2, 0, None)
         assert tail == b"\x00" * k
         res = _check(data2)
         assert res is not None and res[1] == tail
@@ -273,7 +273,7 @@ def test_gap_beyond_window_raises_or_tails():
 def test_tail_junk_gte_8_raises():
     data = _msg(1, 0x100, b"\x01") + b"\x00" * 8
     with pytest.raises(BLFParseError):
-        _walk_container(data, 0, None)
+        walk_container(data, 0, None)
     with pytest.raises(BLFParseError):
         _parse_fast(data, 0)   # valid[last] ∧ e+8 ≤ max_pos → 直接 raise
 
@@ -281,7 +281,7 @@ def test_tail_junk_gte_8_raises():
 def test_no_candidates_tail_or_raise():
     for n in range(8):
         data = b"\x00" * n
-        frames, tail = _walk_container(data, 0, None)
+        frames, tail = walk_container(data, 0, None)
         assert frames == [] and tail == data
         res = _parse_fast(data, 0)
         assert res is not None and res[1] == data \
@@ -289,7 +289,7 @@ def test_no_candidates_tail_or_raise():
     for n in (8, 9):
         data = b"\x00" * n
         with pytest.raises(BLFParseError):
-            _walk_container(data, 0, None)
+            walk_container(data, 0, None)
         with pytest.raises(BLFParseError):
             _parse_fast(data, 0)
 
@@ -311,7 +311,7 @@ def test_version_header_truncated_last_candidate():
     data = _msg(1, 0x200, b"\x02") + truncated
     assert _check(data) is None
     with pytest.raises(struct.error):
-        _walk_container(data, 0, None)
+        walk_container(data, 0, None)
     assert _parse_fast(data, 0) is None
 
 
@@ -322,7 +322,7 @@ def test_message_body_truncated_last_candidate():
     data = _msg(1, 0x200, b"\x02") + truncated
     res = _check(data)
     assert res is not None and res[1] == truncated and len(res[0].channel) == 1
-    frames, tail = _walk_container(data, 0, None)
+    frames, tail = walk_container(data, 0, None)
     assert len(frames) == 1 and tail == truncated
 
 
@@ -429,9 +429,9 @@ def test_cross_container_split_all_offsets():
         data2 = obj[k:] + tail_obj
         _check(data1)
         _check(data2)
-        f1, t1 = _walk_container(data1, 0, None)
-        f2, t2 = _walk_container(t1 + data2, 0, None)
-        fall, tall = _walk_container(data1 + data2, 0, None)
+        f1, t1 = walk_container(data1, 0, None)
+        f2, t2 = walk_container(t1 + data2, 0, None)
+        fall, tall = walk_container(data1 + data2, 0, None)
         assert f1 + f2 == fall, f"k={k} 跨容器组合帧不相等"
         assert t2 == tall, f"k={k} 组合尾部不一致"
 
@@ -442,8 +442,8 @@ def test_junk_tail_continuation():
     data2 = _msg(2, 0x200, b"\x02")
     res = _check(data1)
     assert res is not None and res[1] == b"\xFE" * 3
-    f1, t1 = _walk_container(data1, 0, None)
-    f2, t2 = _walk_container(t1 + data2, 0, None)
+    f1, t1 = walk_container(data1, 0, None)
+    f2, t2 = walk_container(t1 + data2, 0, None)
     assert len(f1) == 1 and len(f2) == 1
     # 衔接后：窗口下界按 obj_start+obj_size 推进（gap 字节未消费）——
     # msg2 末尾 3 字节留在 tail，继续流向下一容器
@@ -568,7 +568,7 @@ def test_iter_container_frames_progress_monotonic(tmp_path):
 def test_iter_container_frames_cancel(tmp_path):
     p = tmp_path / "cancel.blf"
     _write_synthetic(p, frames=2500)
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         list(iter_container_frames(str(p), cancel_cb=lambda: True))
     got = list(iter_container_frames(str(p), cancel_cb=lambda: False))
     assert got
@@ -583,9 +583,9 @@ def test_sample_full_bitwise_and_fast_engagement():
     ms_part = None
     tail = b""
     total = hits = 0
-    for start_ns, data in _iter_containers(str(blf)):
+    for start_ns, data in iter_containers(str(blf)):
         if ms_part is None:
-            ms_part = _ms_part_ns(start_ns)
+            ms_part = ms_part_ns(start_ns)
         if tail:
             data = tail + data
             tail = b""
@@ -595,7 +595,7 @@ def test_sample_full_bitwise_and_fast_engagement():
             hits += 1
             tail = res[1]
         else:
-            _, tail = _walk_container(data, ms_part, None)
+            _, tail = walk_container(data, ms_part, None)
     assert hits == total, f"样例 {hits}/{total} 容器命中快路径"
     # 全量对拍：快路径流 / 强制回退流 vs 现行 iter_all_messages
     ref = list(blf_reader.iter_all_messages(str(blf)))

@@ -44,7 +44,7 @@ System32 自带 ICU，Win10 1709+/Win11 可用，**免安装、可在无 Python 
 
 数据文件不打包。发布目录即构建输出目录 `exe_publish/`（`BLF2MDF.exe` +
 `dbc_ccu3.0/` 直接旁挂），exe 自动在自身目录下找 `inputs/dbc_ccu3.0` 或
-`dbc_ccu3.0`（两种布局由 `main_window._find_ccu3_root()` 自动兼容，优先
+`dbc_ccu3.0`（两种布局由 `project_loader.find_ccu3_root()` 自动兼容，优先
 inputs 布局），输出写到 exe 旁的 `outputs/`：
 
 ```

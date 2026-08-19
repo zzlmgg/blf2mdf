@@ -26,6 +26,23 @@ DEFAULT_MAPPING = {
 }
 
 
+def find_ccu3_root(root: str | Path | None) -> Path | None:
+    """定位 ccu3.0 DBC 数据源：<root>/inputs/dbc_ccu3.0 或 <root>/dbc_ccu3.0。
+
+    兼容两种发布布局：inputs/ 层（源码运行与当前发布包）与 exe 直接旁挂
+    （用户把 dbc_ccu3.0 放 exe 同一目录）。优先 inputs 布局；两者都无时
+    返回 None（GUI 降级为手动添加 DBC，不崩溃）。P5 收口：数据源定位
+    归本模块职责，main_window 不再持有（README 与测试同源改调）。
+    """
+    if root is None:
+        return None
+    root = Path(root)
+    for candidate in (root / "inputs" / "dbc_ccu3.0", root / "dbc_ccu3.0"):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def list_projects(root: str | Path | None) -> list[str]:
     """枚举含 .dbc 文件的项目文件夹（按名称排序）。
 

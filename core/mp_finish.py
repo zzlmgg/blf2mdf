@@ -23,7 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
-from core.blf_reader import ScanCancelled
+from core.blf_reader import ConversionCancelled
 from core.decoder import (Bucket, DecodeStats, _decode_bucket_reference,
                           _finish_bucket_vectorized, _msg_vectorizable)
 
@@ -54,28 +54,44 @@ def _noop():
     return None
 
 
-def warm_up(pool: ProcessPoolExecutor) -> None:
+def resolve_workers(workers: int | None, n_channels: int,
+                    env_override: bool = True) -> int:
+    """worker 数唯一决策点（L1 收口）：显式 workers → cpu 数，再对通道数
+    取 min；env BLF_MP_WORKERS 覆盖仅产品路径（make_pool）启用，
+    finish_all 内部建池（测试/串行兜底）保持不读 env——语义不变。"""
+    n = workers if workers is not None else (os.cpu_count() or 1)
+    if env_override:
+        env = os.environ.get("BLF_MP_WORKERS")
+        if env:
+            n = int(env)
+    return min(n, n_channels)
+
+
+def decode_progress(fraction: float) -> float:
+    """解码进度带 10→90（串行/并行共用，L1 收口）：10 + 80 × 完成比例。"""
+    return 10 + 80 * fraction
+
+
+def warm_up(pool: ProcessPoolExecutor, n_workers: int) -> None:
     """扫描期预热：每个 worker 槽提交一个 no-op 任务并等待，让全部 worker
     的 spawn + import（numpy/cantools）耗时藏在扫描期（实测 8 worker
     ~1.7s）。注意只提交 1 个任务时 ProcessPoolExecutor 惰性只拉起 1 个
     worker，其余 spawn 会落到首个真实任务提交时（H1 后解码墙钟实测
-    ~1.7s 虚增）——必须按 max_workers 全量预热。"""
-    futures = [pool.submit(_noop) for _ in range(pool._max_workers)]
+    ~1.7s 虚增）——必须按已知 worker 数全量预热。"""
+    futures = [pool.submit(_noop) for _ in range(n_workers)]
     for f in futures:
         f.result()
 
 
 def make_pool(channels: list[int],
               workers: int | None = None) -> ProcessPoolExecutor:
-    """创建并预热进程池（worker 数 = min(cpu, 通道数)，env BLF_MP_WORKERS 覆盖）。
-
-    convert 在 feed 循环前调用（预热藏在扫描期）；池由调用方负责 shutdown。
+    """创建并预热进程池（worker 数 = resolve_workers 唯一决策，env
+    BLF_MP_WORKERS 覆盖）。convert 在 feed 循环前调用（预热藏在扫描期）；
+    池由调用方负责 shutdown。
     """
-    env = os.environ.get("BLF_MP_WORKERS")
-    n = min(int(env) if env else (workers if workers is not None
-                                  else (os.cpu_count() or 1)), len(channels))
+    n = resolve_workers(workers, len(channels))
     pool = ProcessPoolExecutor(max_workers=n)
-    warm_up(pool)
+    warm_up(pool, n)
     return pool
 
 
@@ -130,24 +146,23 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
     - 调用方可在扫描前创建池并 warm_up（spawn 成本藏在扫描期）；
       pool=None 时内部创建（无预热，主要供测试/串行兜底对照用）。
     - progress_cb(stage, percent)：每桶完成时实时回调一次（percent =
-      10 + 80 × 累计完成帧数 / 总帧数，随 as_completed 单调递增）；
+      decode_progress(累计完成帧数 / 总帧数)，随 as_completed 单调递增）；
       失败桶在串行兜底完成后同样上报。修复：旧实现把全部上报推迟到
       所有桶完成后按通道补齐 → 解码期间进度条停住、结束瞬间跳到 90%。
     - verify=True：组装结果与父进程本地串行 finish 全量对拍（测试用）。
     - 失败回退：任务异常/池损坏 → 未完成桶原地串行 finish，结果与全串行一致。
     - cancel_cb() 可选：每桶完成时检查（收集循环 + 串行兜底循环），置位即
-      raise ScanCancelled——注意必须在通用 except Exception 之前捕获，否则
+      raise ConversionCancelled——注意必须在通用 except Exception 之前捕获，否则
       取消异常会被当成池故障吞掉、转串行兜底重解（取消静默失效）。
     - timings 可选（GUI 日志用）：传入 dict 时填充 {ch: 秒}，语义 = 该通道
       各桶解码的累计工作量（worker 内实测每桶耗时求和，含串行兜底桶）——
       并行下各通道互相重叠，是 CPU 工作而非墙钟跨度；零桶通道填 0.0；
-      ScanCancelled 抛出时不收尾（随异常丢弃）。
+      ConversionCancelled 抛出时不收尾（随异常丢弃）。
     """
     if not channels:
         return {}
     need_dbc = _needs_dbc(decoders, channels)
-    n_workers = min(workers if workers is not None else (os.cpu_count() or 1),
-                    len(channels))
+    n_workers = resolve_workers(workers, len(channels), env_override=False)
     owned = pool is None
     if owned:
         pool = ProcessPoolExecutor(max_workers=n_workers)
@@ -183,7 +198,7 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
         done_frames += bucket.n_frames
         if progress_cb and total_frames:
             progress_cb(f"解码 CAN{ch}",
-                        10 + 80 * done_frames / total_frames)
+                        decode_progress(done_frames / total_frames))
 
     try:
         futures = {}
@@ -196,7 +211,7 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
             # 取消检查点：每桶完成时（in-flight 桶由 finally 的
             # shutdown(cancel_futures=True) 收尾，运行中桶至多 ~1s）
             if cancel_cb is not None and cancel_cb():
-                raise ScanCancelled()
+                raise ConversionCancelled()
             ch, arb = futures[f]
             try:
                 _, _, series, unk_frames, unk_ids, dur = f.result()
@@ -206,7 +221,7 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
             ch_work[ch] = ch_work.get(ch, 0.0) + dur
             results[(ch, arb)] = (series, unk_frames, unk_ids)
             _report(ch, decoders[ch].buckets[arb])
-    except ScanCancelled:
+    except ConversionCancelled:
         # 必须先于通用 except Exception 捕获：取消不能走「池故障→串行兜底」
         raise
     except Exception:
@@ -224,7 +239,7 @@ def finish_all(decoders: dict[int, "ChannelDecoder"], channels: list[int],
     for ch, arb, bucket in failed:
         # 取消检查点：串行兜底逐桶
         if cancel_cb is not None and cancel_cb():
-            raise ScanCancelled()
+            raise ConversionCancelled()
         _, _, series, unk_frames, unk_ids, dur = \
             _finish_bucket_worker(ch, arb, bucket, decoders[ch].dbc)
         results[(ch, arb)] = (series, unk_frames, unk_ids)

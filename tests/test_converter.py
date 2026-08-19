@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from asammdf import MDF
 
-from core.blf_reader import ScanCancelled
+from core.blf_reader import ConversionCancelled
 from core.converter import convert
 from core.dbc_loader import load
 
@@ -269,11 +269,11 @@ def test_convert_stats_t_axis_last_point_full_precision(tmp_path):
 # ---- 转换取消 ----
 
 def test_convert_cancel_preset_no_output(tmp_path, blf_and_dbc):
-    """cancel_cb 预置 True：转换在任何检查点（读取后）即抛 ScanCancelled，
+    """cancel_cb 预置 True：转换在任何检查点（读取后）即抛 ConversionCancelled，
     输出文件与半成品 .mf4 均不残留。"""
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "cancelled.mdf"
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         convert(blf, {1: load(dbc_path)}, str(out), cancel_cb=lambda: True)
     assert not out.exists(), "取消后不应残留输出文件"
     assert not Path(str(out).replace(".mdf", ".mf4")).exists(), \
@@ -301,14 +301,14 @@ def test_convert_cancel_mid_read(tmp_path):
         state["calls"] += 1
         return state["calls"] >= 3  # 1024、2048 帧处 False，3072 帧处 True
 
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         convert(blf, {1: load(dbc)}, str(out), cancel_cb=cancel)
     assert not out.exists()
 
 
 def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
     """并行解码（finish_all 桶收集循环）中取消：cancel_cb 在读取后检查点放行、
-    首个桶完成时置位 → ScanCancelled 从 finish_all 上抛（不被 except Exception
+    首个桶完成时置位 → ConversionCancelled 从 finish_all 上抛（不被 except Exception
     吞掉转串行重解），输出不残留。"""
     blf, dbc_path = blf_and_dbc
     out = tmp_path / "par_cancel.mdf"
@@ -318,7 +318,7 @@ def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
         state["calls"] += 1
         return state["calls"] >= 2  # 读取后检查点（第 1 次）放行，桶完成时（第 2 次）取消
 
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         convert(blf, {1: load(dbc_path), 2: load(dbc_path)}, str(out),
                 parallel=True, cancel_cb=cancel)
     assert not out.exists()
@@ -327,7 +327,7 @@ def test_convert_parallel_cancel_during_finish(tmp_path, blf_and_dbc):
 def test_convert_cancel_after_write_discards_output(tmp_path, blf_and_dbc,
                                                     monkeypatch):
     """写后取消分支（2026-08-18 spec D5 唯一剩余清理）：write_mdf 成功返回后
-    cancel_cb 置位 → 完整产物被删除 + ScanCancelled。删除完整产物是
+    cancel_cb 置位 → 完整产物被删除 + ConversionCancelled。删除完整产物是
     「取消 = 放弃本次转换」的 converter 业务语义（CONTEXT.md：取消不是失败）。
 
     取消条件 = write_mdf 已完成的标志（状态机，非检查点计数）：前面所有
@@ -350,7 +350,7 @@ def test_convert_cancel_after_write_discards_output(tmp_path, blf_and_dbc,
     def cancel():
         return state["written"]
 
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         convert(blf, {1: load(dbc_path)}, str(out), cancel_cb=cancel)
     assert state["written"], "取消必须发生在 write_mdf 完成后（否则测试空过）"
     assert not out.exists(), "取消 = 放弃本次转换：完整产物应被删除"
@@ -378,9 +378,9 @@ def test_convert_reports_stage_timings(tmp_path, blf_and_dbc):
 
 
 def test_convert_cancel_discards_timings(tmp_path, blf_and_dbc):
-    """取消路径：ScanCancelled 上抛，timings 随异常丢弃（GUI 取消日志不带耗时）。"""
+    """取消路径：ConversionCancelled 上抛，timings 随异常丢弃（GUI 取消日志不带耗时）。"""
     blf, dbc_path = blf_and_dbc
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ConversionCancelled):
         convert(blf, {1: load(dbc_path)}, str(tmp_path / "x.mdf"),
                 cancel_cb=lambda: True)
 

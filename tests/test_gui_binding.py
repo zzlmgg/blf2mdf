@@ -453,38 +453,38 @@ def _wait_until(qapp, cond, timeout=10.0):
 
 
 def _looping_probe_until_cancel():
-    """确定性探测桩：循环检查 cancel_cb，置位即抛 ScanCancelled——
+    """确定性探测桩：循环检查 cancel_cb，置位即抛 ConversionCancelled——
     避免真实 probe 在毫秒级完成导致的时序抖动。"""
     import time
 
-    from core.blf_reader import ScanCancelled
+    from core.blf_reader import ConversionCancelled
 
     def fake(path, progress_cb=None, cancel_cb=None):
         while True:
             if cancel_cb and cancel_cb():
-                raise ScanCancelled()
+                raise ConversionCancelled()
             time.sleep(0.001)
 
     return fake
 
 
 def _looping_convert_until_cancel():
-    """确定性转换桩：循环检查 cancel_cb，置位即抛 ScanCancelled。"""
+    """确定性转换桩：循环检查 cancel_cb，置位即抛 ConversionCancelled。"""
     import time
 
-    from core.blf_reader import ScanCancelled
+    from core.blf_reader import ConversionCancelled
 
     def fake(*args, cancel_cb=None, **kwargs):
         while True:
             if cancel_cb and cancel_cb():
-                raise ScanCancelled()
+                raise ConversionCancelled()
             time.sleep(0.001)
 
     return fake
 
 
 def test_scan_cancel_aborts_and_resets(window, qapp, tmp_path, monkeypatch):
-    """扫描中取消：worker 抛 ScanCancelled → 状态复位（blf_path 不变、
+    """扫描中取消：worker 抛 ConversionCancelled → 状态复位（blf_path 不变、
     进度条隐藏、文件选择恢复），不弹错误框。"""
     import gui.main_window as mw
 
@@ -513,7 +513,7 @@ def test_scan_cancel_aborts_and_resets(window, qapp, tmp_path, monkeypatch):
 
 
 def test_convert_cancel_resets_state(window, qapp, tmp_path, monkeypatch):
-    """转换中取消：worker 抛 ScanCancelled → 状态复位（进度归零、
+    """转换中取消：worker 抛 ConversionCancelled → 状态复位（进度归零、
     stage_label 就绪、按钮恢复、摘要「已取消」），不弹任何框。"""
     import gui.main_window as mw
 

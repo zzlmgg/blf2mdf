@@ -19,6 +19,7 @@
 - [02 — bench/probe 脚本族清理](issues/02-bench-probe-scripts-cleanup.md) — 9 个一次性脚本全部删除（含 3 个 M8「tools 不 import tests」反向依赖）；README 操作指引同步、docs 历史记录保留；全量 pytest 289 passed 无回归
 - [01 — E: ContainerFrames → 帧序列转换 adapter](issues/01-e-containerframes-adapter.md) — 采纳并落地：载荷访问面 `payload_block`/`payload` + glen 恒存在归一（scattered 字段退役）；`_bucket_block` 双分支 → 1 行、测试 `_payload` 删除直调 adapter；未来表示变更触达面 7 处 → 1-2 处；289 passed + 230 组对拍 exit 0 + full_compare 与基线同分
 - [03 — GUI 面 Worth exploring 逐条裁决](issues/03-gui-worth-exploring.md) — Q1 双轨明示+代码面收敛（theme 常量 POSITIVE_COLOR/NEGATIVE_COLOR，QSS 轨道保持就地）；Q2 worker 骨架保留现状（不做，入 Out of scope）；Q3 test_gui_binding 状态查询/驱动收口 `binding_row`/`set_binding_selection` 两方法面（`_collect_prev` 转生产消费者）；GUI 63 + 全量 289 passed
+- [04 — core 收口面裁决（含搭车项）](issues/04-core-consolidation.md) — Q1 worker 数/进度带单一来源（resolve_workers + decode_progress）、Q2 find_ccu3_root 下沉 project_loader、Q3 容器流衔接三私有名转正、Q5 退化显式化（ConversionResult.warnings）、Q6 取消协议 ConversionCancelled 全部做；Q4 read_start_time 整数化搁置（入 Out of scope）；291 passed + 230 组逐位一致 + full_compare 同分（3434 已知真实差异）
 
 ## Not yet specified
 
@@ -32,4 +33,5 @@
 - **H2b/H2c 共享内存回传**：2026-08-15 已否决（收益不抵复杂度）
 - **统一两个 worker adapter 骨架**（GUI P3，[03 票裁决](issues/03-gui-worth-exploring.md)「不做」）：重复面仅 8 行 try/except 骨架；progress 信号载荷不同（(str,float) vs (float)）致基类无法统一信号，合并得不偿失，违背标准⑥
 - **MainWindow 拆窗口/控制器/模型**：review §4 明确否决（deletion test 不成立）
+- **read_start_time 整数化时机**（L8，[04 票裁决](issues/04-core-consolidation.md)「Q4 搁置不做」）：float 中转 ±119ns 安全论证已成立，属已知冗余；整数化无行为收益，不值得动已验证路径
 - **新功能**：本 effort 只收残余，不做新能力

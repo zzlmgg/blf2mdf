@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from core import blf_reader, mdf_writer, mp_finish
-from core.blf_reader import ScanCancelled
+from core.blf_reader import ConversionCancelled
 from core.blf_vector import iter_container_frames
 from core.decoder import Bucket, ChannelDecoder
 from core.dbc_loader import DbcDef, classify_batch, message_table, normalize_ids
@@ -16,9 +16,9 @@ from core import stats as stats_mod
 
 
 def _check_cancel(cancel_cb) -> None:
-    """转换检查点：cancel_cb 置位 → raise ScanCancelled（GUI 取消按钮）。"""
+    """转换检查点：cancel_cb 置位 → raise ConversionCancelled（GUI 取消按钮）。"""
     if cancel_cb is not None and cancel_cb():
-        raise ScanCancelled()
+        raise ConversionCancelled()
 
 
 # ── H1 Step 3：向量化单遍扫描（读入路由 + 桶装配）──
@@ -213,6 +213,8 @@ class ConversionResult:
     # 该通道墙钟；并行「解码 CANn」为该通道累计解码工作量（各通道互相
     # 重叠，之和可大于解码墙钟）。取消/异常路径不返回（随异常丢弃）。
     timings: list[tuple[str, float]] = field(default_factory=list)
+    # 转换级告警（并行退化等，L7）：GUI 在 timings 上方渲染；空 = 无告警
+    warnings: list[str] = field(default_factory=list)
 
 
 def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
@@ -232,9 +234,12 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     通道）、聚合统计 CANn 92→95（逐通道）、写 MDF 95、完成 100。
 
     cancel_cb() 可选：读取（每 1024 帧）、解码（串行逐通道/并行每桶）、
-    写 MDF 前后检查，置位即 raise ScanCancelled；写 MDF 期间（asammdf
+    写 MDF 前后检查，置位即 raise ConversionCancelled；写 MDF 期间（asammdf
     无取消钩子）点取消 → 删除已写完整输出后抛出（失败清理在 write_mdf
     内部——无残留契约，见 CONTEXT.md）。
+
+    返回 ConversionResult.warnings：转换级告警（并行退化：池创建失败/
+    桶内存超阈值回退串行），无则空列表。
     """
     channels = sorted(bindings)
     if not channels:
@@ -248,6 +253,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
     # 与「解码墙钟（并行）」行并存使日志可对账。
     t_total = time.perf_counter()
     timings: list[tuple[str, float]] = []
+    warnings: list[str] = []
 
     def note_range(ts_arr):
         nonlocal min_ts, max_ts
@@ -289,12 +295,13 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
 
     # 方案 G：多进程并行解码（可选，默认关）。池在 feed 前创建 + 预热
     # （spawn 成本藏在扫描期，原型实测 8 worker ~1.7s）；单通道短路；
-    # 池创建失败（环境/杀软等）→ 自动回退串行，正确性零损失（§5.7）。
+    # 池创建失败（环境/杀软等）→ 回退串行并记入 warnings，正确性零损失（§5.7）。
     pool = None
     if parallel and len(decoders) >= 2:
         try:
             pool = mp_finish.make_pool(sorted(decoders))
         except Exception:
+            warnings.append("并行不可用（进程池创建失败），已回退串行")
             pool = None
 
     try:
@@ -329,6 +336,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 mp_finish.bucket_bytes(decoders, sorted(decoders)) > _MP_MEM_THRESHOLD:
             pool.shutdown(wait=True, cancel_futures=True)
             pool = None
+            warnings.append("桶内存估算超阈值，已回退串行")
 
         # ── 解码阶段：并行（方案 G，per-bucket）或串行（现状语义）──
         if pool is not None:
@@ -347,7 +355,8 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             results = {}
             for i, ch in enumerate(sorted(decoders)):
                 if progress_cb:
-                    progress_cb(f"解码 CAN{ch}", 10 + 80 * i / total)
+                    progress_cb(f"解码 CAN{ch}",
+                                mp_finish.decode_progress(i / total))
                 # 取消检查点：串行解码逐通道
                 _check_cancel(cancel_cb)
                 t_ch = time.perf_counter()
@@ -440,7 +449,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         #「取消 = 放弃本次转换」的 converter 业务语义，不属于 writer 失败契约）
         if cancel_cb is not None and cancel_cb():
             Path(out_path).unlink(missing_ok=True)
-            raise ScanCancelled()
+            raise ConversionCancelled()
         timings.append(("写 MDF", time.perf_counter() - t_write))
         if progress_cb:
             progress_cb("完成", 100)
@@ -449,6 +458,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             summaries=summaries,
             duration_seconds=(max_ts - min_ts) if min_ts <= max_ts else 0.0,
             timings=timings,
+            warnings=warnings,
         )
     finally:
         # 池生命周期：正常/异常路径均回收（feed 异常、write 异常等）

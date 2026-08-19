@@ -112,6 +112,54 @@ def test_parallel_convert_reports_per_channel_decode_timings(tmp_path):
     assert values["解码墙钟（并行）"] > 0.0
 
 
+def _two_channel_inputs(tmp_path):
+    """双通道迷你 BLF + 内联 DBC（并行退化用例输入）。"""
+    import can
+
+    blf = tmp_path / "two_ch.blf"
+    with can.BLFWriter(str(blf), channel=4) as w:
+        for ch in (1, 2):
+            for i in range(20):
+                w.on_message_received(can.Message(
+                    timestamp=1784716800.0 + float(i) * 0.01,
+                    arbitration_id=100, is_extended_id=False, dlc=8,
+                    data=bytes([0xE8, 0x03, 0, 0, 0, 0, 0, 0]), channel=ch))
+    dbc_path = tmp_path / "t.dbc"
+    dbc_path.write_text(_INLINE_DBC, encoding="utf-8")
+    return str(blf), load(str(dbc_path))
+
+
+def test_parallel_pool_failure_falls_back_with_warning(tmp_path, monkeypatch):
+    """L7 并行退化显式化：make_pool 失败（环境/杀软等）→ 回退串行，
+    转换照常成功且 ConversionResult.warnings 记录退化原因。"""
+    import core.mp_finish as mp_finish
+
+    blf, dbc = _two_channel_inputs(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("pool creation failed (test)")
+    monkeypatch.setattr(mp_finish, "make_pool", boom)
+    out = tmp_path / "deg_pool.mdf"
+    result = convert(blf, {1: dbc, 2: dbc}, str(out), parallel=True)
+
+    assert result.warnings == ["并行不可用（进程池创建失败），已回退串行"]
+    assert out.exists() and out.stat().st_size > 0, "回退串行应照常产出"
+
+
+def test_parallel_mem_threshold_falls_back_with_warning(tmp_path, monkeypatch):
+    """L7 并行退化显式化：桶内存估算超阈值 → 池 shutdown 转串行，
+    warnings 记录（用户可得知本次未走并行）。"""
+    import core.mp_finish as mp_finish
+
+    blf, dbc = _two_channel_inputs(tmp_path)
+    monkeypatch.setattr(mp_finish, "bucket_bytes", lambda *a, **k: 10 ** 30)
+    out = tmp_path / "deg_mem.mdf"
+    result = convert(blf, {1: dbc, 2: dbc}, str(out), parallel=True)
+
+    assert result.warnings == ["桶内存估算超阈值，已回退串行"]
+    assert out.exists() and out.stat().st_size > 0, "回退串行应照常产出"
+
+
 def test_parallel_identical_with_module_dims(tmp_path):
     """模块对拍默认 dims 全开时也一致（头部/结构/数值/统计全维度）。"""
     from tools.mdf_compare import compare_files_identical

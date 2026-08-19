@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from typing import Iterator
 
 
-class ScanCancelled(Exception):
-    """读取被用户取消（GUI 取消按钮置位后，读取循环抛出）。"""
+class ConversionCancelled(Exception):
+    """转换被用户取消（GUI 取消按钮置位后，扫描/解码/写 MDF 检查点抛出）。"""
 
 
 @dataclass
@@ -67,10 +67,10 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
     obj_size 跳过；未知压缩/损坏结构抛 BLFParseError（与 list_channels
     同语义）。
 
-    容器枚举复用 _iter_containers（与 _iter_frames 同源，H1 Step 0 抽取）。
+    容器枚举复用 iter_containers（与 _iter_frames 同源，H1 Step 0 抽取）。
 
     progress_cb(percent) 逐容器字节进度（0-100）；cancel_cb() 每 1024 个
-    对象检查一次，返回 True 即 raise ScanCancelled（GUI 取消按钮置位）。
+    对象检查一次，返回 True 即 raise ConversionCancelled（GUI 取消按钮置位）。
     """
     import struct
 
@@ -129,7 +129,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
                 return data[obj_start:]  # 对象跨容器，剩余留给下一容器
             n += 1
             if n % 1024 == 0 and cancel_cb is not None and cancel_cb():
-                raise ScanCancelled()
+                raise ConversionCancelled()
             pos += OBJ_HEADER_BASE_STRUCT.size
             if header_version == 1:
                 pos += OBJ_HEADER_V1_STRUCT.size
@@ -148,7 +148,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
 
     channels = set()
     tail = b""
-    for _, data in _iter_containers(path, progress_cb=progress_cb):
+    for _, data in iter_containers(path, progress_cb=progress_cb):
         if tail:
             data = tail + data
             tail = b""
@@ -170,12 +170,12 @@ def read_start_time(path: str) -> float:
         return float(reader.start_timestamp)
 
 
-def _ms_part_ns(start_ns: int) -> int:
+def ms_part_ns(start_ns: int) -> int:
     """SYSTEMTIME 毫秒整数 → 相对整数秒的毫秒部分（0..999_999_999 ns）。"""
     return start_ns - (start_ns // 1_000_000_000) * 1_000_000_000
 
 
-def _iter_containers(path: str, progress_cb=None) -> Iterator[tuple[int, bytes]]:
+def iter_containers(path: str, progress_cb=None) -> Iterator[tuple[int, bytes]]:
     """BLF 容器枚举：逐容器产出 (start_ns, 解压后容器数据字节)。
 
     自 _iter_frames 的文件头/容器循环原样抽取（H1 Step 0，行为不变）：
@@ -183,7 +183,7 @@ def _iter_containers(path: str, progress_cb=None) -> Iterator[tuple[int, bytes]]
     obj_size%4 填充字节、非 LOG_CONTAINER 跳过、NO_COMPRESSION/ZLIB 解压、
     未知压缩跳过。start_ns = 文件头 SYSTEMTIME 绝对 ns 整数（每容器重复
     产出，调用方据此推 ms_part）。尾部衔接由调用方负责（行走器返回尾部
-    字节，下一容器拼接——见 _walk_container）。progress_cb(percent) 逐
+    字节，下一容器拼接——见 walk_container）。progress_cb(percent) 逐
     容器字节进度（0-100，与 list_channels 同一语义）。
     """
     import os
@@ -236,14 +236,14 @@ def _iter_containers(path: str, progress_cb=None) -> Iterator[tuple[int, bytes]]
             yield start_ns, data
 
 
-def _walk_container(data: bytes, ms_part: int,
+def walk_container(data: bytes, ms_part: int,
                     cancel_cb=None) -> tuple[list[Frame], bytes]:
     """容器内对象行走（python-can _parse_data 语义），返回 (帧, 尾部)。
 
     自 _iter_frames 原样抽取（H1 Step 0，行为不变）。尾部 = 容器末尾
     不足一个对象头 / 跨容器对象的剩余字节，留给下一容器衔接
     （_parse_container 的 _tail 语义）。cancel_cb() 每 1024 个对象检查
-    一次，置位即 raise ScanCancelled（GUI 取消按钮）。
+    一次，置位即 raise ConversionCancelled（GUI 取消按钮）。
     """
     import struct
 
@@ -287,7 +287,7 @@ def _walk_container(data: bytes, ms_part: int,
             return frames, data[obj_start:]  # 对象跨容器，留给下一容器
         n += 1
         if n % 1024 == 0 and cancel_cb is not None and cancel_cb():
-            raise ScanCancelled()
+            raise ConversionCancelled()
         pos += OBJ_HEADER_BASE_STRUCT.size
         if header_version == 1:
             flags, _, _, rel = OBJ_HEADER_V1_STRUCT.unpack_from(data, pos)
@@ -371,7 +371,7 @@ def _iter_frames(path: str, progress_cb=None, cancel_cb=None) -> Iterator[Frame]
     而是 SYSTEMTIME 毫秒整数 + 对象头相对整数（1ns 或 flags==1 的 10µs
     单位）→ (ms_part + rel_ns) × 1e-9 一次舍入，与 CANoe 同构。
 
-    容器枚举与容器内行走见 _iter_containers/_walk_container（H1 Step 0
+    容器枚举与容器内行走见 iter_containers/walk_container（H1 Step 0
     自本函数原样抽取，行为不变）。
 
     progress_cb(percent: float) 可选：每读完一个日志容器回调一次
@@ -380,13 +380,13 @@ def _iter_frames(path: str, progress_cb=None, cancel_cb=None) -> Iterator[Frame]
     """
     tail = b""
     ms_part = None
-    for start_ns, data in _iter_containers(path, progress_cb=progress_cb):
+    for start_ns, data in iter_containers(path, progress_cb=progress_cb):
         if ms_part is None:
-            ms_part = _ms_part_ns(start_ns)
+            ms_part = ms_part_ns(start_ns)
         if tail:
             data = tail + data
             tail = b""
-        frames, tail = _walk_container(data, ms_part, cancel_cb)
+        frames, tail = walk_container(data, ms_part, cancel_cb)
         yield from frames
 
 
@@ -424,7 +424,7 @@ def iter_all_messages(path: str, progress_cb=None, cancel_cb=None) -> Iterator[F
     读取占转换耗时大头，进度条需在读取期间持续前进而不是停在 5%。
 
     cancel_cb() 可选：每 1024 帧检查一次，返回 True 即 raise
-    ScanCancelled（转换阶段取消，GUI 取消按钮置位）。
+    ConversionCancelled（转换阶段取消，GUI 取消按钮置位）。
     """
     yield from _iter_frames(path, progress_cb=progress_cb, cancel_cb=cancel_cb)
 

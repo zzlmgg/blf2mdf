@@ -2,14 +2,14 @@
 
 设计见 docs/2026-08-14-H1-vectorized-parse-plan.md（§2 语义契约、§4 快路径
 算法、§5 回退）。核心思想：按容器做 numpy 候选扫描 + 移位字段提取，快路径
-条件任一不满足即整容器回退标量行走 `_walk_container`（= 现行实现，逐字节
+条件任一不满足即整容器回退标量行走 `walk_container`（= 现行实现，逐字节
 复刻）——回退即 oracle，正确性由对拍测试（tests/test_blf_vector.py）锁定。
 
 窗口语义（§2.1，实测 CPython bytes.index）：每步在 [pos, pos+8) 内找第一
 个 "LOBJ" 候选，匹配须完整落在窗口内 → 命中界 c ≤ pos+4；尾部判断用
 pos+8 > max_pos（+4/+8 不对称）。
 
-字段偏移以参考实现（blf_reader._walk_container 对 python-can 结构体的解包
+字段偏移以参考实现（blf_reader.walk_container 对 python-can 结构体的解包
 索引）为准：V1/V2 flags 均为 u32@+16；FD fd_flags=u8@+12、valid_bytes=
 u8@+13；FD64 ext_data_offset=u8@+35（m[13]）。计划文档 §2.3 实施时已按此
 核对修正。
@@ -462,11 +462,11 @@ def iter_container_frames(path: str, progress_cb=None, cancel_cb=None,
 
     tail = b""
     ms_part = None
-    for start_ns, data in blf_reader._iter_containers(path, progress_cb=progress_cb):
+    for start_ns, data in blf_reader.iter_containers(path, progress_cb=progress_cb):
         if cancel_cb is not None and cancel_cb():
-            raise blf_reader.ScanCancelled()
+            raise blf_reader.ConversionCancelled()
         if ms_part is None:
-            ms_part = blf_reader._ms_part_ns(start_ns)
+            ms_part = blf_reader.ms_part_ns(start_ns)
         if tail:
             data = tail + data
             tail = b""
@@ -477,6 +477,6 @@ def iter_container_frames(path: str, progress_cb=None, cancel_cb=None,
                 if len(cf.channel):
                     yield cf
                 continue
-        frames, tail = blf_reader._walk_container(data, ms_part, cancel_cb=cancel_cb)
+        frames, tail = blf_reader.walk_container(data, ms_part, cancel_cb=cancel_cb)
         if frames:
             yield _frames_to_container(frames)

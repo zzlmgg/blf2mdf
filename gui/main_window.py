@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import blf_reader, project_loader
-from core.blf_reader import ScanCancelled
+from core.blf_reader import ConversionCancelled
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
 from gui.binding import (
@@ -73,20 +73,7 @@ def _app_root() -> Path:
 PROJECT_ROOT = _app_root()
 
 
-def _find_ccu3_root(root: Path) -> Path | None:
-    """定位 ccu3.0 DBC 数据源（<root>/inputs/dbc_ccu3.0 或 <root>/dbc_ccu3.0）。
-
-    兼容两种发布布局：inputs/ 层（源码运行与当前发布包）与 exe 直接旁挂
-    （用户把 dbc_ccu3.0 放 exe 同一目录）。优先 inputs 布局；两者都无时
-    返回 None，GUI 降级为手动添加 DBC（不崩溃）。
-    """
-    for candidate in (root / "inputs" / "dbc_ccu3.0", root / "dbc_ccu3.0"):
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-CCU3_ROOT = _find_ccu3_root(PROJECT_ROOT)
+CCU3_ROOT = project_loader.find_ccu3_root(PROJECT_ROOT)
 CCU3_MAPPING_FILE = CCU3_ROOT / "dbc_对应关系.txt" if CCU3_ROOT else None
 
 PROJECT_PLACEHOLDER = "项目"  # 项目下拉首项（禁用占位，仅提示）
@@ -118,7 +105,7 @@ class ConvertWorker(QObject):
                              parallel=True,
                              cancel_cb=self.cancel_event.is_set)
             self.done.emit(result)
-        except ScanCancelled:
+        except ConversionCancelled:
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
@@ -130,7 +117,7 @@ class BlfScanWorker(QObject):
     放后台线程避免主界面冻结成「未响应」。
 
     progress 按文件字节位置报真实进度（0-100）；cancel_event 置位后
-    probe 在 1024 对象内抛 ScanCancelled → cancelled 信号回主线程。
+    probe 在 1024 对象内抛 ConversionCancelled → cancelled 信号回主线程。
     """
     progress = Signal(float)
     done = Signal(object)
@@ -150,7 +137,7 @@ class BlfScanWorker(QObject):
                 progress_cb=self.progress.emit,
                 cancel_cb=self.cancel_event.is_set)
             self.done.emit(channels)
-        except ScanCancelled:
+        except ConversionCancelled:
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
@@ -179,7 +166,7 @@ class MainWindow(QMainWindow):
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
         # 扫描/转换取消事件：每次加载/转换重建；取消按钮与 closeEvent
-        # 置位，worker 循环检查后抛 ScanCancelled（threading.Event 跨线程安全）
+        # 置位，worker 循环检查后抛 ConversionCancelled（threading.Event 跨线程安全）
         self.scan_cancel = threading.Event()
         self.convert_cancel = threading.Event()
 
@@ -235,7 +222,7 @@ class MainWindow(QMainWindow):
         self.load_progress.setVisible(False)
         row.addWidget(self.load_progress)
         # 扫描取消：仅扫描期间显示（_set_scan_busy 控制）；点击置位取消
-        # 事件，worker 循环在 1024 对象内抛 ScanCancelled 退出
+        # 事件，worker 循环在 1024 对象内抛 ConversionCancelled 退出
         self.btn_scan_cancel = QPushButton("取消")
         self.btn_scan_cancel.setObjectName("secondaryButton")
         self.btn_scan_cancel.setMinimumWidth(64)
@@ -507,7 +494,7 @@ class MainWindow(QMainWindow):
         self.scan_thread.start()
 
     def _cancel_scan(self):
-        """「取消」按钮：置位取消事件（worker 在 1024 对象内抛 ScanCancelled）。"""
+        """「取消」按钮：置位取消事件（worker 在 1024 对象内抛 ConversionCancelled）。"""
         self.scan_cancel.set()
         self.btn_scan_cancel.setEnabled(False)
 
@@ -826,7 +813,7 @@ class MainWindow(QMainWindow):
 
     def _cancel_convert(self):
         """「取消」按钮：置位取消事件（worker 在 1024 帧/每桶内抛
-        ScanCancelled；写 MDF 期间点取消 → 清理已写输出后抛出）。"""
+        ConversionCancelled；写 MDF 期间点取消 → 清理已写输出后抛出）。"""
         self.convert_cancel.set()
         self.btn_convert_cancel.setEnabled(False)
 
@@ -862,14 +849,19 @@ class MainWindow(QMainWindow):
     def _on_done(self, result: ConversionResult):
         self._finish()
         lines = [f"{label}: {t:.2f} s" for label, t in result.timings]
-        body = "转换完成" + ("\n" + "\n".join(lines) if lines else "")
+        body = "转换完成"
+        if result.warnings:
+            body += "\n" + "\n".join(result.warnings)
+        if lines:
+            body += "\n" + "\n".join(lines)
         detail = self._format_summary(result)
         if detail:
             body += "\n转换摘要:\n" + detail
         # 状态行：墙钟总耗时为主；无 timings（测试构造/旧调用方）兜底数据时长
         total = next((t for label, t in result.timings if label == "总耗时"),
                      result.duration_seconds)
-        warning_count = sum(bool(s.warning) for s in result.summaries)
+        warning_count = len(result.warnings) + \
+            sum(bool(s.warning) for s in result.summaries)
         status = f"转换完成 · 总耗时 {total:.1f} s"
         if warning_count:
             status += f" · {warning_count} 条警告"
@@ -975,7 +967,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         thread = self.scan_thread
         if thread is not None and thread.isRunning():
-            # 先置位取消事件：probe 在 1024 对象内抛 ScanCancelled 快速返回，
+            # 先置位取消事件：probe 在 1024 对象内抛 ConversionCancelled 快速返回，
             # wait() 不再阻塞到全文件扫完
             self.scan_cancel.set()
             thread.quit()
