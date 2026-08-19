@@ -1,28 +1,9 @@
 """PySide/QSS 界面视觉契约测试。"""
 
-import os
 from pathlib import Path
 
-import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    return QApplication.instance() or QApplication([])
-
-
-@pytest.fixture()
-def window(qapp):
-    from gui.main_window import MainWindow
-
-    widget = MainWindow()
-    yield widget
-    widget.close()
 
 
 def test_theme_exposes_approved_tokens():

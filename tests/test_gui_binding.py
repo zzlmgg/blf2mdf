@@ -3,27 +3,9 @@
 修复前 bug：auto_bind 键为 int 通道号，_rebuild_channel_table 却用字符串
 "CANn" 查表，恒不命中 → 选完项目表格全为"不绑定"。
 """
-import os
 from pathlib import Path
 
-import pytest
-from PySide6.QtWidgets import QApplication
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from core.dbc_loader import DbcDef  # noqa: E402
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    return QApplication.instance() or QApplication([])
-
-
-@pytest.fixture()
-def window(qapp):
-    import gui.main_window as mw
-
-    return mw.MainWindow()
+from core.dbc_loader import DbcDef
 
 
 def _d(name: str) -> DbcDef:
