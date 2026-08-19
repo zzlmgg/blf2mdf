@@ -13,6 +13,8 @@
 > **2026-08-18 更新（B 实施完成后）**：§3 M4 标 ✅ 完成；§4 候选 B 已落地；§5 首要建议改为「A」；§2.1 行数刷新（main_window 981→985 净增 4：决策算法 65 行移出至新文件 gui/binding.py，新增 _collect_prev 等接线；tests 19→20 文件）；全量 pytest 现状：**269 passed / 0 失败**（anaconda3 实测，2026-08-18，259 基线 − 7 迁移 + 14 纯函数 + 3 接线）。B 实施按项目惯例未 commit（由用户执行）。
 >
 > **2026-08-19 更新（A 实施完成后）**：§3 M1 标 ✅ 完成；§4 候选 A 已落地；§5 首要建议更新（无剩余 Strong 候选）；§2.1 行数刷新（decoder 453→551 / converter 530→472 / mp_finish 279→271 / dbc_loader 126→175、tests 20→21 文件新增 test_bucket.py；§2.2 主链路图同步刷新已删除函数名）；CONTEXT.md「解码桶」词条（spec 阶段已加，核对通过）；全量 pytest 现状：**289 passed / 0 失败**（anaconda3 实测，2026-08-19，269 基线 + 新增 20：test_bucket 9 + test_dbc_loader 10 + test_parallel_decode 1）。A 实施按项目惯例未 commit（由用户执行）。
+>
+> **2026-08-19 更新（closeout 01–07 票全部落地后）**：§4 候选 **E 已落地**（01 票：`payload_block`/`payload` 双访问面 + glen 恒存在归一，scattered 字段退役，未来表示变更触达面 7 处 → 1-2 处）；全部 Worth exploring / Speculative 条目经 03/04/05/06 票逐条裁决——**做则落地**（resolve_workers/decode_progress 单一来源、find_ccu3_root 下沉 project_loader、容器流衔接三私有名转正、ConversionResult.warnings 退化显式化、ConversionCancelled 取消协议、binding_row/set_binding_selection 方法面、theme 常量 POSITIVE_COLOR/NEGATIVE_COLOR、conftest fixture 上收、sample_blf 固定具名、DEFAULT_MAPPING 四边互锁），**不做入 Out of scope**（统一两个 worker adapter 骨架、read_start_time 整数化、冻结探针 subprocess 化、DEFAULT_MAPPING 数据文件自动生成）；tools **18→9 脚本**（02 票删除 9 个 bench/probe 一次性脚本，M8 的「tools 不 import tests」三处反向依赖随删即解）；§2.1 行数刷新（blf_reader 454→561 / blf_vector 456→482 / converter 472→466 / mp_finish 271→286 / project_loader 125→143 / main_window 985→990 / theme 266→275 / widgets 421→422 / main 27→26、tests ~5300→5626 行 21 文件、tools ~1700→1005 行 9 脚本）；§3 M8 标 ✅ 完成（02/05/06 票）、L9 标 ✅ 完成（08 票删除 scan_channels，584→561）；全量 pytest 现状：**292 passed / 0 失败**（anaconda3 实测，2026-08-19，289 基线 + 3：04 票 +2、06 票 +1）。各票按项目惯例未 commit（由用户执行）。
 
 ## 0. 摘要
 
@@ -44,24 +46,24 @@
 
 | 文件 | 行数 | 职责 | 公开接口（一句话契约） |
 |---|---|---|---|
-| core/blf_reader.py | 454 | BLF 标量解析（oracle）+ 探测 | `Frame`、`probe_channels`、`read_start_time`、`list_channels`、`iter_messages`、`ScanCancelled`（全项目取消异常唯一定义点） |
-| core/blf_vector.py | 456 | H1 向量化快路径 + 回退编排 | `ContainerFrames`（packed/scattered 双契约）、`iter_container_frames`（快路径失败回退标量，决策唯一收口点） |
-| core/converter.py | 472 | 转换编排 | `convert()`、`ConversionResult`、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由，A 落地后分类/建桶收敛至 `classify_batch`/`Bucket`） |
+| core/blf_reader.py | 561 | BLF 标量解析（oracle）+ 探测 | `Frame`、`probe_channels`（H3 后含 `_probe_fast` 向量化快路径）、`read_start_time`、`list_channels`、`iter_messages`、`ScanCancelled`（全项目取消异常唯一定义点） |
+| core/blf_vector.py | 482 | H1 向量化快路径 + 回退编排 | `ContainerFrames`（物理布局仍双 packed/scattered，消费面归一 `payload_block`/`payload`，E 落地后）、`iter_container_frames`（快路径失败回退标量，决策唯一收口点） |
+| core/converter.py | 466 | 转换编排 | `convert()`、`ConversionResult`（含 warnings，退化显式化后）、`ChannelSummary`；私有 `_read_vectorized`（单遍扫描路由，A 落地后分类/建桶收敛至 `classify_batch`/`Bucket`） |
 | core/decoder.py | 551 | 帧→信号物理值 | `SignalSeries`、`DecodeStats`、`ChannelDecoder`、`decode_channel`（测试面包装）、`Bucket`（三相位显式状态单类，A 落地后） |
-| core/mp_finish.py | 271 | 并行 per-bucket finish | `make_pool`、`bucket_bytes`、`finish_all`（结果与串行 finish 同形；worker 消费 typed `Bucket`） |
+| core/mp_finish.py | 286 | 并行 per-bucket finish | `make_pool`、`bucket_bytes`、`finish_all`（结果与串行 finish 同形；worker 消费 typed `Bucket`） |
 | core/stats.py | 152 | CANoe 1s 统计语义 | `STAT_NAMES`/`STAT_CHANNELS`、`aggregate_channel`（deep）、`align_timestamps`（时间网格规则唯一实现）、`ChannelStats`（不含通道身份，见词汇表「统计组布局」） |
 | core/mdf_writer.py | 145 | MDF 4.10 写出 adapter | `RawGroup`、`write_mdf`（无残留契约：抛出时本次调用不留下任何输出文件）；import 时改 asammdf 全局压缩级别 |
 | core/dbc_loader.py | 175 | DBC 域模型 + 分类规则 | `SignalDef`/`MessageDef`/`DbcDef`、`load`；`normalize_id`/`normalize_ids`（归一化键唯一实现，M2 收口后）；`classify`/`classify_batch`/`message_table`（分类规则唯一实现，A 收口后） |
-| core/project_loader.py | 125 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
-| gui/main_window.py | 985 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`_find_ccu3_root` |
+| core/project_loader.py | 143 | ccu3.0 项目载入/匹配 | `DEFAULT_MAPPING`（txt 优先、仅回退，06 票后）、`find_ccu3_root`、`list_projects`、`load_mapping`、`load_project`、`auto_bindings` |
+| gui/main_window.py | 990 | 主窗口 + 转换编排 + 状态管理 | `MainWindow`、`ConvertWorker`/`BlfScanWorker`（QThread adapter）、`binding_row`/`set_binding_selection`（03 票测试面方法，`_collect_prev` 转生产消费者） |
 | gui/binding.py | 65 | 绑定决策纯函数（B 落地后新增，零 Qt import） | `BindingRow`、`decide_bindings`、`derive_state`、STATE_* 三态常量 |
-| gui/widgets.py | 421 | 无业务 PySide 展示组件（零 core 依赖） | `AppShell`、`CompactCombo`、`DbcListWidget`、`TitleBar`、`SummaryDialog` 等 |
-| gui/theme.py | 266 | 视觉令牌与 QSS | `WINDOW_WIDTH/HEIGHT`、`APP_QSS`、`apply_theme` |
+| gui/widgets.py | 422 | 无业务 PySide 展示组件（零 core 依赖） | `AppShell`、`CompactCombo`、`DbcListWidget`、`TitleBar`、`SummaryDialog` 等 |
+| gui/theme.py | 275 | 视觉令牌与 QSS | `WINDOW_WIDTH/HEIGHT`、`POSITIVE_COLOR`/`NEGATIVE_COLOR`（03 票收敛）、`APP_QSS`、`apply_theme` |
 | gui/windows_effects.py | 70 | Win11 玻璃/圆角 + 软件回退 | `apply_light_glass`、`sync_rounded_window` |
 | gui/resources.py | 26 | 运行时路径与图标 | `resource_path`、`install_application_icon` |
-| main.py | 27 | 程序入口 | `main()`；`freeze_support()` 铁律 |
-| tests/ | ~5300 | 21 文件 | 见 §4（18 原始 + mdf_factory.py 共享工厂 + test_compare_cli.py CLI 契约；B 落地新增 test_binding.py 纯函数套件；A 落地新增 test_bucket.py 相位契约套件） |
-| tools/ | ~1700 | 18 脚本 | 见 §4（compare 族已收口为 mdf_compare + 2 CLI 薄壳；bench/probe 族 8 个仍可删） |
+| main.py | 26 | 程序入口 | `main()`；`freeze_support()` 铁律 |
+| tests/ | 5626 | 21 文件 | 见 §4（18 原始 + mdf_factory.py 共享工厂 + test_compare_cli.py CLI 契约；B 落地新增 test_binding.py 纯函数套件；A 落地新增 test_bucket.py 相位契约套件；05 票 conftest 上收 fixture） |
+| tools/ | 1005 | 9 脚本 | 见 §4（compare 族已收口为 mdf_compare + 2 CLI 薄壳；02 票删除 9 个 bench/probe 一次性脚本，仅余发布/打包验证脚本） |
 
 ### 2.2 依赖方向与主链路
 
@@ -169,6 +171,7 @@ ConvertWorker.run
 - 位置：bench 脚本 `sys.path.insert(0, .../tests)` 反向依赖（bench_bucket_dist.py:14-16、bench_parallel_finish.py:26-28、bench_stages.py:12-14）；test_package_config.py:43,49 反向 import tools；通道↔DBC 绑定表三处（test_golden.py:16-27 BINDING / convert_aht.py:15-26 硬编码 / project_loader.DEFAULT_MAPPING）
 - 违反：②、④
 - 方向：绑定表与样例路径收敛到单一中性来源；tools 不 import tests。
+- **状态：✅ 已完成**（2026-08-19）——tools 侧：三个 bench 脚本（bench_bucket_dist/bench_parallel_finish/bench_stages）随 02 票整体删除，`sys.path.insert(0, .../tests)` 反向依赖消失；绑定表三份收敛为两份（convert_aht 随 02 删除、test_golden.BINDING 随 H2 删除），DEFAULT_MAPPING 成为唯一内置来源，06 票四边互锁断言（MAPPING_TEXT/EXPECTED_MAPPING/真实 txt）锁漂移；样例路径 05 票 sample_blf 固定具名（删「排序取首」漂移）。
 
 ### 低（12 项，择要）
 
@@ -182,7 +185,7 @@ ConvertWorker.run
 | L6 | [converter.py:106-107](../../core/converter.py#L106-L107) | `_read_vectorized` 10 个位置参数 + 写 4 个可变结构——全管线最 deep 的函数，接口是裸结构集合（当前仅 1 调用方，暂不必动） | ③⑤ |
 | L7 | [converter.py:368-372](../../core/converter.py#L368-L372) | make_pool 失败静默吞掉，用户无从得知本次串行还是并行 | ⑤ |
 | L8 | [blf_reader.py:159-170](../../core/blf_reader.py#L159-L170) | read_start_time 走 float 中转两次，而模块内已有 `_systemtime_ns` 纯整数路径（float 路径有 ±119ns 安全论证，属已知冗余） | ①⑤ |
-| L9 | [blf_reader.py:432-454](../../core/blf_reader.py#L432-L454) | `scan_channels` 零调用者、零测试引用；且 H1 计划文档（docs/func_impro/2026-08-14-H1-vectorized-parse-plan.md:21）声称它是「对拍参考与测试覆盖对象」——**文档漂移**，事实无测试引用。deletion test：直接删，复杂度不转移 | ⑥ |
+| L9 | [blf_reader.py:432-454](../../core/blf_reader.py#L432-L454) | `scan_channels` 零调用者、零测试引用；且 H1 计划文档（docs/func_impro/2026-08-14-H1-vectorized-parse-plan.md:21）声称它是「对拍参考与测试覆盖对象」——**文档漂移**，事实无测试引用。deletion test：直接删，复杂度不转移。**状态：✅ 已完成**（2026-08-19，08 票）——已删除（全仓 grep 仅 converter.py 两处历史注释提及；02 票已删其唯一用户 probe_blf）。 | ⑥ |
 | L10 | blf_reader.py:151-155 / 381-390 / blf_vector.py:437-446 | 尾部衔接 + ms_part 推导骨架三份复制 | ⑥ |
 | L11 | [main_window.py:656-657](../../gui/main_window.py#L656-L657)、:751-753、:651-654 | `_fit_table_width` 空方法零调用；`_remove_dbc` 零调用（仅 :685 用 `_remove_dbc_at`）；`_fit_window_height` 近 no-op | ⑤ |
 | L12 | 其余命名/住所类：ScanCancelled 定义在 blf_reader 却同时是 convert 的取消信号（[blf_reader.py:16](../../core/blf_reader.py#L16)）；关窗确认文案与取消语义矛盾（[main_window.py:970-977](../../gui/main_window.py#L970-L977)）；DbcCombo 定义在 main_window 与 widgets.py 自述冲突；conftest 无 fixture 且 import 时 mkdir；test_parallel_decode 鸭子类型伪造 Frame；test_main_entry 按函数名断言 AST | ③⑤ |
@@ -199,19 +202,19 @@ ConvertWorker.run
 | B. 绑定决策抽无 Qt 纯函数（M4） | ✅ 已落地（2026-08-18） | 决策抽为 gui/binding.py 纯函数（65 行零 Qt）+ 绑定键结构化（路径）+ userData=DbcDef 直取、`_dbc_by_display` 删除；14 纯函数用例免 Qt + 3 薄接线；双键型契约归一；269 passed。详见 §3 M4 状态 |
 | C. 归一化键单一来源（M2） | ✅ 已落地（2026-08-18） | 归一化键唯一实现落 dbc_loader（`normalize_id`/`normalize_ids`/`_EFF_BIT`），三处调用点 + oracle 全部改调；6 项边界测试；259 passed。详见 §3 M2 状态 |
 | D. write_mdf 失败无残留归 writer（M3） | ✅ 已落地（2026-08-18） | 契约已实施：失败清理本次半成品、out_path 保留旧产物、BaseException 覆盖、取消留 converter 侧；converter 异常清理分支删除、取消分支简化为 unlink(missing_ok=True)。5 个新测试；全量 253 passed。详见 [D spec](./2026-08-18-d-write-no-residue-spec.md) |
-| E. ContainerFrames → 帧序列转换 adapter | **Strong** | test_blf_vector 手工重建帧语义（`_payload`+`_assert_eq`），H7b 一次表示变更迫使 7 处测试更新（master plan 已实证该成本）。adapter 同时简化 converter 与测试两侧 |
+| E. ContainerFrames → 帧序列转换 adapter | ✅ 已落地（2026-08-19，[01 票](../../.scratch/closeout/issues/01-e-containerframes-adapter.md)） | 载荷访问面 `payload_block`/`payload` + glen 恒存在归一（scattered 字段退役）；`_bucket_block` 双分支 → 1 行；未来表示变更触达面 7 处 → 1-2 处。详见 01 票决议 |
 | F. 对拍逻辑收口为可导入模块并纳入 pytest（H1/H2） | ✅ 已落地（2026-08-18） | 修复两个「高」级问题：compare 族 7 脚本 → mdf_compare 深模块 + 2 CLI 薄壳（tools 21→18；**8 个 bench/probe 可删脚本未动**——M8/L9 残留，H1 spec 明示 Out of Scope）；oracle 获 41 用例黄金测试 + CLI 退出码进程契约 + STAT_NAMES 双副本锁定。行为等价验证通过（H2 验证记录：identical 与原版逐字节一致、reference 3434 处判定差异全部核验为已知真实差异）；全量 pytest 现状 249 passed / 0 失败。详见 [H2 验证记录](./2026-08-18-h2-compare-consolidation-verification.md) / [H1 spec](./h1/2026-08-18-h1-oracle-protection-spec.md) |
 | G. ChannelStats 通道身份显式化或删死字段（L2） | ✅ 已落地（2026-08-18） | `channel` + 零读者的 `signal_names` 双死字段删除（grilling Q1/Q5）；类 docstring 明示「对象不含通道身份，通道由调用方按 STAT_CHANNELS 顺序持有」（Q2）；CONTEXT.md 新增「统计组布局」词条（Q3）；不补测试、零测试改动（Q4）。259 passed 用例数不变。详见 [G spec](./g/2026-08-18-g-channelstats-dead-field-spec.md) |
-| 视觉令牌收敛或双轨明示（GUI P2） | Worth exploring | 同一色值 #207e4b 出现在 theme.py:42 / widgets.py:169 / main_window.py:670 三处；若团队实际迭代方式是就地改色，双轨明示比强制收敛诚实 |
-| 统一两个 worker adapter 骨架（GUI P3） | Worth exploring | 两个 adapter 证明 seam 真实；骨架同构是已兑现成本；合并是否更可读需拿一版对照再定 |
-| worker 数 / 进度带单一来源（L1/M5） | Worth exploring | 收口方式为最小常量/函数共享，不引入「进度管理器」抽象 |
-| test_gui_binding 表格状态查询收敛（M7） | Worth exploring | 约 35 处 widget 图访问收到 2-3 个方法面 |
-| `_find_ccu3_root` 下沉 project_loader（读写侧 P5） | Worth exploring | 模块自述职责与实现分离；测试跨包归属暴露错位，locality 直接改善 |
-| 容器流衔接骨架三份收敛（L10） | Worth exploring | 收敛后 blf_vector 对 blf_reader 的 4 个私有名依赖可降为正式接口 |
-| read_start_time 整数化（L8） | Worth exploring | 方向明确，当前 float 路径有安全论证，非急需 |
-| conftest 上收 fixture + sample_blf 显式化；冻结探针转 subprocess pytest | Worth exploring | 消除两份 GUI fixture 重复与「第一个 BLF」漂移；进程级行为进测试体系 |
-| 并行退化显式化（L7）/ 取消协议中性化（L12） | Speculative | 可观测性与命名洁癖，成本极低可搭车 |
-| DEFAULT_MAPPING 从数据文件自动生成 | Speculative | 消除手工同步副本，但引入构建/缓存机制，成本可能高于收益 |
+| 视觉令牌收敛或双轨明示（GUI P2） | ✅ 已落地（2026-08-19，[03 票 Q1](../../.scratch/closeout/issues/03-gui-worth-exploring.md)） | 双轨明示 + 代码面收敛：theme 常量 `POSITIVE_COLOR`/`NEGATIVE_COLOR`（widgets/main_window 改引常量），QSS 轨道保持就地（诚实双轨） |
+| 统一两个 worker adapter 骨架（GUI P3） | ✅ 已裁决不做（2026-08-19，[03 票 Q2](../../.scratch/closeout/issues/03-gui-worth-exploring.md)） | 重复面仅 8 行 try/except 骨架；progress 信号载荷不同（(str,float) vs (float)）致基类无法统一信号，合并违背标准 ⑥；入 map Out of scope |
+| worker 数 / 进度带单一来源（L1/M5） | ✅ 已落地（2026-08-19，[04 票 Q1](../../.scratch/closeout/issues/04-core-consolidation.md)） | `resolve_workers` + `decode_progress` 单一来源；worker 决策双实现与进度带双写死收口（无新抽象） |
+| test_gui_binding 表格状态查询收敛（M7） | ✅ 已落地（2026-08-19，[03 票 Q3](../../.scratch/closeout/issues/03-gui-worth-exploring.md)） | 状态查询/驱动收口 `binding_row`/`set_binding_selection` 两方法面；`_collect_prev` 转生产消费者；GUI 63 用例保持 |
+| `_find_ccu3_root` 下沉 project_loader（读写侧 P5） | ✅ 已落地（2026-08-19，[04 票 Q2](../../.scratch/closeout/issues/04-core-consolidation.md)） | `find_ccu3_root` 下沉 project_loader；测试跨包归属错位随迁 |
+| 容器流衔接骨架三份收敛（L10） | ✅ 已落地（2026-08-19，[04 票 Q3](../../.scratch/closeout/issues/04-core-consolidation.md)） | blf_reader 三私有名（`_iter_containers`/`_walk_container`/`_ms_part_ns`）转正为正式接口，blf_vector 依赖私有名状态解除 |
+| read_start_time 整数化（L8） | ✅ 已裁决搁置（2026-08-19，[04 票 Q4](../../.scratch/closeout/issues/04-core-consolidation.md)） | float 中转 ±119ns 安全论证已成立，整数化无行为收益，不值得动已验证路径；入 map Out of scope |
+| conftest 上收 fixture + sample_blf 显式化；冻结探针转 subprocess pytest | ✅ Q1/Q2 已落地、Q3 已裁决不做（2026-08-19，[05 票](../../.scratch/closeout/issues/05-test-infra.md)） | conftest 单一来源（qapp/window 统一 yield+close、删 import 副作用）、sample_blf 固定具名 A19G1；冻结探针 subprocess 化入 Out of scope（发布路径本就手动，收益不抵成本） |
+| 并行退化显式化（L7）/ 取消协议中性化（L12） | ✅ 已落地（2026-08-19，[04 票 Q5/Q6](../../.scratch/closeout/issues/04-core-consolidation.md)） | 退化显式化为 `ConversionResult.warnings`；取消协议收口 `ConversionCancelled`（唯一异常面） |
+| DEFAULT_MAPPING 从数据文件自动生成 | ✅ 已裁决不做（2026-08-19，[06 票 Q2](../../.scratch/closeout/issues/06-default-mapping-source.md)） | 机制已反向（txt 优先、DEFAULT_MAPPING 仅回退）；引入构建/缓存属 Speculative 成本；四边互锁断言已覆盖漂移；入 map Out of scope |
 | 解码路由回归 decoder 模块 ownership | Speculative | 分类单实现收益真实，但单遍三方收集是性能前提，拆开需回调接口，可能违背标准 ⑥；现有测试锁足以兜底，不必现在动手 |
 | MainWindow 拆窗口/控制器/模型 | **明确否决** | deletion test：981 行中约 300 行是声明式 QWidget 构建，拆开是把同一复杂度摊到更多文件 + 新增跨文件事件布线，违反标准 ⑥。实际深度在 `_rebuild_channel_table`，已由候选 B 覆盖 |
 
@@ -219,12 +222,12 @@ ConvertWorker.run
 
 ## 5. 首要建议
 
-**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）；B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）；A（桶契约类型化）已实施完毕（2026-08-19，289 passed）。五个 Strong 候选（A/B/F/H1/H2）全部落地，无剩余 Strong 候选。下一步：M8/L9 bench/probe 脚本清理（8 个可删脚本）等 Worth exploring 条目。**
+**F（H1/H2 对拍收口）已落地（2026-08-18）；D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）；C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）；G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）；B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）；A（桶契约类型化）已实施完毕（2026-08-19，289 passed）；E（ContainerFrames 载荷访问 adapter）已实施完毕（2026-08-19，[01 票](../../.scratch/closeout/issues/01-e-containerframes-adapter.md)）。七个落地候选（A/B/C/D/E/F/G）+ 两个「高」级（H1/H2）全部完成；§4 全部 Worth exploring / Speculative 条目经 closeout 03/04/05/06 票逐条裁决完毕（做则落地、不做入 Out of scope，各票决议即裁决记录）；L9 scan_channels 已随 08 票删除。架构线已无可决策项；剩余 = 性能线残余（zlib 并行解压 ~0.9s 可行但触达面出 probe 单函数、can→asammdf import 链 ~4s，均挂 map Not yet specified，重启性能线时作 fresh effort 评估）。**
 
 理由：
 1. **B（绑定决策抽无 Qt 纯函数）已落地**：全 GUI 分区唯一有 bug 史的算法抽为 gui/binding.py 纯函数，14 个决策用例不再穿越 Qt 对象图；绑定键结构化（路径）后显示名格式变更不再静默断裂。收口类（C/D/M3/G/L2/B/M4）至此全部落地，架构剩余主要工作重心转入 core 侧。
 2. **A（桶契约类型化）已落地**：解码桶收口为 `Bucket` 显式状态单类，分类规则唯一实现落 dbc_loader，两条建桶路由由路由等价测试直接对拍——M1 的「等价性靠注释声明」结构性收口完成，单遍扫描性能前提（numpy 运算语义零变化 + H2a 注释随迁）未触碰。
-3. F 的「减法」只完成了 compare 族（21→18）；**8 个 bench/probe 可删脚本**（bench_bucket_dist / bench_parallel_finish / bench_spawn / bench_probe / probe_blf / convert_aht / run_gui_probe / verify_clean_env）仍待清，属 M8/L9 条目，可搭车任意收口任务。
+3. **closeout 收尾已完成**：E adapter 落地后表示变更触达面 7 → 1-2 处（01 票）；9 个 bench/probe 一次性脚本删除，tools 18→9（02 票，M8 随解）；03/04/05/06 票把 §4 其余条目逐条裁决完毕（做则落地、不做入 Out of scope）。架构侧残余仅剩 L9 scan_channels 单点裁决，不构成候选级工作。
 
 ---
 
@@ -246,4 +249,4 @@ ConvertWorker.run
 - 未逐行比对 docs/superpowers 下的 12 份设计/计划文档与代码现状（仅抽查 master plan 一处发现 L9 文档漂移）。
 - 审查不修改任何代码；所有问题条目均含 文件:行号 证据，可按条目逐一复核。
 
-**下一步**（按 improve-codebase-architecture 流程）：两个「高」级候选（H1/H2）已走完 grilling 并落地；**D（write_mdf 失败无残留归 writer）已实施完毕（2026-08-18，253 passed）**，实施记录见 §3 M3 状态；**C（归一化键单一来源）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 M2 状态；**G（ChannelStats 死字段）已实施完毕（2026-08-18，259 passed）**，实施记录见 §3 L2 状态；**B（绑定决策抽无 Qt 纯函数）已实施完毕（2026-08-18，269 passed）**，实施记录见 §3 M4 状态；**A（桶契约类型化）已实施完毕（2026-08-19，289 passed）**，实施记录见 §3 M1 状态。候选表中其余条目只描述问题与方向、未设计接口；五个 Strong 候选（A/B/F/H1/H2）全部落地，后续按 §5 处理 M8/L9 bench/probe 脚本清理等 Worth exploring 条目。
+**下一步**（按 improve-codebase-architecture 流程）：七个落地候选（H1/H2/F/D/C/G/B/A/E，2026-08-18~19）全部实施完毕，各实施记录见 §3 对应状态与 §4 候选表；五个 Strong 候选（A/B/F/H1/H2）与 E 落地后，closeout 03/04/05/06/08 票把 §4 全部 Worth exploring / Speculative 条目及 L9 逐条裁决完毕（做则落地、不做入 Out of scope、L9 已删），架构线无可决策项。剩余性能线残余（zlib 并行解压、can→asammdf import 链）挂 master plan 名下、map Not yet specified，重启性能线时作 fresh effort 评估。

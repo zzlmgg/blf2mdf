@@ -23,6 +23,7 @@
 - [07 — H3 输入探测提速](issues/07-h3-input-probe.md) — 方案 1 向量化行走单独做（缓存不做）：probe_channels 新增 _probe_fast 复用 _candidates + 掩码提取，终止分型按 probe 裁剪标量、回退 oracle 不 raise；行走 ~6.3s → ~0.24s（96%↓）；输入阶段冷 12.32 → 6.22s、GUI 热口径 ~2.2s（zlib 1.78s 硬下限）；291 passed + 230 组逐位一致 + full_compare 同分
 - [05 — 测试基建面裁决](issues/05-test-infra.md) — Q1 conftest 上收做（qapp/window 单一来源、window 统一 yield+close 规范形、删 import 时 mkdir 副作用与无引用常量）、Q2 sample_blf 固定具名 A19G1（删排序取首漂移）、Q3 冻结探针转 subprocess pytest 不做（入 Out of scope）；291 passed = 基线零回归
 - [06 — DEFAULT_MAPPING 单一来源裁决](issues/06-default-mapping-source.md) — 票面「三份」实为两份已删（convert_aht 随 02 票、test_golden 随 H2），轻量收敛已完整落地（MAPPING_TEXT/EXPECTED_MAPPING/真实 txt 四边互锁断言，漂移在 pytest 阶段已响亮）；Q1 档 1 意图显性化做（:47 对拍提为独立契约测试 + DEFAULT_MAPPING 注释指路），Q2 方案 A（数据文件自动生成）不做（机制已反向：txt 优先、DEFAULT 仅回退）入 Out of scope；292 passed 零回归
+- [08 — 最终验收与文档收尾](issues/08-final-acceptance.md) — **map destination 达成**：pytest 292 passed / 0 失败；对拍链 compare_two_mdf exit 0（230 组逐位一致）+ full_compare 70/70 同基线（报告与 07 逐字节同）；计时复测冷 6.50s / 热 ~3.25s / 转换 28.26s（基线 29.8s，+5%）；review 文档全量刷新（§5/行数/pytest 292/M8+L9 ✅）；裁决：打包验证不再重复（V1.2 已验 + pytest 覆盖 + 出包自然再验，入 Out of scope）、L9 scan_channels 删除（blf_reader 584→561，复跑零回归）
 
 ## Not yet specified
 
@@ -41,3 +42,4 @@
 - **read_start_time 整数化时机**（L8，[04 票裁决](issues/04-core-consolidation.md)「Q4 搁置不做」）：float 中转 ±119ns 安全论证已成立，属已知冗余；整数化无行为收益，不值得动已验证路径
 - **新功能**：本 effort 只收残余，不做新能力
 - **冻结探针转 subprocess pytest**（[05 票裁决](issues/05-test-infra.md)「Q3 不做」）：frozen_probe/frozen_gui_probe 仅发布 exe 时运行（低频），subprocess 化需 exe 常备否则常 skip；构建配置与 spec sed 同步脆弱 + 时序断言脆；发布路径本就手动，README:73-88 已记录断言，收益不抵成本
+- **打包验证重复**（[08 票裁决](issues/08-final-acceptance.md)「不再重复」）：V1.2 已验过一轮；01-07 票全部改动（core+gui）由 292 用例 pytest 锁定；verify_pyside_package --launch-smoke + test_package_config 已锁打包配置；dist/ 不存在、发布路径本就手动，出包时自然再验

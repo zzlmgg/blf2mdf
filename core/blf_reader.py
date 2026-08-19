@@ -557,28 +557,3 @@ def iter_all_messages(path: str, progress_cb=None, cancel_cb=None) -> Iterator[F
     ConversionCancelled（转换阶段取消，GUI 取消按钮置位）。
     """
     yield from _iter_frames(path, progress_cb=progress_cb, cancel_cb=cancel_cb)
-
-
-def scan_channels(path: str) -> dict[int, tuple]:
-    """一次全文件扫描：每通道的统计输入（修复项 4）。
-
-    返回 {channel: (相对时间戳 float64, is_extended, is_remote, is_error)}，
-    数组等长；未出现的通道不在字典中。时间戳 = Frame 的整数 ns 构造
-    （见模块 docstring）。供总线统计收集使用（避免逐通道重复全文件扫描）。
-    """
-    from collections import defaultdict
-
-    import numpy as np
-
-    data = defaultdict(lambda: ([], [], [], []))
-    for fr in _iter_frames(path):
-        ts, ext, rem, err = data[fr.channel]
-        ts.append(fr.ts_seconds)
-        ext.append(fr.is_extended)
-        rem.append(fr.is_remote)
-        err.append(fr.is_error)
-    return {
-        ch: (np.asarray(ts, dtype=np.float64), np.asarray(ext, dtype=bool),
-             np.asarray(rem, dtype=bool), np.asarray(err, dtype=bool))
-        for ch, (ts, ext, rem, err) in data.items()
-    }
