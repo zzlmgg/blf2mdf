@@ -55,7 +55,7 @@ ZFCANT——CAN11
 
 
 
-自动对比：
+自动对比（tools/verify_vs_canoe.py）：
 ——————————
 以下面两组原始 blf 及其对应的 canoe 转换的 mdf 文件：
 组别一：

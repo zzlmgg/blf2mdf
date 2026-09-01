@@ -134,6 +134,21 @@ def test_iter_all_messages_matches_iter_messages(tmp_path):
             f"通道 {ch} 单遍流与过滤流应逐帧一致"
 
 
+def test_iter_all_messages_accepts_unaligned_objects(unaligned_blf):
+    """合法对象 padding 不得累积成搜索窗口漂移。"""
+    import can
+
+    expected = [(0, 0x100, b"\x01"), (1, 0x101, b"\x02")]
+    frames = list(iter_all_messages(str(unaligned_blf)))
+    got = [(frame.channel, frame.arbitration_id, frame.data) for frame in frames]
+    with can.BLFReader(str(unaligned_blf)) as reader:
+        reference = [
+            (message.channel, message.arbitration_id, bytes(message.data))
+            for message in reader
+        ]
+    assert got == reference == expected
+
+
 def test_iter_messages_fields_on_sample():
     blf = sample_blf()
     if blf is None:
@@ -164,6 +179,11 @@ def test_probe_channels_matches_list_channels(tmp_path):
     expected = _multi_container_blf(p)
     assert probe_channels(str(p)) == expected
     assert probe_channels(str(p)) == list_channels(str(p))
+
+
+def test_probe_channels_accepts_unaligned_objects(unaligned_blf):
+    """通道探测与参考解析器同样接受连续对象 padding。"""
+    assert probe_channels(str(unaligned_blf)) == [0, 1]
 
 
 def test_probe_channels_on_sample():

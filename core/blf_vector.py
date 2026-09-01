@@ -184,6 +184,21 @@ def _candidates(data: bytes):
     return np.nonzero(v == _LOBJ)[0].astype(np.int64) * 4 + o, j_first
 
 
+def _window_positions(candidates: np.ndarray,
+                      obj_size: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """候选命中位置和对象大小 →（逐轮搜索下界, 实际对象结束位置）。
+
+    搜索下界首项固定为 0，后续项等于前一候选实际命中位置 + obj_size；
+    不能使用 obj_size 前缀和，否则对象间 padding 会被累积成游标漂移。
+    """
+    ends = candidates + obj_size.astype(np.int64)
+    starts = np.empty_like(ends)
+    if len(starts):
+        starts[0] = 0
+        starts[1:] = ends[:-1]
+    return starts, ends
+
+
 def _parse_fast(data: bytes, ms_part: int):
     """快路径（计划 §4）：返回 (ContainerFrames, tail)；条件不满足 → None。
 
@@ -231,7 +246,7 @@ def _parse_fast(data: bytes, ms_part: int):
     hdr_word = u32(c + 4, max_pos)
     hdr_size = (hdr_word & np.uint32(0xFFFF)).astype(np.int64)  # u16 字段（≠ 实际 hsz）
     hdr_ver = hdr_word >> np.uint32(16)
-    e = c + obj_size.astype(np.int64)
+    s, e = _window_positions(c, obj_size)
     v1 = hdr_ver == np.uint32(1)
     v2 = hdr_ver == np.uint32(2)
     unk = ~(v1 | v2)
@@ -250,21 +265,20 @@ def _parse_fast(data: bytes, ms_part: int):
                | (~(t_cls | t_err | t_fd | t_fd64)))   # 其他类型恒真（整体跳过）
     valid = base_fit & (unk | ver_fit) & (unk | msg_fit) & obj_fit
 
-    # ── 窗口状态机（§4.2 实施核对修正）：walk 的搜索窗口下界 s 按
-    # obj_size 前缀和推进（s' = s + obj_size；obj_size 不含 base 头，
-    # python-can writer 约定），候选 c 与窗口下界 s 的间隙 ∈ [0,4] 才
-    # 命中（fit 语义 c+4 ≤ s+8）；所有尾部均以窗口下界 s 为界
-    # （data[s:]，含未消费 padding），而非对象末尾 e = c + obj_size ──
-    s = np.concatenate(([0], np.cumsum(obj_size.astype(np.int64))))[:N]
+    # ── 窗口状态机：walk 的搜索窗口下界 s = 前一候选实际命中位置 +
+    # obj_size。不能只累加 obj_size：对象间 padding 会使搜索下界与实际
+    # 命中位置产生偏移，连续未对齐对象会把偏移累计到窗口之外。
+    # 候选 c 与窗口下界 s 的间隙 ∈ [0,4] 才命中；失败路径的 tail 仍从
+    # 搜索下界 s 起保留（含未消费 padding）。
     bad = ~valid | (c - s > 4)
     first = int(np.argmax(bad)) if bool(bad.any()) else N   # 第一个失败轮
 
     if first < N and int(c[first]) < int(s[first]):
         return None   # 防御：候选落窗口下界之前（不变量破坏）→ 回退
 
-    # H7a 双探针：重叠定理下仅两处窗口可能有扫描不可见的 walk 命中
+    # H7a 双探针：窗口状态机下仅两处窗口可能有扫描不可见的 walk 命中
     # （gap > 4 的首坏轮 / first == N 的末窗口）；探针命中即回退。
-    # 有效轮（gap ∈ {0,4}）由重叠定理保证 walk 首窗命中 = 扫描候选。
+    # 有效轮（gap ≤ 4）保证 walk 首窗命中 = 扫描候选。
     # 全窗口 j∈[0,4]：obj_size ≢ 0 mod 4（fuzz FD64）可使 s ≢ o mod 4，
     # 此时 j=0/j=4 的 LOBJ 对扫描与 (1,2,3) 探针双不可见而 walk 会命中
     # （fuzz 裁决修复；探针两分支的窗口内可见 LOBJ 由前置条件排除，
@@ -275,7 +289,7 @@ def _parse_fast(data: bytes, ms_part: int):
             if w + j + 4 <= max_pos and data[w + j:w + j + 4] == b"LOBJ":
                 return None
     if first == N and N >= 1:
-        s_end = int(s[N - 1]) + int(obj_size[N - 1])   # walk 末轮后的搜索起点
+        s_end = int(e[N - 1])   # 末候选实际命中位置 + obj_size
         for j in range(5):
             if s_end + j + 4 <= max_pos and data[s_end + j:s_end + j + 4] == b"LOBJ":
                 return None
@@ -420,9 +434,9 @@ def _parse_fast(data: bytes, ms_part: int):
             return None   # 版本头截断：walk 未捕获 struct.error 传播 → 回退
         return cf, data[int(s[first]):]   # 消息体截断 → 尾部
 
-    # ── 尾部（正常终止）：s_end = 窗口下界推进终点（Σ obj_size，含跳过
-    # 对象）；s_end+8 > max_pos → 尾部 = 未消费字节；否则 walk 会 raise ──
-    s_end = int(s[N - 1]) + int(obj_size[N - 1])
+    # ── 尾部（正常终止）：s_end = 末候选实际命中位置 + obj_size；
+    # s_end+8 > max_pos → 尾部 = 未消费字节；否则 walk 会 raise ──
+    s_end = int(e[N - 1])
     if s_end + 8 > max_pos:
         tail = data[s_end:]
     else:

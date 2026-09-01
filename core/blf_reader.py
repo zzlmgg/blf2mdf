@@ -84,6 +84,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
         _u16_at_v,
         _u32_at,
         _u32_at_v,
+        _window_positions,
     )
 
     from can.io.blf import (
@@ -194,7 +195,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
         obj_size = u32(c + 8, max_pos)
         obj_type = u32(c + 12, max_pos)
         hdr_ver = u32(c + 4, max_pos) >> np.uint32(16)
-        e = c + obj_size.astype(np.int64)
+        s, e = _window_positions(c, obj_size)
         v1 = hdr_ver == np.uint32(1)
         v2 = hdr_ver == np.uint32(2)
         unk = ~(v1 | v2)
@@ -213,7 +214,8 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
                    | (~(t_cls | t_err | t_fd | t_fd64)))
         valid = base_fit & (unk | ver_fit) & (unk | msg_fit) & obj_fit
 
-        s = np.concatenate(([0], np.cumsum(obj_size.astype(np.int64))))[:N]
+        # 搜索下界由前一候选的实际结束位置决定；只累加 obj_size 会把
+        # 对象间 padding 累积成漂移，与下方标量 _walk 的 next_pos 语义不符。
         bad = ~valid | (c - s > 4)
         first = int(np.argmax(bad)) if bool(bad.any()) else N
         if first < N and int(c[first]) < int(s[first]):
@@ -227,7 +229,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
                 if w + j + 4 <= max_pos and data[w + j:w + j + 4] == b"LOBJ":
                     return None
         if first == N and N >= 1:
-            s_end = int(s[N - 1]) + int(obj_size[N - 1])   # walk 末轮后的搜索起点
+            s_end = int(e[N - 1])   # 末候选实际命中位置 + obj_size
             for j in range(5):
                 if s_end + j + 4 <= max_pos and data[s_end + j:s_end + j + 4] == b"LOBJ":
                     return None
@@ -266,7 +268,7 @@ def probe_channels(path: str, progress_cb=None, cancel_cb=None) -> list[int]:
                     return channels, data[int(s[first]):]
                 raise BLFParseError("Could not find next object")
             return channels, data[int(s[first]):]   # 对象解析失败 → 尾部
-        s_end = int(s[N - 1]) + int(obj_size[N - 1])
+        s_end = int(e[N - 1])
         if s_end + 8 > max_pos:
             return channels, data[s_end:]
         raise BLFParseError("Could not find next object")
@@ -413,7 +415,10 @@ def walk_container(data: bytes, ms_part: int,
                 OBJ_HEADER_BASE_STRUCT.unpack_from(data, pos)
         except struct.error:
             return frames, data[obj_start:]  # 容器末尾不足一个对象头
-        if pos + obj_size > max_pos:
+        # 下一轮必须从实际 LOBJ 命中位置推进；obj_start 是搜索窗口下界，
+        # 可能因对象间 padding 落后于 pos，不能参与对象末尾计算。
+        next_pos = pos + obj_size
+        if next_pos > max_pos:
             return frames, data[obj_start:]  # 对象跨容器，留给下一容器
         n += 1
         if n % 1024 == 0 and cancel_cb is not None and cancel_cb():
@@ -426,7 +431,7 @@ def walk_container(data: bytes, ms_part: int,
             flags, _, _, rel = OBJ_HEADER_V2_STRUCT.unpack_from(data, pos)
             hsz = OBJ_HEADER_V2_STRUCT.size
         else:
-            pos = obj_start + obj_size
+            pos = next_pos
             continue  # 未知对象头版本：整体跳过（同 python-can）
         rel_ns = rel * 10_000 if flags == 1 else rel  # 10µs / 1ns 单位
         try:
@@ -489,7 +494,7 @@ def walk_container(data: bytes, ms_part: int,
                 ))
         except struct.error:
             return frames, data[obj_start:]  # 对象数据区截断（同 python-can）
-        pos = obj_start + obj_size
+        pos = next_pos
 
 
 def _iter_frames(path: str, progress_cb=None, cancel_cb=None) -> Iterator[Frame]:

@@ -171,9 +171,8 @@ def test_mixed_four_types_engage_and_match():
     res = _check(data)
     assert res is not None, "全正常容器应命中快路径"
     cf, tail = res
-    # 容器尾 padding（fd64(7) 的 body 50 字节 → 4 字节对齐补 2）按 walk
-    # 语义留在尾部（= 窗口下界 s 之后的未消费字节）
-    assert tail == b"\x00\x00"
+    # 对象间 padding 被下一轮窗口搜索吸收；末对象恰好结束于容器末尾。
+    assert tail == b""
     assert len(cf.channel) == 9
     assert cf.arb[0] == 0x123 and not cf.is_ext[0] and cf.channel[0] == 3
     assert cf.channel[1] == 1 and bool(cf.is_error[1])
@@ -445,9 +444,9 @@ def test_junk_tail_continuation():
     f1, t1 = walk_container(data1, 0, None)
     f2, t2 = walk_container(t1 + data2, 0, None)
     assert len(f1) == 1 and len(f2) == 1
-    # 衔接后：窗口下界按 obj_start+obj_size 推进（gap 字节未消费）——
-    # msg2 末尾 3 字节留在 tail，继续流向下一容器
-    assert t2 == b"\x00" * 3
+    # 衔接后按实际 LOBJ 命中位置推进；前三个垃圾字节作为搜索间隙吸收，
+    # msg2 恰好结束于容器末尾，不产生伪 tail。
+    assert t2 == b""
     assert _check(t1 + data2) is not None
 
 
@@ -554,6 +553,22 @@ def test_iter_container_frames_force_fallback_matches(tmp_path):
     ref = list(blf_reader.iter_all_messages(str(p)))
     got = list(iter_container_frames(str(p), _force_fallback=True))
     _assert_streams_equal(ref, got)
+
+
+def test_iter_container_frames_accepts_unaligned_objects(unaligned_blf):
+    """转换读入 seam 必须接受连续带 padding 的合法对象。"""
+    expected = [(0, 0x100, b"\x01"), (1, 0x101, b"\x02")]
+    got = []
+    for container in iter_container_frames(str(unaligned_blf)):
+        got.extend(
+            (
+                int(container.channel[i]),
+                int(container.arb[i]),
+                container.payload(i),
+            )
+            for i in range(len(container.channel))
+        )
+    assert got == expected
 
 
 def test_iter_container_frames_progress_monotonic(tmp_path):

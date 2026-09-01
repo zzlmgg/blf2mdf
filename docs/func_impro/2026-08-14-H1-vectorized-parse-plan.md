@@ -36,6 +36,10 @@
 
 - 基础头（16B，`<4sHHLL`）：header_size(u16@+4)、header_version(u16@+6)、obj_size(u32@+8)、obj_type(u32@+12)。
 - `next_pos = pos + obj_size`；`next_pos > max_pos` → 尾部（对象跨容器，留待下一容器衔接）。
+- `pos` 在此处是本轮实际命中的 `LOBJ` 位置，不是搜索前的窗口下界
+  `obj_start`。对象间 padding 由窗口搜索吸收；下一轮必须从 `next_pos`
+  推进，不能用 `obj_start + obj_size`，否则连续未对齐对象会累积游标漂移。
+  截断路径的尾部仍从 `obj_start` 保留，以便跨容器衔接不丢 padding。
 - 版本 1：V1 头 16B，flags=u32@+16，rel=u64@+24；版本 2：V2 头 24B（`<LBxHQ8x`），flags=**u32**@+16，rel=u64@+24（2026-08-14 实施核对修正：V2 flags 为 L 字段 u32，非 u8）。
 - 时间单位：`flags == 1`（精确相等，非位测试）→ rel×10000（10µs 单位）；否则 rel 按 1ns 计。
 - 未知版本：整体跳过（pos = 对象末尾），**不做**版本头解包、不发射。
@@ -141,7 +145,9 @@ def u32_at(p):  # p: int64 数组（已裁剪到安全域）
 
 ### 4.2 快路径条件（任一不满足 → 本容器整体回退 §5）
 
-记 `e = c + obj_size`，`N = len(c)`：
+记 `e = c + obj_size`，`s = concat([0], e[:-1])`，`N = len(c)`；`s` 是
+逐轮搜索窗口下界，必须由前一候选的实际结束位置构造，不能使用
+`obj_size` 前缀和：
 
 1. `N == 0`：`max_pos < 8` → 尾部 `data[0:]`；否则 raise BLFParseError（直接终结，无需回退）。
 2. `c[0] ≤ 4`（首对象命中窗口 `[0,8)` 的 +4 界；`max_pos < 8` 时自动成立）。
