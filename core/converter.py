@@ -44,16 +44,21 @@ def _bucket_block(cf, sel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
-                     raw_chunks, known_keys, read_cb, cancel_cb) -> None:
+                     raw_chunks, known_keys, read_cb, cancel_cb) -> int:
     """H1 向量化单遍扫描（计划 §9.1.3）：逐容器路由解码桶/统计/原始帧。
 
     直接填充 decoders[ch].buckets（数组桶）、decoders[ch].stats（feed 期
     计数语义）、stats_bufs 块列表、raw_chunks 块列表——下游（finish/统计
     聚合/raw 组装）输出与旧 feed 循环逐位一致。
+
+    返回：全文件对象最大绝对 ns 时刻（含非 CAN 帧对象，见 global_end）。
     """
     info = {ch: message_table(dec.dbc) for ch, dec in decoders.items()}
+    max_obj_ns = 0
     for cf in iter_container_frames(blf_path, progress_cb=read_cb,
                                     cancel_cb=cancel_cb):
+        if cf.max_obj_ns > max_obj_ns:
+            max_obj_ns = cf.max_obj_ns
         n = len(cf.channel)
         if n == 0:
             continue
@@ -123,6 +128,7 @@ def _read_vectorized(blf_path, decoders, raw_chs, stats_export, stats_bufs,
     for dec in decoders.values():
         for b in dec.buckets.values():
             b.to_array()
+    return max_obj_ns
 
 
 def _block_rows(block: np.ndarray, lens: np.ndarray) -> np.ndarray:
@@ -314,9 +320,9 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         t_read = time.perf_counter()
         # H1 向量化单遍扫描：路由解码桶/统计/原始帧（数组桶 + 块列表，
         # 见 _read_vectorized；产物与旧 feed 循环逐位一致）
-        _read_vectorized(blf_path, decoders, list(raw_chunks),
-                         stats_export, stats_bufs, raw_chunks,
-                         known_keys_arr, read_cb, cancel_cb)
+        max_obj_ns = _read_vectorized(blf_path, decoders, list(raw_chunks),
+                                      stats_export, stats_bufs, raw_chunks,
+                                      known_keys_arr, read_cb, cancel_cb)
         # 统计块列表 → 单数组（下游聚合代码不变）
         for ch, (t, e, r, er) in list(stats_bufs.items()):
             if not t:
@@ -414,11 +420,11 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
             t_stats = time.perf_counter()
             if progress_cb:
                 progress_cb("聚合总线统计", 92)
-            global_end = 0.0
-            for ch in stats_mod.STAT_CHANNELS:
-                ts = stats_bufs.get(ch, ((), None, None, None))[0]
-                if len(ts):
-                    global_end = max(global_end, float(np.max(ts)))
+            # 测量结束 = 全文件最大对象时刻（含非 CAN 帧对象；帧最大值是
+            # 其子集，构造式同 ts：(ms_part + rel_ns) × 1e-9）。CANoe 口径
+            # 实测：A02Y 末对象 obj_type=11 @375.999 晚于末帧 @375.998，
+            # 参考统计 t 轴末点正是 375.999；A19G1/AHT 末对象即末帧。
+            global_end = float(max_obj_ns) * 1e-9
             n_stats = len(stats_mod.STAT_CHANNELS)
             for i, ch in enumerate(stats_mod.STAT_CHANNELS):
                 # 逐通道上报 92→95：聚合 16 通道实测 ~1.4s，不再停在 92%

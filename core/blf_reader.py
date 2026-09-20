@@ -369,13 +369,19 @@ def iter_containers(path: str, progress_cb=None) -> Iterator[tuple[int, bytes]]:
 
 
 def walk_container(data: bytes, ms_part: int,
-                    cancel_cb=None) -> tuple[list[Frame], bytes]:
-    """容器内对象行走（python-can _parse_data 语义），返回 (帧, 尾部)。
+                    cancel_cb=None) -> tuple[list[Frame], bytes, int]:
+    """容器内对象行走（python-can _parse_data 语义），返回 (帧, 尾部, 末对象 ns)。
 
     自 _iter_frames 原样抽取（H1 Step 0，行为不变）。尾部 = 容器末尾
     不足一个对象头 / 跨容器对象的剩余字节，留给下一容器衔接
     （_parse_container 的 _tail 语义）。cancel_cb() 每 1024 个对象检查
     一次，置位即 raise ConversionCancelled（GUI 取消按钮）。
+
+    第三项 = 本容器内「读到时间头」的对象的最大绝对 ns 时刻（版本 1/2；
+    未知版本对象按 python-can 语义整体跳过，读不到时刻；未读出任何对象
+    为 0）。测量结束的取数口径见 converter.global_end——非 CAN 帧对象
+    也是测量的一部分（实测 A02Y 末对象 obj_type=11 晚于末帧 1ms，CANoe
+    参考统计 t 轴末点正是该对象时刻）。
     """
     import struct
 
@@ -401,6 +407,7 @@ def walk_container(data: bytes, ms_part: int,
     max_pos = len(data)
     pos = 0
     frames = []
+    max_obj_ns = 0
     n = 0
     while True:
         obj_start = pos
@@ -408,18 +415,18 @@ def walk_container(data: bytes, ms_part: int,
             pos = data.index(b"LOBJ", pos, pos + 8)
         except ValueError:
             if pos + 8 > max_pos:
-                return frames, data[obj_start:]
+                return frames, data[obj_start:], max_obj_ns
             raise BLFParseError("Could not find next object") from None
         try:
             _, header_size, header_version, obj_size, obj_type = \
                 OBJ_HEADER_BASE_STRUCT.unpack_from(data, pos)
         except struct.error:
-            return frames, data[obj_start:]  # 容器末尾不足一个对象头
+            return frames, data[obj_start:], max_obj_ns  # 容器末尾不足一个对象头
         # 下一轮必须从实际 LOBJ 命中位置推进；obj_start 是搜索窗口下界，
         # 可能因对象间 padding 落后于 pos，不能参与对象末尾计算。
         next_pos = pos + obj_size
         if next_pos > max_pos:
-            return frames, data[obj_start:]  # 对象跨容器，留给下一容器
+            return frames, data[obj_start:], max_obj_ns  # 对象跨容器，留给下一容器
         n += 1
         if n % 1024 == 0 and cancel_cb is not None and cancel_cb():
             raise ConversionCancelled()
@@ -434,6 +441,8 @@ def walk_container(data: bytes, ms_part: int,
             pos = next_pos
             continue  # 未知对象头版本：整体跳过（同 python-can）
         rel_ns = rel * 10_000 if flags == 1 else rel  # 10µs / 1ns 单位
+        if ms_part + rel_ns > max_obj_ns:
+            max_obj_ns = ms_part + rel_ns
         try:
             if obj_type in (CAN_MESSAGE, CAN_MESSAGE2):
                 m = CAN_MSG_STRUCT.unpack_from(data, pos + hsz)
@@ -493,7 +502,7 @@ def walk_container(data: bytes, ms_part: int,
                     is_remote=bool(m[6] & 0x0010),
                 ))
         except struct.error:
-            return frames, data[obj_start:]  # 对象数据区截断（同 python-can）
+            return frames, data[obj_start:], max_obj_ns  # 对象数据区截断（同 python-can）
         pos = next_pos
 
 
@@ -521,7 +530,7 @@ def _iter_frames(path: str, progress_cb=None, cancel_cb=None) -> Iterator[Frame]
         if tail:
             data = tail + data
             tail = b""
-        frames, tail = walk_container(data, ms_part, cancel_cb)
+        frames, tail, _ = walk_container(data, ms_part, cancel_cb)
         yield from frames
 
 

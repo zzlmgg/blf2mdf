@@ -1,6 +1,6 @@
 """CANoe 参考质量校验（固定验收脚本）：转换 → 全量对比 → 需求线判定。
 
-需求线硬门（退出码 0 = 两组全部满足）：
+需求线硬门（退出码 0 = 全部样例满足）：
 - 信号组全部信号：值（reference 容差 isclose 1e-6/1e-6, equal_nan=True）+ 时间戳逐位；
 - '1s' 统计组 t 轴 ≤1ns 网格容差（ch0 StdData，网格构造同构，代表全部统计组；
   起点带毫秒残值时两侧 float64 有 ULP 级表示噪声，1ns 以下不算差异）。
@@ -12,7 +12,7 @@
 用法：
     python tools/verify_vs_canoe.py [--skip-convert] [--outdir outputs/verify_canoe]
 
---skip-convert：复用 --outdir 下最新的 cmp_*_A19G1.mdf / cmp_*_AHT.mdf，不重新转换。
+--skip-convert：复用 --outdir 下各样例最新的 cmp_*_<项目>.mdf，不重新转换。
 转换产物与报告均写入 --outdir（默认 outputs/verify_canoe/，用户按需管理）。
 """
 import argparse
@@ -39,6 +39,12 @@ SAMPLES = [
     ("A19G1",
      ROOT / "inputs/blf/A19G1_ACFCAN_00112_20260614_141114.blf",
      ROOT / "inputs/mdf_canoe/A19G1.mdf"),
+    # A02Y：2026-09-20 CANape 值表信号显示 bug 的原始样例（DCU_HvilSt/VCU_HvilSt），
+    # 纳入固定门防止该类存储形态回归
+    ("A02Y",
+     ROOT / "inputs/blf/A02Y_ACFCANPUB_20260917_221900_59655158-"
+            "ACFCANPUB_20260917_222500_59655170.blf",
+     ROOT / "inputs/mdf_canoe/A02Y.mdf"),
     ("AHT",
      ROOT / "inputs/blf/AHT_ACFCANPUB_20260317_210430_59125089-"
             "ACFCAN_20260317_210930_59125099.blf",
@@ -89,7 +95,10 @@ def convert_one(project, blf, out):
     result = converter.convert(str(blf), bindings, str(out),
                                raw_export=False, parallel=True,
                                stats_export=True)
-    print(f"    转换耗时 {result.duration_seconds:.3f}s warnings={result.warnings}")
+    # duration_seconds = max_ts - min_ts（测量时长，非耗时）；墙钟取阶段计时
+    wall = dict(result.timings).get("总耗时", 0.0)
+    print(f"    测量时长 {result.duration_seconds:.3f}s 转换墙钟 {wall:.3f}s "
+          f"warnings={result.warnings}")
     for s in result.summaries:
         print(f"      CAN{s.channel}: bound={s.bound} 解码帧={s.decoded_frames} "
               f"信号数={s.signal_count} 未知帧={s.unknown_frames} 未知ID={s.unknown_ids}")

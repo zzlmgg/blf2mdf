@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from asammdf import MDF, Signal
 
-from core.decoder import SignalSeries
+from core.decoder import EnumTable, SignalSeries
 from core.stats import ChannelStats, STAT_NAMES
 
 # 修复项 9：asammdf 默认 COMPRESSION_LEVEL=1（zlib 最快、压缩率最低，
@@ -31,6 +31,29 @@ class RawGroup:
 
 # asammdf v4_constants.SYNC_TYPE_TIME：主时间通道同步类型，单位 "s"
 _MASTER_TIME = ("t", 1)
+
+
+def _enum_conversion(et: EnumTable) -> dict:
+    """值表 → asammdf 转换 dict（TABX=7 文本表；与 CANoe 转换块逐字段同构）。
+
+    表内原始值 → 文本（val_i/text_i，按原始值升序）；表外 → default_addr：
+    无缩放为恒等（b''），有缩放为嵌套线性换算 {a,b,unit}——CANoe 实测
+    ITS_MotorInletTemp：val 3050 "Invalid Value" + default(0.1,-50,degC)。
+
+    unit 只在有线性默认换算时写入转换块：恒等默认时 CANoe 不写 unit 块
+    （实测 4 个 '%' 单位的值表信号 conversion.unit 为空，通道级 CN_unit 仍为 '%'）。
+    """
+    conv = {}
+    for i, value in enumerate(sorted(et.choices)):
+        conv[f"val_{i}"] = float(value)
+        conv[f"text_{i}"] = et.choices[value]
+    if et.scale == 1.0 and et.offset == 0.0:
+        conv["default_addr"] = b""
+    else:
+        conv["unit"] = et.unit
+        conv["default_addr"] = {"conversion_type": 1, "a": et.scale,
+                                "b": et.offset, "unit": et.unit}
+    return conv
 
 
 def _abs_time_ns(dt: datetime) -> int:
@@ -83,8 +106,12 @@ def write_mdf(signal_series_list: list[SignalSeries],
             samples = s.values[name]
             kwargs = {}
             if samples.dtype.kind in ("S", "O", "U"):
-                # 枚举文本：|Sn 定宽 bytes（修复项 3）；asammdf 需 encoding 元数据
+                # 文本样本（|Sn 定宽 bytes）；asammdf 需 encoding 元数据
                 kwargs["encoding"] = "utf-8"
+            enum = s.enums.get(name)
+            if enum is not None:
+                # 值表信号：原始整型样本 + 文本表转换（CANape 才能画成曲线）
+                kwargs["conversion"] = _enum_conversion(enum)
             signals.append(Signal(
                 samples=samples,           # 按解码 dtype 原样写出（整型/文本/float64，修复项 8）
                 timestamps=s.timestamps,

@@ -266,6 +266,61 @@ def test_convert_stats_t_axis_last_point_full_precision(tmp_path):
     assert t[-1] == pytest.approx(5.123456, abs=1e-6), t[-1]
 
 
+def test_convert_stats_t_axis_end_includes_non_frame_objects(tmp_path):
+    """统计 t 轴末点 = 全文件最大对象时刻：非 CAN 帧对象（obj_type=11）也计入。
+
+    回归背景（A02Y 实测）：CANoe 的测量结束取全文件最大对象时刻——末对象
+    obj_type=11 @375.999 晚于末帧 @375.998，参考 t 轴末点正是 375.999；我们
+    曾只取 CAN 帧最大值（375.998），硬门在统计 t 轴末点报 1ms 差异。末对象
+    单独占一个容器（无帧）时同样计入——容器产物流不可丢空容器。
+    """
+    from can.io.blf import (CAN_MESSAGE, CAN_MSG_STRUCT, FILE_HEADER_SIZE,
+                            FILE_HEADER_STRUCT, LOG_CONTAINER,
+                            LOG_CONTAINER_STRUCT, NO_COMPRESSION,
+                            OBJ_HEADER_BASE_STRUCT, OBJ_HEADER_V1_STRUCT)
+
+    def obj(body, obj_type, rel_ns):
+        """V1 对象：header_size = base(16) + V1(16)，obj_size 含 base 头。"""
+        header_size = OBJ_HEADER_BASE_STRUCT.size + OBJ_HEADER_V1_STRUCT.size
+        return (OBJ_HEADER_BASE_STRUCT.pack(
+                    b"LOBJ", header_size, 1, header_size + len(body), obj_type)
+                + OBJ_HEADER_V1_STRUCT.pack(0, 0, 0, rel_ns) + body)
+
+    def container(payload):
+        return (OBJ_HEADER_BASE_STRUCT.pack(b"LOBJ", 16, 1, 32 + len(payload),
+                                            LOG_CONTAINER)
+                + LOG_CONTAINER_STRUCT.pack(NO_COMPRESSION, len(payload))
+                + payload)
+
+    msg = obj(CAN_MSG_STRUCT.pack(1, 0, 8, 100, b"\xE8\x03" + b"\x00" * 6),
+              CAN_MESSAGE, 1_000_000_000)   # 通道字段 1-based → 读回通道 0
+    # 非消息对象（统计/标记类，obj_type=11）：无帧容器，晚于末帧 1.5s
+    marker = obj(b"\x00" * 16, 11, 2_500_000_000)
+    payloads = msg + marker
+    total = FILE_HEADER_SIZE + len(payloads) + 32 * 2
+    header = [b"LOGG", FILE_HEADER_SIZE, 5, 0, 0, 0, 2, 6, 8, 1, total,
+              FILE_HEADER_SIZE + len(payloads), 2, 0,
+              2026, 8, 1, 17, 12, 34, 56, 0,      # 起始 SYSTEMTIME（毫秒 0）
+              2026, 8, 1, 17, 12, 34, 57, 0]
+    blf = tmp_path / "marker.blf"
+    with blf.open("wb") as stream:
+        stream.write(FILE_HEADER_STRUCT.pack(*header))
+        stream.write(b"\x00" * (FILE_HEADER_SIZE - FILE_HEADER_STRUCT.size))
+        stream.write(container(msg))
+        stream.write(container(marker))
+
+    dbc = tmp_path / "t.dbc"
+    dbc.write_text(INLINE_DBC, encoding="utf-8")
+    out = tmp_path / "out.mdf"
+    convert(blf, {0: load(dbc)}, str(out))
+
+    m = MDF(str(out))
+    std = m.get("StdData", group=1)   # ch0 StdData（组 0 = 解码组）
+    t = np.asarray(std.timestamps)
+    assert t[-1] == pytest.approx(2.5, abs=1e-6), t   # 曾为末帧 1.0
+    assert len(t) == 4, t                             # ceil(2.5) = 3 窗 + 首点
+
+
 # ---- 转换取消 ----
 
 def test_convert_cancel_preset_no_output(tmp_path, blf_and_dbc):
@@ -466,3 +521,112 @@ def test_convert_fd_bucketing_and_raw_assembly(tmp_path, blf_and_dbc_fd):
     assert data[1][0] == 0xAA and not data[1][1:].any()      # 短帧补零
     assert m.get("IsFD", group=gi).samples.tolist() == [1, 0]
     assert np.allclose(m.get("t", group=gi).samples, [3.0, 4.0])
+
+
+INLINE_DBC_ENUM = '''VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU
+
+BO_ 700 Status: 8 ECU
+ SG_ DCU_HvilSt : 0|2@1+ (1,0) [0|3] "%" ECU
+ SG_ VCU_stSupBD : 2|8@1+ (1,0) [0|255] "" ECU
+ SG_ ITS_Temp : 10|16@1+ (0.1,-50) [-50|150] "degC" ECU
+
+VAL_ 700 DCU_HvilSt 0 "Standby" 1 "Closed" 2 "Interrupted" 3 "Failure" ;
+VAL_ 700 ITS_Temp 3050 "Invalid Value" ;
+'''
+
+
+def _enum_frame(hvil, supbd, temp_raw):
+    """LE 位布局：bit0-1 DCU_HvilSt / bit2-9 VCU_stSupBD / bit10-25 ITS_Temp。"""
+    word = ((hvil & 0x3) | ((supbd & 0xFF) << 2) | ((temp_raw & 0xFFFF) << 10))
+    return word.to_bytes(8, "little")
+
+
+@pytest.fixture()
+def blf_and_dbc_enum(tmp_path):
+    """值表信号夹具：纯枚举 + 缩放枚举 + 无表信号（对照）。"""
+    import can
+
+    blf = tmp_path / "enum.blf"
+    samples = [(0, 5, 100), (1, 6, 200), (2, 7, 3050), (3, 8, 300)]
+    with can.BLFWriter(str(blf)) as w:
+        for i, (hvil, supbd, temp) in enumerate(samples):
+            w.on_message_received(can.Message(
+                arbitration_id=700, is_extended_id=False,
+                data=_enum_frame(hvil, supbd, temp), channel=1,
+                timestamp=1784716800.0 + i))
+    dbc = tmp_path / "t_enum.dbc"
+    dbc.write_text(INLINE_DBC_ENUM, encoding="utf-8")
+    return str(blf), str(dbc)
+
+
+def test_convert_value_table_signal_storage(tmp_path, blf_and_dbc_enum):
+    """值表信号（DBC VAL_）必须写成「原始整型 + TABX 值表转换」（CANoe 形态）。
+
+    回归（2026-09-20 CANape 显示 bug）：旧实现把值表信号写成 |Sn 字符串通道，
+    CANape 无法把字符串画成数值曲线 → 枚举信号渲染成一条粗直线，看不出变化。
+    """
+    from asammdf.blocks import conversion_utils
+
+    blf, dbc_path = blf_and_dbc_enum
+    out = tmp_path / "enum_out.mdf"
+    convert(blf, {1: load(dbc_path)}, str(out), stats_export=False)
+
+    m = MDF(str(out))
+    gi = next(i for i, g in enumerate(m.groups)
+              if g.channel_group.acq_name == "Status")
+    chans = {ch.name: ch for ch in m.groups[gi].channels}
+    idx = {ch.name: i for i, ch in enumerate(m.groups[gi].channels)}
+
+    def read(name, **kw):
+        return m.get(name, group=gi, index=idx[name], **kw).samples
+
+    # 1) 存储形态：数值通道（非字符串）+ 值表转换；CANape 才能画曲线
+    enum_ch = chans["DCU_HvilSt"]
+    assert enum_ch.data_type not in (6, 7, 13, 14, 15, 16), "值表信号不得存成字符串"
+    assert enum_ch.conversion.conversion_type == 7
+
+    # 2) 转换表内容 = DBC VAL_ 全表；表外原始值走 default（无缩放 → 恒等）
+    conv = conversion_utils.to_dict(enum_ch.conversion)
+    assert {k: conv[k] for k in sorted(conv) if k.startswith("val_")} == {
+        "val_0": 0.0, "val_1": 1.0, "val_2": 2.0, "val_3": 3.0}
+    assert {k: conv[k] for k in sorted(conv) if k.startswith("text_")} == {
+        "text_0": "Standby", "text_1": "Closed",
+        "text_2": "Interrupted", "text_3": "Failure"}
+    assert conv["default_addr"] == ""      # 恒等（asammdf to_dict 归一化为 str）
+
+    # 2b) unit 规则（CANoe 实测，A02Y 446 个值表信号逐字段对拍得出）：
+    #     通道级 CN_unit 照 DBC 写出，但恒等 default 的转换块不写 unit 块
+    #     （CANoe 同形）；只有嵌套线性 default 才带 unit（见 4）。
+    assert enum_ch.unit == "%"
+    assert conv.get("unit", "") == ""
+
+    # 3) 原始值即 DBC 原始值（未缩放）；读取按表替换成文本
+    assert read("DCU_HvilSt", raw=True).tolist() == [0, 1, 2, 3]
+    assert read("DCU_HvilSt").tolist() == [
+        b"Standby", b"Closed", b"Interrupted", b"Failure"]
+
+    # 4) 缩放 + 值表：原始整型存储，表外值 default 走嵌套线性换算
+    temp_ch = chans["ITS_Temp"]
+    assert temp_ch.data_type not in (6, 7, 13, 14, 15, 16)
+    assert temp_ch.conversion.conversion_type == 7
+    tconv = conversion_utils.to_dict(temp_ch.conversion)
+    assert {k: tconv[k] for k in sorted(tconv) if k.startswith("val_")} == {"val_0": 3050.0}
+    assert {k: tconv[k] for k in sorted(tconv) if k.startswith("text_")} == {
+        "text_0": "Invalid Value"}
+    default = tconv["default_addr"]
+    assert default["conversion_type"] == 1
+    assert default["a"] == pytest.approx(0.1) and default["b"] == pytest.approx(-50.0)
+    assert default["unit"] == "degC"
+    assert read("ITS_Temp", raw=True).tolist() == [100, 200, 3050, 300]
+
+    # 5) 对照（无回归）：无值表信号仍为数值通道且无转换块（CANoe 同形）
+    plain_ch = chans["VCU_stSupBD"]
+    assert plain_ch.data_type not in (6, 7, 13, 14, 15, 16)
+    assert plain_ch.conversion is None
+    assert read("VCU_stSupBD").tolist() == [5, 6, 7, 8]

@@ -5,10 +5,21 @@ from typing import Iterator
 
 import numpy as np
 
-from cantools.database.namedsignalvalue import NamedSignalValue
-
 from core.blf_reader import Frame
 from core.dbc_loader import DbcDef, MessageDef, SignalDef, classify, normalize_id
+
+
+@dataclass(frozen=True)
+class EnumTable:
+    """值表信号的转换元数据（writer 写成 TABX 文本表 + default 换算）。
+
+    choices: DBC VAL_ 原始值 → 文本；scale/offset/unit: 表外原始值的换算
+    （CANoe 语义：表内原始值 → 文本，表外 → 线性换算后的物理值）。
+    """
+    choices: dict
+    scale: float = 1.0
+    offset: float = 0.0
+    unit: str = ""
 
 
 @dataclass
@@ -19,9 +30,11 @@ class SignalSeries:
     signal_names: list[str]
     timestamps: np.ndarray          # float64 (N,)
     # 每信号 dtype 由 DBC 定义决定（修复项 3+8，与 CANoe 一致）：
-    #   float64 物理值 / 最小整型原值（uint8..int64）/ |Sn 枚举文本 bytes
+    #   float64 物理值 / 最小整型原值（uint8..int64）；值表信号存原始整型，
+    #   文本表由 writer 侧写成 TABX 转换（enums），见 _signal_kind
     values: dict[str, np.ndarray] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
+    enums: dict[str, EnumTable] = field(default_factory=dict)
 
 
 @dataclass
@@ -224,21 +237,38 @@ def _extract_signal(data64: np.ndarray, sd: SignalDef) -> np.ndarray:
     return v
 
 
-def _signal_kind(sd: SignalDef, vals: list) -> str:
-    """CANoe 最小存储类型规则（参考 _T058.mdf 全量核对：3724 信号 0 反例）：
-    - 物理变换（factor≠1 / offset≠0 / 浮点）：默认 float64 物理值；但有 choices 且
-      **观察到的值全部在表内**（全为 NamedSignalValue）→ 文本（实测
-      HVAC_RearTempSelect 全 31→|S7；HVAC_DriverTempSelect 混表外 0 → float64，
-      表内值存 nan）；
-    - 无物理变换且有 choices → 文本（表外原始值存空字节，实测 FanPWMSt）；
-    - 其余 → 原始整型（最小 dtype）。"""
+def _has_enum_storage(sd: SignalDef) -> bool:
+    """值表信号（DBC VAL_）是否走「原始整型 + TABX 值表」存储。
+
+    浮点信号带值表（SIG_VALTYPE_ + VAL_）项目内不存在、无 CANoe 参考，
+    维持 float 分支（见 _signal_kind）。
+    """
+    return bool(sd.choices) and not sd.is_float
+
+
+def _signal_kind(sd: SignalDef) -> str:
+    """存储类型（纯 SignalDef 函数，2026-09-20 重做）：
+    - 有值表（choices）→ 原始整型值（含物理变换的信号：表内/表外的换算交给
+      writer 的 TABX 转换，见 EnumTable）；
+    - 有物理变换或浮点（无值表）→ float64 物理值；
+    - 其余 → 原始整型（最小 dtype）。
+
+    旧实现按观察值定类型（观察值全在表内 → |Sn 文本，混表外 → float64 且表内
+    值存 nan）。字符串通道 CANape 画不成数值曲线 —— 枚举信号渲染成一条粗直线，
+    看不出变化（2026-09-20 CANape 显示 bug），故与 CANoe 一致改存数值 + 转换表。
+    """
+    if _has_enum_storage(sd):
+        return "int"
     if sd.is_float or sd.scale != 1.0 or sd.offset != 0.0:
-        if sd.choices and all(isinstance(v, NamedSignalValue) for v in vals):
-            return "text"
         return "float"
-    if sd.choices:
-        return "text"
     return "int"
+
+
+def _enum_tables(md: MessageDef) -> dict[str, EnumTable]:
+    """值表信号 → EnumTable（两条解码路径共用，writer 侧写 TABX 转换的唯一来源）。"""
+    return {s.name: EnumTable(choices=s.choices, scale=s.scale,
+                              offset=s.offset, unit=s.unit)
+            for s in md.signals if _has_enum_storage(s)}
 
 
 def _clamped_int_array(vals: list, dtype: np.dtype) -> np.ndarray:
@@ -263,37 +293,6 @@ def _clamped_int_array(vals: list, dtype: np.dtype) -> np.ndarray:
                     u.astype(object) - (1 << bits), u.astype(object)).astype(dtype)
 
 
-def _choices_lookup(sd: SignalDef, raw: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """choices 键查询 → (排序键数组, in_table 掩码)；无 choices → (None, None)。
-
-    键匹配语义同 Python dict（31.0 == 31）：浮点信号键按 float64 比较；
-    整型按符号取 int64/uint64（裁决修正 4）——与 raw 同 dtype 空间，
-    searchsorted/判等不跨空间（uint64 键装负键会绕成巨大值且 int64 raw ×
-    uint64 keys 经 float64 提升后键 ≥2^53 时判等错配）。
-    """
-    if not sd.choices:
-        return None, None
-    keys = np.asarray(sorted(sd.choices),
-                      dtype=np.float64 if sd.is_float
-                      else np.int64 if sd.is_signed else np.uint64)
-    idx = np.searchsorted(keys, raw, side="left")
-    ok = idx < len(keys)
-    in_table = ok & (keys[np.where(ok, idx, 0)] == raw)
-    return keys, in_table
-
-
-def _signal_kind_vec(sd: SignalDef, in_table: np.ndarray | None) -> str:
-    """向量化存储类型判定（= _signal_kind 语义，观察值全在表内判定向量化）。
-    in_table 为 None（无 choices）或掩码（mux 非活跃帧为 False，同 nan 语义）。"""
-    if sd.is_float or sd.scale != 1.0 or sd.offset != 0.0:
-        if sd.choices and bool(np.all(in_table)):
-            return "text"
-        return "float"
-    if sd.choices:
-        return "text"
-    return "int"
-
-
 def _physical(sd: SignalDef, raw: np.ndarray) -> np.ndarray:
     """scale/offset 物理变换 → float64（与参考实现逐位一致）。
 
@@ -315,50 +314,18 @@ def _physical(sd: SignalDef, raw: np.ndarray) -> np.ndarray:
     return np.fromiter((int(r) * s + o for r in raw), dtype=np.float64, count=raw.size)
 
 
-def _text_array(sd: SignalDef, raw: np.ndarray, keys: np.ndarray,
-                in_table: np.ndarray) -> np.ndarray:
-    """文本存储：表内值 → 定宽 UTF-8 bytes（= 最长观察值），表外/非活跃 → b''。
+def _store_signal(sd: SignalDef, raw: np.ndarray, active: np.ndarray) -> np.ndarray:
+    """按存储类型落盘：int 非活跃→0；float 非活跃→nan。
 
-    逐样本 Python 编码在 27.5M 样本上实测 ~30s（genexpr 求宽 + 逐样本
-    encode），改为表级一次编码：宽度 = 观察到的表项编码长度最大值，
-    输出 = (k, w) 编码矩阵 take + view（同语义逐位一致）。
+    值表信号存原始整型（表内外一律原值，含物理变换的信号——换算由 writer 的
+    TABX 转换承担，读回物理值与 CANoe 一致）。
     """
-    n = len(raw)
-    if not in_table.any():
-        return np.zeros(n, dtype="|S1")
-    texts = np.array([sd.choices[k] for k in keys.tolist()], dtype=object)
-    ai = np.where(in_table)[0]
-    idx = np.searchsorted(keys, raw[ai], side="left")
-    enc_table = [t.encode("utf-8") for t in texts.tolist()]
-    len_table = np.fromiter((len(e) for e in enc_table), dtype=np.int64,
-                            count=len(enc_table))
-    # 宽度按 UTF-8 字节数（= 参考 str(v).encode("utf-8") 的字节长度；
-    # 按 len(t) 字符数会对非 ASCII 文本（GBK 中文）定宽不足而截断）
-    w = int(np.max(len_table[idx], initial=1))
-    # 未观察表项可能长于 w：截断安全（idx 只指向观察到的表项，长度 ≤ w）
-    mat = np.array([list(e.ljust(w, b"\x00")[:w]) for e in enc_table],
-                   dtype=np.uint8)
-    out = np.zeros(n, dtype=f"|S{w}")
-    out[ai] = mat[idx].view(f"|S{w}").reshape(-1)   # w=1 时 view 不塌缩末轴
-    return out
-
-
-def _store_signal(sd: SignalDef, raw: np.ndarray, active: np.ndarray,
-                  keys, in_table) -> np.ndarray:
-    """按存储类型落盘：int 非活跃→0；float 非活跃→nan；text 非活跃/表外→b''。"""
-    n = len(raw)
-    if _signal_kind_vec(sd, in_table) == "text":
-        return _text_array(sd, raw, keys, in_table)
-    if _signal_kind_vec(sd, in_table) == "int":
-        out = np.zeros(n, dtype=_int_dtype(sd.length, sd.is_signed))
-        out[active] = raw[active].astype(out.dtype)
+    if _signal_kind(sd) == "float":
+        out = np.full(len(raw), np.nan, dtype=np.float64)
+        out[active] = _physical(sd, raw)[active]
         return out
-    out = np.full(n, np.nan, dtype=np.float64)
-    phys = _physical(sd, raw)
-    if in_table is None:
-        out[active] = phys[active]
-    else:
-        out[active & ~in_table] = phys[active & ~in_table]
+    out = np.zeros(len(raw), dtype=_int_dtype(sd.length, sd.is_signed))
+    out[active] = raw[active].astype(out.dtype)
     return out
 
 
@@ -425,15 +392,13 @@ def _finish_bucket_vectorized(dbc, channel, b, stats) -> list[SignalSeries]:
         else:
             active = np.ones(n_ok, dtype=bool)
         raw = _extract_signal(d64, s)
-        keys, in_table = _choices_lookup(s, raw)
-        if in_table is not None:
-            in_table &= active
-        values[s.name] = _store_signal(s, raw, active, keys, in_table)
+        values[s.name] = _store_signal(s, raw, active)
     return [SignalSeries(
         channel=channel, message_name=md.name, node=md.sender_node,
         signal_names=[s.name for s in md.signals],
         timestamps=timestamps, values=values,
-        units={s.name: s.unit for s in md.signals})]
+        units={s.name: s.unit for s in md.signals},
+        enums=_enum_tables(md))]
 
 
 def _decode_bucket_reference(dbc, channel, b, stats) -> list[SignalSeries]:
@@ -443,43 +408,44 @@ def _decode_bucket_reference(dbc, channel, b, stats) -> list[SignalSeries]:
     数组相位（to_array 收敛）——data (N, L) uint8 按 lens 行切片还原帧字节。
     """
     from cantools.database.errors import DecodeError
-    from cantools.database.namedsignalvalue import NamedSignalValue
 
     md = b.md
+    enum_names = {s.name for s in md.signals if _has_enum_storage(s)}
     vals_by_sig = {s.name: [] for s in md.signals}
     ts_ok = []
     for ts, ln, row in zip(b.ts, b.lens, b.data):
         try:
+            payload = row[:ln].tobytes()
             # 归一化键（含 EFF 位）与 feed/参考实现对拍一致（rulings 修正 2）
-            decoded = dbc.db.decode_message(b.arb, row[:ln].tobytes())
+            decoded = dbc.db.decode_message(b.arb, payload)
+            # 值表信号存原始值：默认解码把表内值替换成文本，另取一次原始值
+            # （不缩放不替换）；无值表信号的缩放仍由 cantools 承担（对拍保留）
+            raw_decoded = (dbc.db.decode_message(b.arb, payload,
+                                                 decode_choices=False, scaling=False)
+                           if enum_names else None)
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(b.raw_id)
             continue
         ts_ok.append(ts)
         for s in md.signals:
-            vals_by_sig[s.name].append(decoded.get(s.name, float("nan")))
+            src = raw_decoded if s.name in enum_names else decoded
+            vals_by_sig[s.name].append(src.get(s.name, float("nan")))
     if not ts_ok:
         return []
     values = {}
     for s in md.signals:
         vals = vals_by_sig[s.name]
-        kind = _signal_kind(s, vals)
-        if kind == "text":
-            values[s.name] = np.asarray([
-                str(v).encode("utf-8") if isinstance(v, NamedSignalValue) else b""
-                for v in vals])
-        elif kind == "int":
-            values[s.name] = _clamped_int_array(vals, _int_dtype(s.length, s.is_signed))
+        if _signal_kind(s) == "float":
+            values[s.name] = np.asarray(vals, dtype=np.float64)
         else:
-            values[s.name] = np.asarray(
-                [float("nan") if isinstance(v, NamedSignalValue) else v
-                 for v in vals], dtype=np.float64)
+            values[s.name] = _clamped_int_array(vals, _int_dtype(s.length, s.is_signed))
     return [SignalSeries(
         channel=channel, message_name=md.name, node=md.sender_node,
         signal_names=[s.name for s in md.signals],
         timestamps=np.asarray(ts_ok, dtype=np.float64),
-        values=values, units={s.name: s.unit for s in md.signals})]
+        values=values, units={s.name: s.unit for s in md.signals},
+        enums=_enum_tables(md))]
 
 
 def _int_dtype(length: int, is_signed: bool) -> np.dtype:

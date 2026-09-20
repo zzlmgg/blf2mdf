@@ -111,9 +111,11 @@ def _fd64(channel, can_id, data, *, flags=0, rel=0, version=1, dlc=None,
 
 
 # ── 容器级对拍 ──
-def _assert_eq(frames, tail, res):
+def _assert_eq(frames, tail, max_obj_ns, res):
     cf, ftail = res
     assert ftail == tail, "尾部字节不一致"
+    assert cf.max_obj_ns == max_obj_ns, (
+        f"末对象时刻 {cf.max_obj_ns} != 标量 {max_obj_ns}")
     got = cf.channel.shape[0]
     assert got == len(frames), f"帧数 {got} != {len(frames)}"
     for i, f in enumerate(frames):
@@ -136,7 +138,7 @@ def _check(data, ms_part=0):
     → None。标量正常而快路径抛异常、或标量抛而快路径产出结果 = 测试失败。
     """
     try:
-        frames, tail = walk_container(data, ms_part, None)
+        frames, tail, mns = walk_container(data, ms_part, None)
     except Exception as e:
         try:
             res = _parse_fast(data, ms_part)
@@ -151,7 +153,7 @@ def _check(data, ms_part=0):
     res = _parse_fast(data, ms_part)
     if res is None:
         return None
-    _assert_eq(frames, tail, res)
+    _assert_eq(frames, tail, mns, res)
     return res
 
 
@@ -263,7 +265,7 @@ def test_gap_beyond_window_raises_or_tails():
             walk_container(data, 0, None)
         # 情形 2：容器在 e_A 后不足 8 字节 → 双双尾部（= 洞字节）
         data2 = _msg(1, 0x100, b"\x01") + b"\x00" * k
-        frames, tail = walk_container(data2, 0, None)
+        frames, tail, _ = walk_container(data2, 0, None)
         assert tail == b"\x00" * k
         res = _check(data2)
         assert res is not None and res[1] == tail
@@ -280,7 +282,7 @@ def test_tail_junk_gte_8_raises():
 def test_no_candidates_tail_or_raise():
     for n in range(8):
         data = b"\x00" * n
-        frames, tail = walk_container(data, 0, None)
+        frames, tail, _ = walk_container(data, 0, None)
         assert frames == [] and tail == data
         res = _parse_fast(data, 0)
         assert res is not None and res[1] == data \
@@ -321,8 +323,44 @@ def test_message_body_truncated_last_candidate():
     data = _msg(1, 0x200, b"\x02") + truncated
     res = _check(data)
     assert res is not None and res[1] == truncated and len(res[0].channel) == 1
-    frames, tail = walk_container(data, 0, None)
+    frames, tail, _ = walk_container(data, 0, None)
     assert len(frames) == 1 and tail == truncated
+
+
+def test_max_obj_ns_includes_skipped_objects():
+    """末对象时刻取「读到时间头的对象」最大值，含被跳过的非消息对象。
+
+    回归背景：测量结束（统计 t 轴末点）曾只取 CAN 帧最大值；CANoe 取全
+    文件最大对象时刻——A02Y 末对象 obj_type=11 @375.999 晚于末帧 @375.998，
+    参考 t 轴末点正是 375.999。末对象在容器中部（非最后一个对象）也取到。
+    """
+    skipped = _mk_obj(b"\x00" * 8, rel=2_500_000_000, obj_type=11)
+    data = (_msg(1, 0x100, b"\x01", rel=1_000_000_000) + skipped
+            + _msg(1, 0x101, b"\x02", rel=500_000_000))
+    res = _check(data)   # 快路径 vs 标量（_assert_eq 含 max_obj_ns）
+    assert res is not None
+    cf, _ = res
+    assert len(cf.channel) == 2, "obj_type=11 不是帧"
+    assert cf.max_obj_ns == 2_500_000_000
+    # 全为消息对象时退化为帧最大值
+    only_msg = _msg(1, 0x100, b"\x01", rel=7) + _msg(1, 0x101, b"\x02", rel=9)
+    cf2, _ = _check(only_msg)
+    assert cf2.max_obj_ns == 9
+
+
+def test_max_obj_ns_excludes_truncated_and_unknown_version():
+    """跨容器截断的对象与未知版本对象都不计入末对象时刻。
+
+    截断对象（walk 在读版本头前已返回）：其时刻由下一容器的完整解析接续
+    计数，本容器不得提前计入；未知版本对象无时间头可读。
+    """
+    truncated = _base(32, 1, 4096, CAN_MESSAGE)   # obj_size 超出容器
+    frames, tail, mns = walk_container(_msg(1, 0x100, b"\x01", rel=5) + truncated,
+                                       0, None)
+    assert len(frames) == 1 and mns == 5
+    unknown_ver = _base(16, 3, 24, CAN_MESSAGE) + b"\x00" * 8
+    _, _, mns2 = walk_container(unknown_ver, 0, None)
+    assert mns2 == 0
 
 
 def test_dlc_out_of_range_classic():
@@ -428,9 +466,9 @@ def test_cross_container_split_all_offsets():
         data2 = obj[k:] + tail_obj
         _check(data1)
         _check(data2)
-        f1, t1 = walk_container(data1, 0, None)
-        f2, t2 = walk_container(t1 + data2, 0, None)
-        fall, tall = walk_container(data1 + data2, 0, None)
+        f1, t1, _ = walk_container(data1, 0, None)
+        f2, t2, _ = walk_container(t1 + data2, 0, None)
+        fall, tall, _ = walk_container(data1 + data2, 0, None)
         assert f1 + f2 == fall, f"k={k} 跨容器组合帧不相等"
         assert t2 == tall, f"k={k} 组合尾部不一致"
 
@@ -441,8 +479,8 @@ def test_junk_tail_continuation():
     data2 = _msg(2, 0x200, b"\x02")
     res = _check(data1)
     assert res is not None and res[1] == b"\xFE" * 3
-    f1, t1 = walk_container(data1, 0, None)
-    f2, t2 = walk_container(t1 + data2, 0, None)
+    f1, t1, _ = walk_container(data1, 0, None)
+    f2, t2, _ = walk_container(t1 + data2, 0, None)
     assert len(f1) == 1 and len(f2) == 1
     # 衔接后按实际 LOBJ 命中位置推进；前三个垃圾字节作为搜索间隙吸收，
     # msg2 恰好结束于容器末尾，不产生伪 tail。
@@ -456,7 +494,7 @@ def test_fuzz_object_mix():
     for _ in range(300):
         parts = []
         for _ in range(int(rng.integers(0, 12))):
-            kind = int(rng.integers(0, 8))
+            kind = int(rng.integers(0, 9))
             ch = int(rng.integers(0, 40))
             can_id = int(rng.integers(0, 0x20000000))
             data = rng.bytes(int(rng.integers(0, 40)))
@@ -488,9 +526,13 @@ def test_fuzz_object_mix():
                              + b"\x00" * 16)
             elif kind == 6:
                 parts.append(b"\x00" * int(rng.integers(0, 5)))
-            else:
+            elif kind == 7:
                 parts.append(_msg(ch, can_id, b"LOBJ\x00\x00\x00\x00",
                                   rel=rel, flags=1))
+            else:
+                # 非消息对象（obj_type=11 统计/标记类）：被跳过但计入末对象时刻
+                parts.append(_mk_obj(data[:8], rel=rel, version=ver,
+                                     flags=fl, obj_type=11))
         data = b"".join(parts) + rng.bytes(int(rng.integers(0, 12)))
         _check(data)
 
@@ -610,7 +652,7 @@ def test_sample_full_bitwise_and_fast_engagement():
             hits += 1
             tail = res[1]
         else:
-            _, tail = walk_container(data, ms_part, None)
+            _, tail, _ = walk_container(data, ms_part, None)
     assert hits == total, f"样例 {hits}/{total} 容器命中快路径"
     # 全量对拍：快路径流 / 强制回退流 vs 现行 iter_all_messages
     ref = list(blf_reader.iter_all_messages(str(blf)))

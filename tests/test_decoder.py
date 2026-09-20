@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import pytest
 
@@ -111,9 +109,11 @@ def test_short_dlc_known_id_counts_as_unknown(tmp_path):
     assert series[0].timestamps.tolist() == [1.0]
 
 
-def test_enum_signal_stored_as_text(tmp_path):
-    """VAL_ 枚举信号：存 DBC value table 文本（UTF-8 bytes，|S 定宽）；
-    表外原始值存空字节 b''（CANoe 实测行为，参考 _T058.mdf FanPWMSt 等）。"""
+def test_enum_signal_stored_as_raw_with_enum_table(tmp_path):
+    """VAL_ 值表信号：存原始整型 + EnumTable（文本表由 writer 侧写成 TABX 转换）。
+
+    回归（2026-09-20 CANape 显示 bug）：旧实现存 |Sn 文本通道，CANape 无法把
+    字符串画成数值曲线（枚举信号渲染成一条粗直线，看不出变化）。"""
     from core.blf_reader import Frame
 
     enum_dbc = '''VERSION ""
@@ -141,14 +141,15 @@ VAL_ 300 State 0 "off" 1 "on" ;
     series, stats = decode_channel(iter([on, other]), dbc, channel=1)
     assert stats.total_frames == 2 and stats.unknown_frames == 0
     vals = series[0].values["State"]
-    assert vals.dtype.kind == "S"            # 文本（|S 定宽 bytes），非数值
-    assert vals.tolist() == [b"on", b""]     # 表内→文本 verbatim；表外→b''
+    assert vals.dtype == np.uint8            # 数值通道，非文本
+    assert vals.tolist() == [1, 2]           # 原始值原样（表外值不做特殊处理）
+    assert series[0].enums["State"].choices == {0: "off", 1: "on"}
     assert series[0].units["State"] == "state"
 
 
-def test_transform_signal_with_choices_observation_based(tmp_path):
-    """物理变换+choices 信号按观察值定存储类型（CANoe 实测规则）：
-    观察值全在表内 → 文本；存在表外值 → float64，且表内值存 nan。"""
+def test_scaled_signal_with_choices_stored_as_raw(tmp_path):
+    """物理变换+choices 信号：仍存原始整型，换算交给 EnumTable（writer 侧
+    TABX 的 default 线性换算）；旧实现按观察值存文本或 float64+表内 nan。"""
     from core.blf_reader import Frame
 
     dbc_txt = '''VERSION ""
@@ -173,15 +174,17 @@ VAL_ 500 TmpSel 31 "Invalid" ;
                      is_extended=False, is_fd=False, dlc=8,
                      data=bytes([raw, 0, 0, 0, 0, 0, 0, 0]))
 
-    # (a) 观察值全在表内（raw=31）→ 文本
+    # (a) 观察值全在表内（raw=31）：仍存原始值 + 表
     series, _ = decode_channel(iter([frame(31), frame(31)]), dbc, channel=1)
     vals = series[0].values["TmpSel"]
-    assert vals.dtype.kind == "S" and vals.tolist() == [b"Invalid", b"Invalid"]
-    # (b) 存在表外值（raw=0 → 18.0）→ float64；表内值（31）存 nan
+    assert vals.dtype == np.uint8 and vals.tolist() == [31, 31]
+    et = series[0].enums["TmpSel"]
+    assert et.choices == {31: "Invalid"}
+    assert et.scale == 0.5 and et.offset == 18.0 and et.unit == "degC"
+    # (b) 存在表外值（raw=0）：表内值不再存 nan，原值原样（换算在 writer 侧）
     series, _ = decode_channel(iter([frame(31), frame(0)]), dbc, channel=1)
-    vals = series[0].values["TmpSel"]
-    assert vals.dtype == np.float64
-    assert math.isnan(vals[0]) and vals[1] == pytest.approx(18.0)
+    assert series[0].values["TmpSel"].tolist() == [31, 0]
+    assert "TmpSel" in series[0].enums
 
 
 def test_integer_signal_minimal_dtype(tmp_path):

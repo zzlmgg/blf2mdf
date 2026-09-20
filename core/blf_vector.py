@@ -40,6 +40,9 @@ class ContainerFrames:
     真实字节 + 行尾补零至 data_len（ljust 语义）。物理布局仍双——packed
     （回退）定跨距打包块 / scattered（快路径）容器字节零拷贝视图——但布局
     差异是性能性质，消费方不感知：载荷访问统一走 payload_block / payload。
+
+    max_obj_ns 与帧数组无关（非帧对象也计入），语义与 walk_container 第三
+    返回项逐位一致（对拍锁定）：两条路径必须给同一值。
     """
     channel: np.ndarray    # int64 (N,) 0-based
     ts: np.ndarray         # float64 (N,)（整数 ns 构造，与 Frame.ts_seconds 同语义）
@@ -53,6 +56,7 @@ class ContainerFrames:
     data_off: np.ndarray   # int64 (N,) 帧载荷在 data8 中的起点（块内/容器内视布局）
     data_len: np.ndarray   # int64 (N,)（= len(Frame.data)）
     glen: np.ndarray       # int64 (N,) 真实载荷字节数（FD64 可 < data_len；packed = data_len）
+    max_obj_ns: int        # 本容器「读到时间头」的对象的最大绝对 ns 时刻（0 = 无）
 
     def payload_block(self, sel) -> np.ndarray:
         """sel 帧子集 → (N, L) 定宽载荷块，补零就位（行尾 ljust 语义）。
@@ -86,7 +90,8 @@ def _empty_container_frames() -> ContainerFrames:
         is_remote=np.empty(0, bool), is_error=np.empty(0, bool),
         is_fd=np.empty(0, bool), dlc=np.empty(0, np.uint8),
         data8=np.empty(0, np.uint8), data_off=np.empty(0, np.int64),
-        data_len=np.empty(0, np.int64), glen=np.empty(0, np.int64))
+        data_len=np.empty(0, np.int64), glen=np.empty(0, np.int64),
+        max_obj_ns=0)
 
 
 # ── 移位组装提取（显式小端，机器无关；p 越界处读出垃圾值，由调用方掩码
@@ -302,14 +307,20 @@ def _parse_fast(data: bytes, ms_part: int):
         use[first:] = False
     idx = np.flatnonzero(use)
 
-    # 条件 6（§4.2.6）：时间守卫仅作用于解析轮（walk 不读跳过对象的时间
-    # 头），按 flags 单位分判（10µs 单位先除再比，杜绝 rel×10000 的
-    # uint64 回绕假守卫）
+    # 条件 6（§4.2.6）：时间守卫作用于「rel 被消费的候选」，按 flags 单位
+    # 分判（10µs 单位先除再比，杜绝 rel×10000 的 uint64 回绕假守卫）。
+    # 消费集 = 发射帧 use ∪ 末对象时刻取数集 readable（下）——后者含被跳过
+    # 的非消息对象，守卫须一并覆盖（越界即回退，标量路径同读同值）。
     flags = u32(c + 16, max_pos)   # V1/V2 均为 u32（核对修正）
     rel = u64(c + 24, max_pos)
     unit = np.where(flags == 1, np.uint64(10000), np.uint64(1))
     rel_max = (np.uint64(2 ** 53) - np.uint64(ms_part)) // unit
-    if not bool(np.all(~use | (rel <= rel_max))):
+    # 末对象时刻取数集 = walk 读到时间头的候选：轮 ≤ first（first 轮可能
+    # 在读头前就返回）∧ 窗口命中（gap ≤ 4）∧ base 头与对象体都在容器内；
+    # 版本头截断的情形 walk 传播 struct.error → 本函数已在条件 5 整体拒绝。
+    readable = ((v1 | v2) & (np.arange(N) <= first) & (c - s <= 4)
+                & base_fit & obj_fit)
+    if not bool(np.all(~(use | readable) | (rel <= rel_max))):
         return None
 
     ch_full = np.zeros(N, dtype=np.int64)
@@ -412,11 +423,16 @@ def _parse_fast(data: bytes, ms_part: int):
     rel_ns = np.where(flags == 1, rel * np.uint64(10000), rel)
     ts = (np.uint64(ms_part) + rel_ns[idx]).astype(np.float64) * 1e-9
 
+    # ── 末对象时刻（含非消息类型对象）：整数 ns 语义，与 walk_container
+    # 第三返回项逐位一致（walk 在读到 rel 的同一步取 max）──
+    ridx = np.flatnonzero(readable)
+    max_obj_ns = int(ms_part + int(rel_ns[ridx].max())) if len(ridx) else 0
+
     cf = ContainerFrames(
         channel=ch_full[idx], ts=ts, arb=arb_full[idx], is_ext=ext_full[idx],
         is_remote=remote_full[idx], is_error=err_full[idx], is_fd=fd_full[idx],
         dlc=dlc_full[idx], data8=data8, data_off=data_off,
-        data_len=lens, glen=glen)
+        data_len=lens, glen=glen, max_obj_ns=max_obj_ns)
 
     # ── 早退轮（§4.4 核对修正）：walk 在轮 first 失败后返回已累积帧 +
     # tail = data[s[first]:]（窗口下界为界，含未消费 padding）──
@@ -444,8 +460,10 @@ def _parse_fast(data: bytes, ms_part: int):
     return cf, tail
 
 
-def _frames_to_container(frames: list) -> ContainerFrames:
-    """标量回退产物 Frame[] → ContainerFrames（每容器一次性转换）。"""
+def _frames_to_container(frames: list, max_obj_ns: int) -> ContainerFrames:
+    """标量回退产物 Frame[] → ContainerFrames（每容器一次性转换）。
+
+    max_obj_ns 由 walk_container 第三返回项透传（含无帧容器）。"""
     n = len(frames)
     ts = np.fromiter((f.ts_seconds for f in frames), dtype=np.float64, count=n)
     lens = np.fromiter((len(f.data) for f in frames), dtype=np.int64, count=n)
@@ -460,13 +478,16 @@ def _frames_to_container(frames: list) -> ContainerFrames:
         is_error=np.fromiter((f.is_error for f in frames), dtype=bool, count=n),
         is_fd=np.fromiter((f.is_fd for f in frames), dtype=bool, count=n),
         dlc=np.fromiter((f.dlc for f in frames), dtype=np.uint8, count=n),
-        data8=data8, data_off=starts[:-1].copy(), data_len=lens, glen=lens)
+        data8=data8, data_off=starts[:-1].copy(), data_len=lens, glen=lens,
+        max_obj_ns=max_obj_ns)
 
 
 def iter_container_frames(path: str, progress_cb=None, cancel_cb=None,
                           _force_fallback: bool = False) -> Iterator[ContainerFrames]:
-    """逐容器产帧（快路径优先，条件不满足回退标量）——convert 读入入口。
+    """逐容器产解析结果（快路径优先，条件不满足回退标量）——convert 读入入口。
 
+    每个容器恰好产出一个 ContainerFrames（可能无帧——容器内只有非消息
+    对象时仍产出，其 max_obj_ns 是测量结束取数的一部分，不可丢）。
     帧全局顺序 = 容器序 × 容器内对象序（BLF 时间序）。progress_cb(percent)
     逐容器字节进度（与 iter_all_messages 同语义）；cancel_cb() 每容器检查
     一次（H1 有意松弛，计划 §7：82MB 样例 58 容器 ≈ 0.5s 延迟）。
@@ -488,9 +509,8 @@ def iter_container_frames(path: str, progress_cb=None, cancel_cb=None,
             fast = _parse_fast(data, ms_part)
             if fast is not None:
                 cf, tail = fast
-                if len(cf.channel):
-                    yield cf
+                yield cf
                 continue
-        frames, tail = blf_reader.walk_container(data, ms_part, cancel_cb=cancel_cb)
-        if frames:
-            yield _frames_to_container(frames)
+        frames, tail, max_obj_ns = blf_reader.walk_container(
+            data, ms_part, cancel_cb=cancel_cb)
+        yield _frames_to_container(frames, max_obj_ns)

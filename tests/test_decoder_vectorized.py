@@ -5,12 +5,11 @@ import numpy as np
 import pytest
 
 from cantools.database.errors import DecodeError
-from cantools.database.namedsignalvalue import NamedSignalValue
 
 from core.blf_reader import Frame
 from core.decoder import (DecodeStats, SignalSeries, _clamped_int_array,
-                          _extract_bits, _extract_signal, _int_dtype,
-                          _pad_to_64, _signal_kind)
+                          _enum_tables, _extract_bits, _extract_signal,
+                          _has_enum_storage, _int_dtype, _pad_to_64, _signal_kind)
 from core.dbc_loader import DbcDef, SignalDef, classify, load, normalize_id
 
 
@@ -112,6 +111,11 @@ def reference_decode(frames, dbc: DbcDef, channel: int):
             continue
         try:
             decoded = dbc.db.decode_message(arb, fr.data)
+            # 值表信号（choices）存原始值：默认解码把表内值替换成文本，
+            # oracle 另取一次原始值（不缩放不替换），与生产参考路径同语义
+            enum_names = {s.name for s in md.signals if _has_enum_storage(s)}
+            raw_decoded = (dbc.db.decode_message(arb, fr.data, decode_choices=False,
+                                                 scaling=False) if enum_names else None)
         except (KeyError, DecodeError):
             stats.unknown_frames += 1
             stats.unknown_ids.add(fr.arbitration_id)
@@ -119,29 +123,24 @@ def reference_decode(frames, dbc: DbcDef, channel: int):
         b = buckets.setdefault(arb, {"ts": [], "values": {s.name: [] for s in md.signals}})
         b["ts"].append(fr.ts_seconds)
         for s in md.signals:
-            b["values"][s.name].append(decoded.get(s.name, float("nan")))
+            src = raw_decoded if s.name in enum_names else decoded
+            b["values"][s.name].append(src.get(s.name, float("nan")))
     series = []
     for arb, b in buckets.items():
         md = dbc.messages[arb]
         values = {}
         for s in md.signals:
             vals = b["values"][s.name]
-            kind = _signal_kind(s, vals)
-            if kind == "text":
-                values[s.name] = np.asarray([
-                    str(v).encode("utf-8") if isinstance(v, NamedSignalValue) else b""
-                    for v in vals])
-            elif kind == "int":
-                values[s.name] = _clamped_int_array(vals, _int_dtype(s.length, s.is_signed))
+            if _signal_kind(s) == "float":
+                values[s.name] = np.asarray(vals, dtype=np.float64)
             else:
-                values[s.name] = np.asarray(
-                    [float("nan") if isinstance(v, NamedSignalValue) else v
-                     for v in vals], dtype=np.float64)
+                values[s.name] = _clamped_int_array(vals, _int_dtype(s.length, s.is_signed))
         series.append(SignalSeries(
             channel=channel, message_name=md.name, node=md.sender_node,
             signal_names=[s.name for s in md.signals],
             timestamps=np.asarray(b["ts"], dtype=np.float64),
-            values=values, units={s.name: s.unit for s in md.signals}))
+            values=values, units={s.name: s.unit for s in md.signals},
+            enums=_enum_tables(md)))
     return series, stats
 
 
@@ -151,13 +150,12 @@ def _assert_series_equal(sa, sb):
         assert a.message_name == b.message_name
         assert a.signal_names == b.signal_names
         assert a.units == b.units
+        assert a.enums == b.enums
         assert np.array_equal(a.timestamps, b.timestamps)
         for name in a.signal_names:
             va, vb = a.values[name], b.values[name]
             assert va.dtype == vb.dtype, f"{name}: {va.dtype} vs {vb.dtype}"
-            if va.dtype.kind == "S":
-                assert va.tolist() == vb.tolist(), name
-            elif va.dtype.kind == "f":
+            if va.dtype.kind == "f":
                 eq = np.isnan(va) & np.isnan(vb)
                 np.testing.assert_allclose(va[~eq], vb[~eq], rtol=0, atol=0), name
             else:
