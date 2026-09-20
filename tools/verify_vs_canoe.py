@@ -49,6 +49,13 @@ SAMPLES = [
      ROOT / "inputs/blf/AHT_ACFCANPUB_20260317_210430_59125089-"
             "ACFCAN_20260317_210930_59125099.blf",
      ROOT / "inputs/mdf_canoe/AHT.mdf"),
+    # A66T：16 路 CAN 大 BLF（统计 16×22 组），20260917 采集；首个带中途
+    # 记录静默窗的样例 —— ~392s 内全文件对象为 0，CANoe 统计在静默期不出点、
+    # 恢复时刻重新对齐 1s 网格，本样例专门覆盖该行为差异（见报告层明细）
+    ("A66T",
+     ROOT / "inputs/blf/A66T_ACFCANPUB_20260917_151500_59654310-"
+            "ACFCANPUB_20260917_154000_59654360.blf",
+     ROOT / "inputs/mdf_canoe/A66T报非预期加速故障.mdf"),
 ]
 
 _HARD_STATS_PREFIX = "统计 t 轴"  # stats 维度中属硬门的行前缀
