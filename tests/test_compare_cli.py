@@ -4,20 +4,27 @@
 报 ModuleNotFoundError: No module named 'mdf_compare'），模块导入路径不可用——
 退出码是进程级契约，以子进程断言 returncode（端到端覆盖 argparse 接线与 dims 映射）。
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from mdf_factory import _write_mdf, _simple, REF_LAYOUT
+from mdf_factory import _write_mdf, _simple, hole_stat_groups, REF_LAYOUT
+from tools.mdf_compare import STAT_NAMES
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run(args, timeout=60):
-    return subprocess.run([sys.executable, *args], cwd=ROOT,
-                          capture_output=True, text=True, timeout=timeout)
+    """子进程运行：显式钉住子进程输出编码为 UTF-8 并按 UTF-8 解码——工具输出含中文，
+    默认各随 locale 会在本测试进程解出 UnicodeDecodeError（读取线程报错、stdout 读空）。
+    """
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    return subprocess.run([sys.executable, *args], cwd=ROOT, env=env,
+                          capture_output=True, text=True, encoding="utf-8",
+                          timeout=timeout)
 
 
 def _ref_idx():
@@ -83,3 +90,24 @@ def test_full_compare_required_args(tmp_path):
     r = _run(["tools/full_compare.py", str(p1), str(p2),
               "--stats-ref-block", str(REF_LAYOUT[0])])
     assert r.returncode != 0
+
+
+def test_full_compare_known_diff_line_printed_not_counted(tmp_path):
+    """记录空洞样例：统计 t 轴长度不等但契约满足 → 只落一条 KNOWN_DIFF_PREFIX
+    说明行；统计组采样数差异（10 项 × 1 通道，真实差异）仍计入判定 → 退出码 1，
+    说明行照常打印且单独计数。"""
+    ours, ref = hole_stat_groups()
+    p1, p2 = tmp_path / "a.mf4", tmp_path / "b.mf4"
+    _write_mdf(p1, ours)
+    _write_mdf(p2, ref)
+    r = _run(["tools/full_compare.py", str(p1), str(p2),
+              "--stats-ref-block", str(REF_LAYOUT[0]),
+              "--stats-ref-idx", _ref_idx(), "--no-report"])
+    assert "已知差异: 统计 t 轴" in r.stdout
+    assert f"{len(STAT_NAMES)} 处差异（另有 1 条已知差异说明，不计入）" in r.stdout
+    assert r.returncode == 1
+    # 关闭 stats 维度后，唯一残留的 t 轴说明行也随之消失 → 判定一致
+    r = _run(["tools/full_compare.py", str(p1), str(p2),
+              "--stats-ref-block", str(REF_LAYOUT[0]),
+              "--stats-ref-idx", _ref_idx(), "--skip-stats", "--no-report"])
+    assert r.returncode == 0

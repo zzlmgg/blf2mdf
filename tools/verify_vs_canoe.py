@@ -3,11 +3,14 @@
 需求线硬门（退出码 0 = 全部样例满足）：
 - 信号组全部信号：值（reference 容差 isclose 1e-6/1e-6, equal_nan=True）+ 时间戳逐位；
 - '1s' 统计组 t 轴 ≤1ns 网格容差（ch0 StdData，网格构造同构，代表全部统计组；
-  起点带毫秒残值时两侧 float64 有 ULP 级表示噪声，1ns 以下不算差异）。
+  起点带毫秒残值时两侧 float64 有 ULP 级表示噪声，1ns 以下不算差异）。记录空洞
+  样例（参考侧在空洞处重启 1s 网格，长度必然不等）改按自产轴契约验收：前段一致 +
+  末点一致 + 网格自洽，见 tools/mdf_compare._stats_t_axis_contract。
 
 报告层（不参与退出码，但完整列出供核对）：header/structure 差异（头部 comment、
 组序、组内通道序、存储表示等已知格式差异）+ 统计组逐点值差异（CANoe 自身时钟域，
-已知不可复现）——若出现超出已知清单的新差异行，说明转换质量漂移，需人工介入。
+已知不可复现）+ 统计 t 轴已知差异说明行——若出现超出已知清单的新差异行，
+说明转换质量漂移，需人工介入。
 
 用法：
     python tools/verify_vs_canoe.py [--skip-convert] [--outdir outputs/verify_canoe]
@@ -27,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from core import blf_reader, converter, project_loader
 from gui.binding import decide_bindings
-from tools.mdf_compare import compare_files_reference
+from tools.mdf_compare import KNOWN_DIFF_PREFIX, compare_files_reference
 
 CCU3 = ROOT / "inputs/dbc_ccu3.0"
 # CANoe 参考统计布局（22 项/通道，10 项统计名的组内偏移；probe 实测）
@@ -49,16 +52,27 @@ SAMPLES = [
      ROOT / "inputs/blf/AHT_ACFCANPUB_20260317_210430_59125089-"
             "ACFCAN_20260317_210930_59125099.blf",
      ROOT / "inputs/mdf_canoe/AHT.mdf"),
-    # A66T：16 路 CAN 大 BLF（统计 16×22 组），20260917 采集；首个带中途
-    # 记录静默窗的样例 —— ~392s 内全文件对象为 0，CANoe 统计在静默期不出点、
-    # 恢复时刻重新对齐 1s 网格，本样例专门覆盖该行为差异（见报告层明细）
+    # A66T：16 路 CAN 大 BLF（统计 16×22 组），20260917 采集；唯一覆盖「断电→
+    # 上电」全程的样例——391.5s 记录空洞（11 路 CAN + LIN 同时停、两路常电 ECU
+    # 多活 65.7s、13 路瞬时满速率恢复），信号值/时间戳仍逐位一致。该样例统计
+    # t 轴按自产轴契约验收（CANoe 在空洞处重启 1s 网格、长度必然不等，见 README）
     ("A66T",
      ROOT / "inputs/blf/A66T_ACFCANPUB_20260917_151500_59654310-"
             "ACFCANPUB_20260917_154000_59654360.blf",
      ROOT / "inputs/mdf_canoe/A66T报非预期加速故障.mdf"),
 ]
 
-_HARD_STATS_PREFIX = "统计 t 轴"  # stats 维度中属硬门的行前缀
+_HARD_STATS_PREFIX = "统计 t 轴:"  # stats 维度中属硬门的行前缀
+
+
+def _is_hard_stats(d):
+    """stats 行是否属硬门：统计 t 轴差异，且不是 KNOWN_DIFF_PREFIX 说明行。
+
+    记录空洞样例的说明行（"已知差异: 统计 t 轴 …"，见 mdf_compare）不匹配
+    _HARD_STATS_PREFIX → 落报告层；此处再按语义前缀兜一道，避免说明行格式
+    变动后被静默升级为硬门差异。
+    """
+    return d.startswith(_HARD_STATS_PREFIX) and not d.startswith(KNOWN_DIFF_PREFIX)
 
 
 class _Tee:
@@ -120,8 +134,8 @@ def compare_one(ours, canoe):
                                   dims=frozenset({"values"}))
     stats = compare_files_reference(ours, canoe, stats_ref_layout=layout,
                                     dims=frozenset({"stats"}))
-    stat_t = [d for d in stats if d.startswith(_HARD_STATS_PREFIX)]
-    stat_rest = [d for d in stats if not d.startswith(_HARD_STATS_PREFIX)]
+    stat_t = [d for d in stats if _is_hard_stats(d)]
+    stat_rest = [d for d in stats if not _is_hard_stats(d)]
     return meta, val, stat_t, stat_rest
 
 

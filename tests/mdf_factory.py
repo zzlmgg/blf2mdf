@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 import numpy as np
 from asammdf import MDF, Signal
 
+from tools.mdf_compare import STAT_NAMES
+
 # 固定文件头起始时间：asammdf 新建文件默认盖章写入时刻（两文件必然不同）；
 # core/mdf_writer 的 start_time 来自转换源而非写入时刻，此处镜像该语义。
 _FIXED_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -63,3 +65,29 @@ def _simple(comment="t"):
         ("G2", [("SigC", [b"x", b"y", b"z"], "S8")]),
     ]
     return _write_mdf, groups, comment
+
+
+# 统计 t 轴「记录空洞」用例网格（A66T 同构的小尺度模型）：自产轴 = 整段连续 1s
+# 网格（洞内照常出点，末点 = 测量末点）；参考轴 = 洞前同相位、洞内不出点、洞后
+# 按洞后首帧重锚（+0.188s），末点两侧同源。两轴长度必然不等 —— 触发
+# mdf_compare 的自产轴契约验收路径（非逐位比较）。
+HOLE_T_OURS = [0.0, 1.109, 2.009, 3.009, 4.009, 5.009, 6.009, 7.009, 7.999]
+HOLE_T_REF = [0.0, 1.109, 2.009, 3.009, 4.009, 4.197, 5.197, 6.197, 7.197, 7.999]
+
+
+def hole_stat_groups(t_ours=HOLE_T_OURS, t_ref=HOLE_T_REF):
+    """1 通道统计组对：自产 10 组（t=t_ours）/ 参考 22 组（t=t_ref，统计名按
+    REF_LAYOUT 偏移落位、其余为裸 t 组）。样本值两侧同值——用例只针对统计 t 轴。"""
+    t_ref = np.asarray(t_ref, np.float64)
+    ours = [("1s", [(n, np.ones(len(t_ours), np.float64), np.float64),
+                    ("t", np.asarray(t_ours, np.float64), np.float64)])
+            for n in STAT_NAMES]
+    ref = []
+    for i in range(REF_LAYOUT[0]):
+        name = next((k for k, v in REF_LAYOUT[1].items() if v == i), None)
+        if name is None:
+            ref.append(("1s", [("t", t_ref, np.float64)]))
+        else:
+            ref.append(("1s", [(name, np.ones(len(t_ref), np.float64), np.float64),
+                               ("t", t_ref, np.float64)]))
+    return ours, ref

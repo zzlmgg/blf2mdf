@@ -5,7 +5,8 @@
         --stats-ref-block 22 --stats-ref-idx "StdData:4,StdDataRate:5,..." \
         [--skip-{header,structure,values,stats}] [--outdir outputs/mdf_compare] [--no-report]
 --stats-ref-block / --stats-ref-idx 必填：参考文件统计组布局（每通道项数 + 项名→组内偏移）。
-退出码 0 = 判定一致；非 0 = 存在判定差异（报告仍写入）。
+退出码 0 = 判定一致；非 0 = 存在判定差异（报告仍写入）。以 KNOWN_DIFF_PREFIX 开头的
+说明性记录行照常打印，但不参与判定（见 tools/mdf_compare 模块 docstring）。
 """
 import argparse
 import contextlib
@@ -17,7 +18,8 @@ from pathlib import Path
 import numpy as np
 from asammdf import MDF
 
-from mdf_compare import compare_files_reference, STAT_NAMES  # 同目录脚本运行
+from mdf_compare import (compare_files_reference, KNOWN_DIFF_PREFIX,  # 同目录脚本运行
+                         STAT_NAMES)
 
 _TIME_CHANNELS = {"t", "time"}
 _DIMS = ("header", "structure", "values", "stats")
@@ -203,11 +205,15 @@ def main(argv=None):
 
     diffs = compare_files_reference(args.path_a, args.path_b,
                                     stats_ref_layout=layout, dims=dims)
+    # 说明性记录行（KNOWN_DIFF_PREFIX）照常打印，但不计入判定与差异计数
+    known = [d for d in diffs if d.startswith(KNOWN_DIFF_PREFIX)]
+    hard = [d for d in diffs if not d.startswith(KNOWN_DIFF_PREFIX)]
+    tail = f"（另有 {len(known)} 条已知差异说明，不计入）" if known else ""
     print(f"\n=== 判定（{', '.join(sorted(dims))}）: "
-          f"{'全部一致' if not diffs else f'{len(diffs)} 处差异'} ===")
+          f"{'全部一致' if not hard else f'{len(hard)} 处差异'}{tail} ===")
     for line in diffs:
         print(f"  - {line}")
-    return 1 if diffs else 0
+    return 1 if hard else 0
 
 
 if __name__ == "__main__":

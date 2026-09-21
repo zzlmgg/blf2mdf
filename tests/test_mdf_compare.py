@@ -5,9 +5,10 @@ import numpy as np
 import pytest
 from asammdf import MDF, Signal
 
-from mdf_factory import _write_mdf, _simple, REF_LAYOUT
+from mdf_factory import (_write_mdf, _simple, hole_stat_groups, REF_LAYOUT,
+                         HOLE_T_OURS, HOLE_T_REF)
 from tools.mdf_compare import (compare_files_identical, compare_files_reference,
-                               STAT_NAMES, DEFAULT_DIMS)
+                               KNOWN_DIFF_PREFIX, STAT_NAMES, DEFAULT_DIMS)
 from core.stats import STAT_NAMES as CORE_STAT_NAMES
 
 
@@ -433,6 +434,63 @@ def test_reference_stats_t_axis(tmp_path):
     _write_mdf(p2, ref)
     diffs = compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT)
     assert any("统计 t 轴" in d for d in diffs)
+
+
+# ---- reference：统计 t 轴长度不等（记录空洞 → 自产轴契约验收）----
+
+def _hole_diffs(tmp_path, t_ours, t_ref):
+    ours, ref = hole_stat_groups(t_ours, t_ref)
+    p1, p2 = tmp_path / "a.mf4", tmp_path / "b.mf4"
+    _write_mdf(p1, ours)
+    _write_mdf(p2, ref)
+    return compare_files_reference(p1, p2, stats_ref_layout=REF_LAYOUT)
+
+
+# 自产轴：整段连续 1s 网格（洞内照常出点），末点 7.999
+_T_OURS = HOLE_T_OURS
+# 参考轴：洞前同相位，洞内不出点，洞后按洞后首帧重锚（+0.188s），末点同源
+_T_REF_HOLE = HOLE_T_REF
+
+
+def test_reference_stats_t_axis_hole_contract_pass(tmp_path):
+    """长度不等但契约满足（前段一致 + 末点一致 + 网格自洽）→ 无硬门差异，
+    只落一行 KNOWN_DIFF_PREFIX 说明性记录。"""
+    diffs = _hole_diffs(tmp_path, _T_OURS, _T_REF_HOLE)
+    known = [d for d in diffs if d.startswith(KNOWN_DIFF_PREFIX)]
+    assert len(known) == 1
+    assert "n=9 vs 参考 n=10" in known[0]
+    assert not any(d.startswith("统计 t 轴:") for d in diffs)
+
+
+def test_reference_stats_t_axis_hole_last_point(tmp_path):
+    """末点口径漂移（A02Y 类）必须报出：末点不一致 → 硬门差异。"""
+    ref = _T_REF_HOLE[:-1] + [7.998]
+    diffs = _hole_diffs(tmp_path, _T_OURS, ref)
+    assert any(d.startswith("统计 t 轴:") and "末点" in d for d in diffs)
+    assert not any(d.startswith(KNOWN_DIFF_PREFIX) for d in diffs)
+
+
+def test_reference_stats_t_axis_hole_step_broken(tmp_path):
+    """自产网格步长漂移（内部非 1.000s）→ 硬门差异。"""
+    ours = [0.0, 1.109, 2.009, 3.009, 4.009, 4.509, 5.009, 6.009, 7.999]
+    diffs = _hole_diffs(tmp_path, ours, _T_REF_HOLE)
+    assert any(d.startswith("统计 t 轴:") and "步长" in d for d in diffs)
+
+
+def test_reference_stats_t_axis_hole_not_increasing(tmp_path):
+    """自产轴末点倒挂（global_end ∈ (k, k+0.009) 时网格点越界，见 stats.py）→ 硬门差异。"""
+    ours = [0.0, 1.109, 2.009, 3.009, 4.009, 5.009, 6.009, 6.005]
+    ref = [0.0, 1.109, 2.009, 3.009, 4.009, 4.197, 5.197, 6.197, 6.005]
+    diffs = _hole_diffs(tmp_path, ours, ref)
+    assert any(d.startswith("统计 t 轴:") and "非严格递增" in d for d in diffs)
+
+
+def test_reference_stats_t_axis_hole_prefix_broken(tmp_path):
+    """公共前缀不足（首窗即分歧）→ 硬门差异（长度不等不构成豁免）。"""
+    ours = [0.0, 1.109, 2.009, 3.009, 4.009]
+    ref = [0.5, 1.109, 2.009, 3.009]
+    diffs = _hole_diffs(tmp_path, ours, ref)
+    assert any(d.startswith("统计 t 轴:") and "公共前缀" in d for d in diffs)
 
 
 # ---- 契约校验 ----

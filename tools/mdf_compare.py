@@ -11,6 +11,10 @@
 
 stats_ref_layout: tuple[int, dict[str, int]] —— (参考每通道统计项数, {统计项名: 组内偏移})，
 必须覆盖 STAT_NAMES 全部 10 项且偏移 ∈ [0, 块大小)；违反则抛 ValueError（错位不静默）。
+
+返回行约定：空列表 = 一致；以 KNOWN_DIFF_PREFIX（"已知差异: "）开头的行是**说明性
+记录**——已知且已按契约验收通过的行为差异（如参考侧在记录空洞处重启统计网格），
+消费方不得据其判定失败。
 """
 from __future__ import annotations
 
@@ -29,6 +33,17 @@ _TIME_CHANNELS = {"t", "time"}
 _HEADER_FIELDS = ("version", "start_time", "abs_time", "tz_offset", "flags",
                   "author", "department", "project", "subject", "comment")
 _CN_FIELDS = ("unit", "data_type", "bit_count", "bit_resolution", "flags", "conversion")
+
+# 说明性记录行前缀（不参与硬门判定，见模块 docstring）
+KNOWN_DIFF_PREFIX = "已知差异: "
+# 统计 t 轴网格契约（自产侧）：首窗 1.1s 的输出时刻 1.109、随后回到整数秒相位
+# （次段 0.900），其后步长 1.000s。1ns 容差 = 整数 ns 网格分辨率：起点带毫秒
+# 残值时两侧 float64 运算产生 ULP 级表示噪声（A19G1 实测 ≤3e-5ns），超出网格
+# 分辨率才算真实差异。
+_T_NS_TOL = 1e-9
+_T_FIRST_STEP = 1.109
+_T_SECOND_STEP = 0.9
+_T_STEP = 1.0
 
 
 def _norm_bytes(v):
@@ -210,6 +225,44 @@ def _values_diffs_reference(a, b, ga, gb, atol, rtol):
     return out
 
 
+def _stats_t_axis_contract(ta, tb) -> str:
+    """数据空洞样例的统计 t 轴契约验收（长度不等时替代逐位比较）。
+
+    参考侧在记录空洞处重启 1s 网格（洞内不出点、洞后按洞后首帧重锚），长度必然
+    与自产不等，逐位比对不可用。此时改验三件事（全部只用两侧 t 数组，无需回读 BLF）：
+    1) 公共前缀（到首个分歧点）与参考一致，且前缀 ≥2 点（含 t[0] 与首窗输出时刻）；
+    2) 末点与参考一致——测量结束 = 全文件最大对象时刻，两侧同源，末点口径漂移
+       （A02Y 类）必须在此报出；
+    3) 自产轴自洽：t[0]==0、严格递增、步长序列符合网格构造——首段 1.109（首窗
+       1.1s 的输出时刻）、次段 0.900（首窗余量）、其后 1.000、末段 ≤1.000
+       （末点 = 测量末点，落在窗内任意位置）。
+
+    返回空串 = 契约满足；否则返回失败描述（供差异行拼接）。
+    """
+    n = min(len(ta), len(tb))
+    hit = np.flatnonzero(np.abs(ta[:n] - tb[:n]) > _T_NS_TOL)
+    prefix = int(hit[0]) if hit.size else n
+    if prefix < 2:
+        return f"公共前缀仅 {prefix} 点（t[0]/首窗即分歧）"
+    bad = []
+    if abs(ta[-1] - tb[-1]) > _T_NS_TOL:
+        bad.append(f"末点 {ta[-1]!r} vs {tb[-1]!r}")
+    if ta[0] != 0.0:
+        bad.append(f"t[0]={ta[0]!r} 非 0")
+    steps = np.diff(ta)
+    if steps.size and steps.min() <= 0:
+        bad.append("非严格递增")
+    elif steps.size > 1 and abs(steps[0] - _T_FIRST_STEP) > _T_NS_TOL:
+        bad.append(f"首段步长 {steps[0]:.6f}s ≠ {_T_FIRST_STEP}s（首窗 1.1）")
+    elif steps.size > 2 and abs(steps[1] - _T_SECOND_STEP) > _T_NS_TOL:
+        bad.append(f"次段步长 {steps[1]:.6f}s ≠ {_T_SECOND_STEP}s（首窗余量）")
+    elif steps.size > 3 and np.any(np.abs(steps[2:-1] - _T_STEP) > _T_NS_TOL):
+        bad.append("内部步长 ≠ 1.000s")
+    elif steps[-1] > _T_STEP + _T_NS_TOL:
+        bad.append(f"末段步长 {steps[-1]:.6f}s > 1.000s")
+    return "；".join(bad)
+
+
 def _stats_diffs_reference(a, b, ga, gb, layout):
     block_size, offsets = layout
     out = []
@@ -237,16 +290,25 @@ def _stats_diffs_reference(a, b, ga, gb, layout):
             out.append(f"1s 组内信号序(自产): ch{ch} 与 STAT_NAMES 不符")
             break
     # 统计 t 轴：自产 ch0 StdData vs 参考 ch0 StdData（layout 显式偏移）。
-    # 容差 1ns = 整数 ns 网格分辨率：起点带毫秒残值时两侧 float64 运算产生
-    # ULP 级表示噪声（A19G1 实测 ≤3e-5ns），超出网格分辨率才算真实差异。
+    # 等长 → 逐位（容差见 _T_NS_TOL）。不等长 = 参考侧在记录空洞处重启了网格
+    # （A66T：断电静默窗，见 README 已知差异），改按自产轴契约验收：契约满足则
+    # 落一行说明性记录，不产生硬门差异；违反则照旧报硬门差异。
     ta = np.asarray(a.get("StdData", group=ones_a[0]["gi"]).timestamps)
     tb = np.asarray(b.get("StdData", group=ones_b[offsets["StdData"]]["gi"]).timestamps)
-    if len(ta) != len(tb):
-        out.append(f"统计 t 轴: 自产 n={len(ta)} vs 参考 n={len(tb)}")
-    elif np.any(np.abs(ta - tb) > 1e-9):
-        n = int(np.count_nonzero(ta != tb))
-        out.append(f"统计 t 轴: {n} 点不一致 "
-                   f"maxdiff={np.abs(ta - tb).max() * 1e9:.0f}ns")
+    if len(ta) == len(tb):
+        if np.any(np.abs(ta - tb) > _T_NS_TOL):
+            n = int(np.count_nonzero(ta != tb))
+            out.append(f"统计 t 轴: {n} 点不一致 "
+                       f"maxdiff={np.abs(ta - tb).max() * 1e9:.0f}ns")
+    else:
+        bad = _stats_t_axis_contract(ta, tb)
+        if bad:
+            out.append(f"统计 t 轴: 自产 n={len(ta)} vs 参考 n={len(tb)}；{bad}")
+        else:
+            out.append(f"{KNOWN_DIFF_PREFIX}统计 t 轴 自产 n={len(ta)} vs "
+                       f"参考 n={len(tb)}（参考在数据空洞处重启网格：洞内不出点、"
+                       f"洞后按首帧重锚；已按自产轴契约验收——前段一致 + 末点一致 "
+                       f"+ 网格自洽，见 README）")
     # 逐点验收：自产 ch×10+i ↔ 参考 ch×block+offset(name)
     for ch in range(nch):
         for i, name in enumerate(STAT_NAMES):
