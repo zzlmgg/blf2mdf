@@ -92,10 +92,17 @@ def test_repeated_entries_produce_one_candidate(tmp_path):
     blf = _touch(root / "sub" / "run001.blf")
     assert [c.blf for c in source_resolver.resolve([root, root])] == [blf]
 
-    # 同一个文件既在拖入的文件夹里、又被单独拖入 → 仍只有一个候选，
-    # 且赢家与拖入顺序无关（结果只取决于路径集合）
-    assert source_resolver.resolve([root, blf]) \
-        == source_resolver.resolve([blf, root])
+
+def test_folder_wins_when_a_loose_drop_overlaps_it(tmp_path):
+    """同一文件既在拖入的文件夹里、又被单独拖入：文件夹规则赢（2026-09-23 定调）。
+
+    赢家只取决于路径集合——拖入顺序不影响结果。
+    """
+    root = tmp_path / "AHT"
+    blf = _touch(root / "sub" / "run001.blf")
+    for paths in ([root, blf], [blf, root]):   # 两种拖入顺序，同一份结果
+        assert [c.output for c in source_resolver.resolve(paths)] == [
+            tmp_path / "AHT_t" / "sub" / "run001_t.mdf"]
 
 
 def test_unreadable_dir_is_skipped_with_a_log(tmp_path, monkeypatch, caplog):
