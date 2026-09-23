@@ -53,6 +53,48 @@ def _no_real_modal(monkeypatch):
             staticmethod(lambda *args, **kwargs: QMessageBox.StandardButton.Yes))
 
 
+def _answer_default_button(box):
+    """QMessageBox.exec 替身：点弹窗的默认按钮（未设时点接受角色那个）。
+
+    与真实点击走同一条路——Qt 在按钮 clicked 时记下 clickedButton，故
+    「点哪个按钮 → 调用方拿到哪个取值」的映射仍由真身走一遍，不必真开窗。
+    """
+    button = box.defaultButton()
+    if button is None:
+        button = next(
+            (button for button in box.buttons()
+             if box.buttonRole(candidate)
+             == mw.QMessageBox.ButtonRole.AcceptRole), None)
+    if button is not None:
+        button.click()
+    return box.result()
+
+
+def _click_button(label: str, seen: list):
+    """把 QMessageBox.exec 换成「点标签为 label 的按钮」，弹窗按顺序记进 seen。"""
+    def fake_exec(box):
+        seen.append(box)
+        for button in box.buttons():
+            if button.text() == label:
+                button.click()
+                return box.result()
+        raise AssertionError(
+            f"弹窗上没有「{label}」按钮：{[b.text() for b in box.buttons()]}")
+    return fake_exec
+
+
+@pytest.fixture(autouse=True)
+def _batch_dialogs_click_the_default_button(monkeypatch):
+    """兜底：批量专属弹窗（共用配置提示 / 覆盖询问 / 结束提示）默认走「继续 /
+    覆盖全部 / 确定」一侧，与上一条夹具的 Yes 同向。
+
+    同因：offscreen 平台没人点按钮，未替换的真实 exec 会永久阻塞测试进程。
+    要断言弹窗内容、或走「返回勾选列表 / 跳过已存在 / 取消」的用例各自再
+    patch（后 patch 生效）。
+    """
+    monkeypatch.setattr(mw.QMessageBox, "exec", _answer_default_button)
+
+
 def _write_blf(path: Path, channels=(1,), frames=3) -> Path:
     """合成 BLF：给定通道各写若干帧（够 probe_channels 探出通道）。"""
     import can
@@ -211,7 +253,7 @@ def test_folder_drop_lists_candidates_and_scans_selection(window, qapp, tmp_path
 
     offered = []
 
-    def choose(candidates):
+    def choose(candidates, checked=None):
         offered.append(list(candidates))
         return candidates[:2]           # 只勾前两个
 
@@ -231,7 +273,8 @@ def test_multiple_loose_files_drop_lists_candidates(window, qapp, tmp_path,
     """一次拖入多个散 .blf → 同样进候选清单（与拖入文件夹同一条入口）。"""
     first = _write_blf(tmp_path / "run001.blf", channels=(1,))
     second = _write_blf(tmp_path / "run002.blf", channels=(2,))
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: candidates)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
 
     _, settled = _drop_and_settle(qapp, window, first, second)
     assert settled
@@ -249,7 +292,7 @@ def test_single_candidate_skips_the_checklist(window, qapp, tmp_path,
     called = []
     monkeypatch.setattr(
         window, "_choose_candidates",
-        lambda candidates: called.append(candidates) or candidates)
+        lambda candidates, checked=None: called.append(candidates) or candidates)
 
     _, settled = _drop_and_settle(qapp, window, root)
     assert settled
@@ -282,7 +325,8 @@ def test_batch_makes_output_readonly_and_shows_source(window, qapp, tmp_path,
     root = tmp_path / "AHT"
     for index in (1, 2):
         _write_blf(root / f"run{index:03d}.blf", channels=(1,))
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: candidates)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
 
     _, settled = _drop_and_settle(qapp, window, root)
     assert settled
@@ -304,7 +348,8 @@ def test_batch_scan_union_keeps_bindings_and_marks_absent_channel_no_data(
     dbc = DbcDef(path=r"E:\dbc\A\PFCAN1.dbc", db=None)
     window.dbc_list = [dbc]
     window.auto_bind = {1: dbc.path, 9: dbc.path}
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: candidates)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
 
     _, settled = _drop_and_settle(qapp, window, root)
     assert settled
@@ -371,7 +416,8 @@ def test_checklist_cancel_keeps_the_previous_state(window, qapp, tmp_path,
     root = tmp_path / "AHT"
     for index in (1, 2):
         _write_blf(root / f"run{index:03d}.blf", channels=(1,))
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: None)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: None)
 
     _drop(window, root)
     assert _wait_until(qapp, lambda: not window._input_busy())
@@ -413,14 +459,15 @@ def test_resolve_shows_discovered_count_while_walking(window, qapp, tmp_path,
 
 
 def _start_batch_with_fake_run_batch(window, qapp, tmp_path, monkeypatch,
-                                     fake):
-    """造一个 2 文件的批次（拖入文件夹）并把 run_batch 换成桩，返回 run 记录。"""
+                                     fake, files=2):
+    """造一个 files 文件的批次（拖入文件夹）并把 run_batch 换成桩，返回源目录。"""
     import gui.main_window as mw
 
     root = tmp_path / "AHT"
-    for index in (1, 2):
+    for index in range(1, files + 1):
         _write_blf(root / f"run{index:03d}.blf", channels=(1,))
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: candidates)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
     monkeypatch.setattr(mw, "run_batch", fake)
     _, settled = _drop_and_settle(qapp, window, root)
     assert settled
@@ -508,7 +555,7 @@ def test_batch_failure_notice_counts_and_lists_failed_files(
 
 def test_batch_convert_asks_once_before_overwriting_outputs(
         window, qapp, tmp_path, monkeypatch):
-    """批量开始前一次性检查输出：已存在的合成一次询问；选择不覆盖则整批不启动。"""
+    """批量开始前一次性检查输出：已存在的合成一次询问；选择取消则整批不启动。"""
     import gui.main_window as mw
 
     calls = []
@@ -526,21 +573,22 @@ def test_batch_convert_asks_once_before_overwriting_outputs(
 
     asked = []
     monkeypatch.setattr(
-        mw.QMessageBox, "question",
-        lambda *args, **kwargs: asked.append(args[2])
-        or QMessageBox.StandardButton.No)
+        window, "_choose_overwrite",
+        lambda existing: asked.append(list(existing)) or mw.PRECHECK_CANCEL)
     window._start_convert()
     assert len(asked) == 1, "一次询问，不是逐文件弹窗"
-    assert "2 个输出文件已存在" in asked[0]
-    assert calls == [], "选择不覆盖 → 整批不启动"
+    assert [c.output for c in asked[0]] == [c.output for c in window.batch], \
+        "一次问完这一批全部已存在的输出"
+    assert window.worker_thread is None and calls == [], "选择取消 → 整批不启动"
+    assert [c.output.read_bytes() for c in window.batch] == [b"old", b"old"], \
+        "取消不碰已有产物"
 
-    monkeypatch.setattr(mw.QMessageBox, "question",
-                        lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
-    monkeypatch.setattr(mw.QMessageBox, "exec",
-                        lambda self: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(window, "_choose_overwrite",
+                        lambda existing: mw.PRECHECK_OVERWRITE_ALL)
     window._start_convert()
     assert _wait_until(qapp, lambda: window.worker_thread is None)
     assert len(calls) == 1, "确认覆盖后照常转换"
+    assert len(calls[0]) == 2
 
 
 def test_batch_end_to_end_lands_products_in_the_mirror_tree(
@@ -568,7 +616,8 @@ def test_batch_end_to_end_lands_products_in_the_mirror_tree(
     root = tmp_path / "AHT"
     for index in (1, 2):
         _write_blf(root / "sub" / f"run{index:03d}.blf", channels=(1,))
-    monkeypatch.setattr(window, "_choose_candidates", lambda candidates: candidates)
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
 
     _, settled = _drop_and_settle(qapp, window, root)
     assert settled
@@ -584,3 +633,212 @@ def test_batch_end_to_end_lands_products_in_the_mirror_tree(
     assert [p.name for p in produced] == ["run001_t.mdf", "run002_t.mdf"]
     assert not (root / "sub" / "run001_t.mdf").exists(), "产物不进源树"
     assert notices == ["2 个 blf 文件全部转换完成"]
+
+
+# ---- 04：批量专属交互（共用配置提示 / 输出预检三选一 / 结果分支） ----
+
+
+def _config_snapshot(window) -> dict:
+    """「现有配置」快照：平台 / 项目 / DBC 列表 / 绑定表 / 输入输出两个字段。"""
+    return {
+        "ccu": window.ccu_combo.currentText(),
+        "project": window.project_combo.currentText(),
+        "dbcs": [dbc.path for dbc in window.dbc_list],
+        "bindings": [window.binding_row(row)
+                     for row in range(window.table.rowCount())],
+        "blf_path": window.blf_path,
+        "out": window.out_edit.text(),
+    }
+
+
+def test_shared_config_notice_precedes_the_batch_configuration(
+        window, qapp, tmp_path, monkeypatch):
+    """实际参与批量 > 1 个文件 → 先弹共用配置提示，确认后才扫描并进入批量。"""
+    root = tmp_path / "AHT"
+    for index in (1, 2, 3):
+        _write_blf(root / f"run{index:03d}.blf", channels=(1,))
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
+    asked = []
+    monkeypatch.setattr(window, "_confirm_shared_config",
+                        lambda count: asked.append(count) or True)
+
+    _, settled = _drop_and_settle(qapp, window, root)
+    assert settled
+
+    assert asked == [3], "提示只弹一次，报的是一批几个文件"
+    assert len(window.batch) == 3
+
+
+def test_shared_config_notice_absent_when_only_one_file_is_involved(
+        window, qapp, tmp_path, monkeypatch):
+    """只涉及 1 个文件 → 不弹提示：勾选剩 1 个不弹，候选只有 1 个也不弹。"""
+    root = tmp_path / "AHT"
+    for index in (1, 2, 3):
+        _write_blf(root / f"run{index:03d}.blf", channels=(1,))
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates[:1])
+    asked = []
+    monkeypatch.setattr(window, "_confirm_shared_config",
+                        lambda count: asked.append(count) or True)
+
+    _, settled = _drop_and_settle(qapp, window, root)
+    assert settled
+    assert asked == []
+    assert window.blf_path is not None and not window._is_batch, \
+        "勾选剩 1 个 = 今天的单文件路径"
+
+    only = _write_blf(tmp_path / "AHT2" / "run001.blf", channels=(1,))
+    _drop(window, tmp_path / "AHT2")
+    assert _wait_until(qapp, lambda: window.blf_path == str(only)), \
+        "候选只有 1 个：列表与提示都不出现，直接进入"
+    assert asked == []
+
+
+def test_shared_config_notice_returns_to_checklist_without_touching_config(
+        window, qapp, tmp_path, monkeypatch):
+    """「返回勾选列表」→ 回到列表重勾（带上次的勾选），现有配置一个都没动。"""
+    root = tmp_path / "AHT"
+    for index in (1, 2, 3):
+        _write_blf(root / f"run{index:03d}.blf", channels=(1,))
+    dbc = DbcDef(path=r"E:\dbc\A\PFCAN1.dbc", db=None)
+    window.dbc_list = [dbc]
+    window.blf_channels = [1]
+    window._rebuild_channel_table([1], prev={1: dbc.path})
+    before = _config_snapshot(window)
+
+    rounds = []
+
+    def choose(candidates, checked=None):
+        rounds.append(checked)
+        return candidates[:2]
+
+    monkeypatch.setattr(window, "_choose_candidates", choose)
+    answers = [False, True]
+    during = []
+
+    def confirm(count):
+        during.append(_config_snapshot(window))
+        return answers.pop(0)
+
+    monkeypatch.setattr(window, "_confirm_shared_config", confirm)
+    _, settled = _drop_and_settle(qapp, window, root)
+    assert settled
+
+    assert during == [before, before], "提示期（含返回列表那一次）配置一个都没动"
+    assert len(rounds) == 2 and rounds[0] is None
+    assert [c.blf.name for c in rounds[1]] == ["run001.blf", "run002.blf"], \
+        "回到列表时带上上次的勾选"
+    assert [c.blf.name for c in window.batch] == ["run001.blf", "run002.blf"]
+
+
+def test_shared_config_notice_states_scope_and_absent_channels(
+        window, qapp, monkeypatch):
+    """提示文案要点：共用平台/项目/CAN-DBC、切换作用于全部文件、缺失通道不导出；
+    两个出口是「继续」（前进）与「返回勾选列表」（后退）。"""
+    seen = []
+    monkeypatch.setattr(mw.QMessageBox, "exec", _click_button("继续", seen))
+
+    assert window._confirm_shared_config(3) is True
+    text = seen[0].text() + seen[0].informativeText()
+    for word in ("3 个文件", "平台", "项目", "CAN-DBC", "切换", "全部文件"):
+        assert word in text
+    assert "不存在的通道不会被导出" in text
+    assert {button.text() for button in seen[0].buttons()} == {
+        "继续", "返回勾选列表"}
+
+    monkeypatch.setattr(mw.QMessageBox, "exec",
+                        _click_button("返回勾选列表", seen))
+    assert window._confirm_shared_config(2) is False
+    monkeypatch.setattr(mw.QMessageBox, "exec", lambda box: None)  # 直接关掉
+    assert window._confirm_shared_config(2) is False, "没点「继续」就不前进"
+
+
+def test_batch_precheck_dialog_offers_overwrite_skip_and_cancel(
+        window, qapp, tmp_path, monkeypatch):
+    """输出预检弹窗：三选一（覆盖全部 / 跳过已存在 / 取消），列出已存在的输出。"""
+    existing = [_candidate(tmp_path, "run001.blf"),
+                _candidate(tmp_path, "run002.blf")]
+    seen = []
+    for label in (mw.PRECHECK_OVERWRITE_ALL, mw.PRECHECK_SKIP_EXISTING,
+                  mw.PRECHECK_CANCEL):
+        monkeypatch.setattr(mw.QMessageBox, "exec", _click_button(label, seen))
+        assert window._choose_overwrite(existing) == label
+
+    box = seen[0]
+    assert "2 个输出文件已存在" in box.text()
+    assert str(existing[1].output) in box.text()
+    assert {button.text() for button in box.buttons()} == {
+        mw.PRECHECK_OVERWRITE_ALL, mw.PRECHECK_SKIP_EXISTING,
+        mw.PRECHECK_CANCEL}
+    monkeypatch.setattr(mw.QMessageBox, "exec", lambda box: None)  # 直接关掉
+    assert window._choose_overwrite(existing) == mw.PRECHECK_CANCEL
+
+
+def test_batch_skip_existing_converts_the_rest_and_reports_skips(
+        window, qapp, tmp_path, monkeypatch):
+    """「跳过已存在」：已存在的那个不转、其余照转；结果弹窗与日志如实反映跳过。"""
+    converted = []
+
+    def fake_run_batch(candidates, bindings, *, progress_cb=None, **kwargs):
+        converted.append(list(candidates))
+        return BatchResult(outcomes=[FileOutcome(c, result=_result())
+                                     for c in candidates])
+
+    _start_batch_with_fake_run_batch(window, qapp, tmp_path, monkeypatch,
+                                     fake_run_batch, files=3)
+    first, skipped, third = window.batch
+    skipped.output.parent.mkdir(parents=True, exist_ok=True)
+    skipped.output.write_bytes(b"old")
+    monkeypatch.setattr(window, "_choose_overwrite",
+                        lambda existing: mw.PRECHECK_SKIP_EXISTING)
+    notices = []
+    monkeypatch.setattr(mw.QMessageBox, "exec",
+                        lambda self: notices.append(self.text())
+                        or QMessageBox.StandardButton.Ok)
+
+    window._start_convert()
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+
+    assert [c.blf for c in converted[0]] == [first.blf, third.blf], \
+        "只把不冲突的交给 core，跳过的那个不进批次"
+    assert skipped.output.read_bytes() == b"old", "跳过 = 不覆盖也不删除"
+    assert notices == ["3 个 blf 文件转换成功 2 个，跳过 1 个已存在"]
+    assert f"{first.display}: 完成 (总耗时 1.5 s)" in window.summary_text
+    assert f"{skipped.display}: 跳过（输出已存在）" in window.summary_text
+    assert "跳过" in window.summary_status.text()
+    order = [window.summary_text.index(f"{c.display}:")
+             for c in (first, skipped, third)]
+    assert order == sorted(order), "日志按批次顺序，跳过的那个留在原位"
+
+
+def test_batch_skip_existing_with_nothing_left_reports_zero_converted(
+        window, qapp, tmp_path, monkeypatch):
+    """全都已存在且选择跳过 → 一个都不转；结果弹窗如实报「转换成功 0 个」。"""
+    from core import batch as core_batch
+
+    converted = []
+    real_run_batch = core_batch.run_batch
+
+    def recording_run_batch(candidates, *args, **kwargs):
+        converted.append(list(candidates))
+        return real_run_batch(candidates, *args, **kwargs)
+
+    _start_batch_with_fake_run_batch(window, qapp, tmp_path, monkeypatch,
+                                     recording_run_batch)
+    for candidate in window.batch:
+        candidate.output.parent.mkdir(parents=True, exist_ok=True)
+        candidate.output.write_bytes(b"old")
+    monkeypatch.setattr(window, "_choose_overwrite",
+                        lambda existing: mw.PRECHECK_SKIP_EXISTING)
+    notices = []
+    monkeypatch.setattr(mw.QMessageBox, "exec",
+                        lambda self: notices.append(self.text())
+                        or QMessageBox.StandardButton.Ok)
+
+    window._start_convert()
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+
+    assert converted == [[]], "空待转清单交给 core 也是空批：不转任何文件"
+    assert notices == ["2 个 blf 文件转换成功 0 个，跳过 2 个已存在"]
+    assert "跳过" in window.summary_status.text()

@@ -32,16 +32,22 @@ def format_size(size: int) -> str:
 
 
 class CandidateDialog(QDialog):
-    """勾选要转换的候选文件（顺序 = 清单顺序，即转换顺序）。"""
+    """勾选要转换的候选文件（顺序 = 清单顺序，即转换顺序）。
+
+    checked 是上一轮的勾选（共用配置提示上「返回勾选列表」时传入）：返回即
+    恢复原样，用户不必重勾；不传则默认全选。
+    """
 
     def __init__(self, candidates: list[Candidate],
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None,
+                 checked: list[Candidate] | None = None):
         super().__init__(parent)
         self.setObjectName("candidateDialog")
         self.setWindowTitle("选择要转换的文件")
         self.setModal(True)
         self.resize(560, 440)
         self.candidates = list(candidates)
+        preselected = None if checked is None else {c.blf for c in checked}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 16)
@@ -62,7 +68,10 @@ class CandidateDialog(QDialog):
             item = QListWidgetItem(
                 f"{candidate.display}    {format_size(candidate.size)}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)      # 默认全要
+            item.setCheckState(                      # 上次的勾选优先，默认全要
+                Qt.CheckState.Checked
+                if preselected is None or candidate.blf in preselected
+                else Qt.CheckState.Unchecked)
             item.setToolTip(str(candidate.blf))
             self.list_widget.addItem(item)
         layout.addWidget(self.list_widget, 1)

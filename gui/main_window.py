@@ -43,6 +43,13 @@ from gui.windows_effects import apply_light_glass, sync_rounded_window
 
 UNBOUND = "不绑定"
 
+# 批量开始前的输出预检：三选一弹窗的取值。与 GUI 的 STATE_* 同一写法——
+# 显示文字即取值，按钮文案与判定同源。统一前缀把这一组与 CONTEXT.md 的
+# 「取消」区分开：那是中止一次进行中的转换，这里是「干脆不开始」。
+PRECHECK_OVERWRITE_ALL = "覆盖全部"
+PRECHECK_SKIP_EXISTING = "跳过已存在"
+PRECHECK_CANCEL = "取消"
+
 
 def _droppable_paths(event) -> list[str]:
     """拖拽事件里的可导入条目：本地文件夹或 .blf 文件（其余忽略）。
@@ -276,6 +283,9 @@ class MainWindow(QMainWindow):
         self.blf_path = None
         # 已就位可转换的批次（清单顺序 = 转换顺序）；空 = 只有 blf_path 那条路
         self.batch: list[Candidate] = []
+        # 本批中因「输出已存在」被预检跳过的文件（结束弹窗与日志的报数依据；
+        # 每次批量转换开头重新算定，见 _start_batch_convert）
+        self.skipped: list[Candidate] = []
         # 批次来源显示名（「输入 BLF」行用）
         self.batch_source = ""
         # 正在扫描的候选与来源（解析产出的本次扫描输入；扫描收尾即清空，
@@ -687,11 +697,13 @@ class MainWindow(QMainWindow):
 
     @property
     def _is_batch(self) -> bool:
-        """本批是否涉及多个文件（批次模式的唯一判据，阈值只此一处）。
+        """本批是否涉及多个文件（已提交批次的分岔判据，阈值只此一处）。
 
         批量下产物落位由解析期算定、输出框只读；单文件保持今天「唯一可
         手改输入框」的地位（手改值优先）——凡按这条分岔的（输出框形态、
-        可用性判定、转换入口）都读这个属性。
+        可用性判定、转换入口）都读这个属性。导入阶段另有两处「1 个」判断
+        （_choose_import_selection 里的候选数与勾选数），那问的是「还要不要
+        弹列表/提示」，与已提交批次是两件事，故不复用本属性。
         """
         return len(self.batch) > 1
 
@@ -720,7 +732,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_resolve_done(self, candidates: list[Candidate]):
-        """候选清单 → 勾选（> 1 个时）→ 扫描选中集。
+        """候选清单 → 勾选与共用配置提示（> 1 个时）→ 扫描选中集。
 
         候选只有 1 个时不弹列表、直接进入；一个都没有是「拖入的文件夹里
         没有 .blf」——明确告知并保持原状（不是静默无反应）。
@@ -731,15 +743,31 @@ class MainWindow(QMainWindow):
             self._end_import()
             QMessageBox.warning(self, "提示", "未找到可导入的 .blf 文件")
             return
-        if len(candidates) == 1:
-            chosen = candidates
-        else:
-            chosen = self._choose_candidates(candidates)
-            if chosen is None:      # 勾选列表上取消 = 放弃本次导入
-                self._end_import()
-                self._log("输入BLF 已取消", status="已取消")
-                return
+        chosen = self._choose_import_selection(candidates)
+        if chosen is None:      # 勾选列表上取消 = 放弃本次导入
+            self._end_import()
+            self._log("输入BLF 已取消", status="已取消")
+            return
         self._begin_scan(chosen, source)
+
+    def _choose_import_selection(
+            self, candidates: list[Candidate]) -> list[Candidate] | None:
+        """勾选 + 共用配置提示的接力：真正参与批量的清单，取消返回 None。
+
+        候选只有 1 个时不弹列表；实际参与批量的文件 > 1 个时才弹共用配置
+        提示。「返回勾选列表」带上次的勾选重开列表（反悔代价为零：此时仍在
+        导入阶段，平台/项目/绑定一个都没动过——它们在扫描之后才配）。
+        """
+        if len(candidates) == 1:
+            return list(candidates)
+        checked = None
+        while True:
+            chosen = self._choose_candidates(candidates, checked=checked)
+            if chosen is None or len(chosen) <= 1:
+                return chosen
+            if self._confirm_shared_config(len(chosen)):
+                return chosen
+            checked = chosen
 
     @Slot()
     def _on_resolve_cancelled(self):
@@ -752,12 +780,39 @@ class MainWindow(QMainWindow):
         self._log(f"输入BLF 读取失败: {msg}", status="输入BLF 读取失败")
         QMessageBox.critical(self, "BLF 读取失败", msg)
 
-    def _choose_candidates(self, candidates: list[Candidate]):
-        """弹候选勾选列表（可直接调用的接缝）；取消返回 None。"""
-        dialog = CandidateDialog(candidates, self)
+    def _choose_candidates(self, candidates: list[Candidate],
+                           checked: list[Candidate] | None = None,
+                           ) -> list[Candidate] | None:
+        """弹候选勾选列表（可直接调用的接缝）；取消返回 None。
+
+        checked = 上一轮的勾选（「返回勾选列表」重开时恢复，用户不必重勾），
+        None = 默认全选。
+        """
+        dialog = CandidateDialog(candidates, self, checked=checked)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         return dialog.checked_candidates()
+
+    def _confirm_shared_config(self, count: int) -> bool:
+        """共用配置提示（可直接调用的接缝）：继续 → True，返回勾选列表 → False。
+
+        实际参与批量的文件 > 1 个时才弹：这一批只配一次平台（CCU 版本）/项目/
+        CAN-DBC 匹配、切换会同时作用于全部文件；某个文件中不存在的通道不导出，
+        该文件的产物相应少几组信号（正常情况，不是错误）。没点「继续」一律
+        按返回处理——提示期未触碰任何配置，回去的代价为零。
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("共用一套配置")
+        box.setText(f"本批 {count} 个文件将共用同一套平台 / 项目 / CAN-DBC 匹配。")
+        box.setInformativeText(
+            "这一套配置只配一次，切换会同时作用于全部文件。\n"
+            "某个文件中不存在的通道不会被导出，该文件的输出会相应少几组信号。")
+        proceed = box.addButton("继续", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("返回勾选列表", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(proceed)
+        box.exec()
+        return box.clickedButton() is proceed
 
     @Slot(object)
     def _on_scan_done(self, channels: list):
@@ -1125,29 +1180,29 @@ class MainWindow(QMainWindow):
         self.worker_thread.start()
 
     def _start_batch_convert(self):
-        """批量转换：整批交给 core.batch.run_batch（界面不自建转换循环）。
+        """批量转换：输出预检一次问完 → 整批交给 core.batch.run_batch。
 
-        覆盖检查一次做完（对齐单文件那次「输出文件已存在」询问，不是 N 个
-        弹窗）；产物落位用解析期算定的输出路径，界面的输出框不参与。
+        预检把「已存在」的输出合成**一次**三选一（覆盖全部 / 跳过已存在 /
+        取消），不逐文件弹窗；「跳过已存在」只把不冲突的子集交给 core，跳过的
+        记在 self.skipped 上供收尾如实报数（它们没被转换，报数不得算作成功）。
+        产物落位用解析期算定的输出路径，界面的输出框不参与。
         """
         existing = [c for c in self.batch if c.output.exists()]
+        self.skipped = []               # 本次批量重新算定（取消也归零）
         if existing:
-            listed = "\n".join(str(c.output) for c in existing[:5])
-            if len(existing) > 5:
-                listed += f"\n… 共 {len(existing)} 个"
-            ans = QMessageBox.question(
-                self, "覆盖确认",
-                f"{len(existing)} 个输出文件已存在：\n{listed}\n\n是否全部覆盖？")
-            if ans != QMessageBox.StandardButton.Yes:
+            choice = self._choose_overwrite(existing)
+            if choice == PRECHECK_CANCEL:
                 return
+            if choice == PRECHECK_SKIP_EXISTING:
+                self.skipped = existing
+        todo = [c for c in self.batch if c not in self.skipped]
         bindings = self._collect_bindings()
         self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
         self._set_busy(True)
         self.progress.setValue(0)
         self.summary_status.setText("批量转换中…")
         self.worker_thread = QThread()
-        self.worker = BatchConvertWorker(list(self.batch), bindings,
-                                        self.convert_cancel)
+        self.worker = BatchConvertWorker(todo, bindings, self.convert_cancel)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
@@ -1155,6 +1210,36 @@ class MainWindow(QMainWindow):
         self.worker.cancelled.connect(self._on_batch_cancelled)
         self.worker.error.connect(self._on_error)
         self.worker_thread.start()
+
+    def _choose_overwrite(self, existing: list[Candidate]) -> str:
+        """批量开始前的输出预检（可直接调用的接缝）：三选一，见模块常量。
+
+        与单文件那次「输出文件已存在」询问对齐——整批只问一次而不是 N 个弹窗，
+        底线是不静默覆盖。没点前两个按钮（含直接关掉）一律按取消处理。
+        """
+        listed = "\n".join(str(c.output) for c in existing[:5])
+        if len(existing) > 5:
+            listed += f"\n… 共 {len(existing)} 个"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("覆盖确认")
+        box.setText(f"{len(existing)} 个输出文件已存在：\n{listed}")
+        box.setInformativeText(
+            "覆盖全部会替换这些文件；跳过已存在只转换其余文件，"
+            "已有产物原样保留。")
+        overwrite = box.addButton(PRECHECK_OVERWRITE_ALL,
+                                  QMessageBox.ButtonRole.AcceptRole)
+        skip = box.addButton(PRECHECK_SKIP_EXISTING,
+                             QMessageBox.ButtonRole.ActionRole)
+        box.addButton(PRECHECK_CANCEL, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(overwrite)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is overwrite:
+            return PRECHECK_OVERWRITE_ALL
+        if clicked is skip:
+            return PRECHECK_SKIP_EXISTING
+        return PRECHECK_CANCEL
 
     def _collect_bindings(self) -> dict[int, DbcDef | None]:
         """绑定表 → {通道: DbcDef | None}（零查找、零反查表）。
@@ -1207,30 +1292,47 @@ class MainWindow(QMainWindow):
     def _on_batch_done(self, result: BatchResult):
         """批次结局：全成功弹「N 个 blf 文件全部转换完成」，部分失败报数并点名。
 
-        逐文件结局（成功记耗时、失败记原因）都进日志——批量下这是唯一能
-        还原「哪个文件怎么了」的地方。失败后**不**回滚已完成的产物（core
-        契约：单个文件失败不中断批次）。
+        逐文件结局（成功记耗时、失败记原因、预检跳过的记跳过）按**批次顺序**进
+        日志——批量下这是唯一能还原「哪个文件怎么了」的地方，顺序即用户看到
+        的清单顺序。跳过的文件属于本批，故报数的分母含它们（不把「跳过」说成
+        转换成功）。失败后**不**回滚已完成的产物（core 契约：单个文件失败不
+        中断批次）。
         """
         self._finish()
+        skipped_blfs = {candidate.blf for candidate in self.skipped}
+        outcome_of = {outcome.candidate.blf: outcome
+                      for outcome in result.outcomes}
         lines = []
-        for outcome in result.outcomes:
+        for candidate in self.batch:        # 清单顺序；跳过的也留在原位
+            if candidate.blf in skipped_blfs:
+                lines.append(f"{candidate.display}: 跳过（输出已存在）")
+                continue
+            outcome = outcome_of[candidate.blf]
             if outcome.ok:
-                lines.append(f"{outcome.candidate.display}: 完成 (总耗时 "
+                lines.append(f"{candidate.display}: 完成 (总耗时 "
                              f"{_total_seconds(outcome.result):.1f} s)")
             else:
-                lines.append(f"{outcome.candidate.display}: 失败 — "
-                             f"{outcome.error}")
-        total = len(result.outcomes)
+                lines.append(f"{candidate.display}: 失败 — {outcome.error}")
+        converted = len(result.outcomes)
+        skipped = len(self.skipped)
+        total = converted + skipped         # 本批文件数 = 转换的 + 预检跳过的
+        skip_clause = f"跳过 {skipped} 个已存在" if skipped else ""
+        skip_suffix = f" · {skip_clause}" if skip_clause else ""
         elapsed = sum(_total_seconds(o.result) for o in result.outcomes if o.ok)
         if result.all_succeeded:
-            status = f"批量转换完成 · {total} 个文件 · 总耗时 {elapsed:.1f} s"
-            notice = f"{total} 个 blf 文件全部转换完成"
+            status = (f"批量转换完成 · {converted} 个文件{skip_suffix}"
+                      f" · 总耗时 {elapsed:.1f} s")
+            notice = (f"{total} 个 blf 文件转换成功 {converted} 个，{skip_clause}"
+                      if skipped else f"{total} 个 blf 文件全部转换完成")
         else:
             failed = result.failures
-            status = (f"批量转换完成 · {total - len(failed)} 成功 / "
-                      f"{len(failed)} 失败 · 总耗时 {elapsed:.1f} s")
-            notice = (f"{total} 个 blf 文件转换成功 {total - len(failed)} 个，"
-                      f"失败 {len(failed)} 个\n失败文件：\n"
+            succeeded = converted - len(failed)
+            status = (f"批量转换完成 · {succeeded} 成功 / {len(failed)} 失败"
+                      f"{skip_suffix} · 总耗时 {elapsed:.1f} s")
+            notice = (f"{total} 个 blf 文件转换成功 {succeeded} 个，失败 "
+                      f"{len(failed)} 个"
+                      + (f"，{skip_clause}" if skipped else "")
+                      + "\n失败文件：\n"
                       + "\n".join(f"{outcome.candidate.display} — "
                                   f"{outcome.error}" for outcome in failed))
         self._log("批量转换完成\n" + "\n".join(lines), status=status)
