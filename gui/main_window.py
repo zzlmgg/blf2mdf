@@ -560,8 +560,9 @@ class MainWindow(QMainWindow):
         → run001_t.mdf）。
 
         每次加载/重选 BLF 后输出自动跟随（_on_scan_done 调用）；用户手动
-        改过的输出路径也会在下次选择 BLF 时被新 BLF 的路径覆盖（需求：
-        输出文件路径始终与 BLF 文件路径一致）。
+        改过的输出路径也会在下次选择 BLF 时被新 BLF 的路径覆盖。这里是
+        「散 .blf 就地落位」这一条规则——文件夹/压缩包来源按来源类型改落
+        同级镜像输出树（见 CONTEXT.md「镜像输出树」）。
         """
         source = Path(self.blf_path)
         self.out_edit.setText(str(source.with_name(f"{source.stem}_t.mdf")))

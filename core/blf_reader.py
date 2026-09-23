@@ -17,6 +17,12 @@ class ConversionCancelled(Exception):
     """转换被用户取消（GUI 取消按钮置位后，扫描/解码/写 MDF 检查点抛出）。"""
 
 
+def check_cancel(cancel_cb) -> None:
+    """取消检查点：cancel_cb 置位 → raise ConversionCancelled（调用方按「已取消」处理）。"""
+    if cancel_cb is not None and cancel_cb():
+        raise ConversionCancelled()
+
+
 @dataclass
 class Frame:
     channel: int

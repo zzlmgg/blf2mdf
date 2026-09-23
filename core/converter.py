@@ -8,17 +8,11 @@ from pathlib import Path
 import numpy as np
 
 from core import blf_reader, mdf_writer, mp_finish
-from core.blf_reader import ConversionCancelled
+from core.blf_reader import ConversionCancelled, check_cancel
 from core.blf_vector import iter_container_frames
 from core.decoder import Bucket, ChannelDecoder
 from core.dbc_loader import DbcDef, classify_batch, message_table, normalize_ids
 from core import stats as stats_mod
-
-
-def _check_cancel(cancel_cb) -> None:
-    """转换检查点：cancel_cb 置位 → raise ConversionCancelled（GUI 取消按钮）。"""
-    if cancel_cb is not None and cancel_cb():
-        raise ConversionCancelled()
 
 
 # ── H1 Step 3：向量化单遍扫描（读入路由 + 桶装配）──
@@ -334,7 +328,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                 np.concatenate(er) if er else np.empty(0, dtype=bool))
         timings.append(("读入 BLF", time.perf_counter() - t_read))
         # 取消检查点：读取完毕、解码前（取消则不再启动解码/池回收）
-        _check_cancel(cancel_cb)
+        check_cancel(cancel_cb)
 
         # 内存阈值回退（方案 G §5.7）：feed 后桶内存估算超阈值 → 转串行。
         # 池已预热但未提交任务，shutdown 无副作用。
@@ -364,7 +358,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
                     progress_cb(f"解码 CAN{ch}",
                                 mp_finish.decode_progress(i / total))
                 # 取消检查点：串行解码逐通道
-                _check_cancel(cancel_cb)
+                check_cancel(cancel_cb)
                 t_ch = time.perf_counter()
                 results[ch] = decoders[ch].finish()
                 timings.append((f"解码 CAN{ch}", time.perf_counter() - t_ch))
@@ -443,7 +437,7 @@ def convert(blf_path: str, bindings: dict[int, DbcDef | None], out_path: str,
         if progress_cb:
             progress_cb("写 MDF", 95)
         # 取消检查点：写 MDF 前（取消则不写，无输出残留）
-        _check_cancel(cancel_cb)
+        check_cancel(cancel_cb)
         t_write = time.perf_counter()
         # 无残留契约在 write_mdf 内部（失败清理本次半成品，见 CONTEXT.md）；
         # converter 不重复清理（deletion test：writer 改临时文件策略不连带 converter）
