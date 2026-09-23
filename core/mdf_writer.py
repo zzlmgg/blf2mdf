@@ -68,13 +68,45 @@ def _abs_time_ns(dt: datetime) -> int:
             * 1_000_000 + dt.microsecond) * 1_000
 
 
+def _create_parent_dirs(out_path: Path, created: list[Path]) -> None:
+    """创建 out_path 的父目录链，本次新建的目录记入 created（由深到浅）。
+
+    深层产物（镜像输出树 <源名>_t/ 的内层路径）整条目录链可能不存在，创建归
+    写出侧（解析期只算路径、不碰文件系统，见 core/source_resolver.py）。
+    已存在的目录不算本次新建——失败回收时不得误删同批其他文件的产物目录。
+    """
+    parent = out_path.parent
+    while not parent.exists():
+        created.append(parent)        # 先记账再创建：mkdir 中途失败同样可回收
+        if parent.parent == parent:   # 盘根（不可写等：mkdir 抛出，无残留由调用方收口）
+            break
+        parent = parent.parent
+    if created:
+        created[-1].mkdir(parents=True, exist_ok=True)
+
+
+def _drop_created_dirs(created: list[Path]) -> None:
+    """回收本次新建、且仍为空的目录（由深到浅）；非空或删除失败静默跳过。"""
+    for directory in created:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def write_mdf(signal_series_list: list[SignalSeries],
               raw_groups: list[RawGroup], out_path: str,
               abs_start_seconds: float | None = None,
               stats_groups: list[ChannelStats] | None = None) -> None:
-    """写出 MDF 4.10 文件。无残留契约（CONTEXT.md）：本函数抛出（含
-    BaseException）时，本次调用不留下任何输出文件——半成品被清理，
-    out_path 保持调用前状态（旧产物保留）。"""
+    """写出 MDF 4.10 文件（out_path 的中间目录由本函数创建）。
+
+    无残留契约（CONTEXT.md）：本函数抛出（含 BaseException）时，本次调用
+    不留下任何输出文件——半成品被清理，out_path 保持调用前状态（旧产物
+    保留）；本次新建的中间目录一并回收（不留空枝）。
+
+    取消不属本函数的契约范围：写成功后被调用方放弃（取消检查点删完整产物，
+    见 core/converter.py）时本函数已正常返回、无从回收目录——镜像树里可能
+    留一个空枝；它不属任何一次「失败的转换调用」，不影响无残留判定。"""
 
     # asammdf 8.8：append 无 group_name 参数，组名 = ChannelGroup.acq_name；
     # 每次 append 新建一组，同一组的所有信号须一次传入（列表）。
@@ -157,7 +189,9 @@ def write_mdf(signal_series_list: list[SignalSeries],
 
     # compression=2（转置 + deflate）：参考 CANoe 高压缩输出（修复项 7，计划实测 326 MB → 4 MB 量级）；
     # 压缩透明，读回自动解压。asammdf 8.8 的 save 强制 .mf4 后缀。
+    created: list[Path] = []
     try:
+        _create_parent_dirs(Path(out_path), created)
         mdf.save(out_path, overwrite=True, compression=2)
         os.replace(Path(out_path).with_suffix(".mf4"), out_path)
     except BaseException:
@@ -169,4 +203,5 @@ def write_mdf(signal_series_list: list[SignalSeries],
             Path(out_path).with_suffix(".mf4").unlink(missing_ok=True)
         except OSError:
             pass
+        _drop_created_dirs(created)    # 本次新建的空目录链一并回收（不留空枝）
         raise

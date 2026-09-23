@@ -244,6 +244,55 @@ def test_write_mdf_replace_failure_leaves_no_residue(tmp_path, monkeypatch):
     assert out.read_bytes() == b"previous", "replace 原子失败：out_path 应保持调用前状态"
 
 
+# ---- 镜像输出树的深层产物（中间目录的创建归写出侧）----
+
+def test_write_mdf_creates_missing_parent_dirs(tmp_path):
+    """深层产物：中间目录由写出侧创建（镜像树 <源名>_t/ 内层的路径可能整条
+    不存在——解析期只算路径、不碰文件系统，见 core/source_resolver.py）。"""
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "AHT_t" / "20260917" / "run001_t.mdf"
+    write_mdf([s], [], str(out))
+
+    assert out.is_file()
+    assert np.allclose(MDF(str(out)).get("Speed").samples, [10.0])
+
+
+def test_write_mdf_failure_reclaims_dirs_it_created(tmp_path, monkeypatch):
+    """无残留：失败时连同半成品一起回收**本次新建**的空目录链——
+    失败文件的输出位置保持调用前状态（镜像树里不留空枝）。
+
+    注入点在 os.replace（save 已写出半成品 .mf4、目录链已由写出侧建好）：
+    半成品与本次新建的目录一并回收。
+    """
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "AHT_t" / "20260917" / "run001_t.mdf"
+
+    def boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("core.mdf_writer.os.replace", boom)
+    with pytest.raises(OSError):
+        write_mdf([s], [], str(out))
+    assert not out.with_suffix(".mf4").exists(), "半成品 .mf4 应被清理"
+    assert not (tmp_path / "AHT_t").exists(), "本次新建的目录链应被回收"
+
+
+def test_write_mdf_failure_keeps_pre_existing_dirs(tmp_path, monkeypatch):
+    """无残留的边界：只回收本次新建的目录——批次里前一个文件建过的目录
+    不属于本次调用，失败不得误删（产物树是整批共享的）。"""
+    s = _series(1, "ECU1", "MsgA", [("Speed", "km/h")], [1.0], {"Speed": [10.0]})
+    out = tmp_path / "AHT_t" / "20260917" / "run002_t.mdf"
+    (tmp_path / "AHT_t" / "20260917").mkdir(parents=True)   # 前一个文件的产物目录
+
+    def boom(self, *args, **kwargs):
+        raise OSError("simulated save failure")
+
+    monkeypatch.setattr(MDF, "save", boom)
+    with pytest.raises(OSError):
+        write_mdf([s], [], str(out))
+    assert (tmp_path / "AHT_t" / "20260917").is_dir()
+
+
 def test_write_mdf_keyboard_interrupt_cleans_partial(tmp_path, monkeypatch):
     """无残留（D3：BaseException）：KeyboardInterrupt（Ctrl+C）同样清理半成品
     并上抛——任何异常路径都不留残留，主异常不被吞。"""
