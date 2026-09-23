@@ -106,18 +106,27 @@ def run_batch(candidates: list[Candidate],
     return BatchResult(outcomes=outcomes)
 
 
+def overall_percent(index: int, total: int, inner_percent: float) -> float:
+    """文件内进度 → 整体百分比：第 index（0 起）个文件的内进度
+    inner_percent ∈ [0, 100] → (index + inner_percent/100) × 100 / total。
+
+    「N 个文件、每个文件有自己的 0-100 进度」这一刻度只此一处：批量转换
+    （run_batch）与界面的多文件扫描（BlfScanWorker）共用它，两边不各算一遍。
+    """
+    return (index + inner_percent / 100) / total * 100
+
+
 def _batch_progress_cb(progress_cb, index: int, total: int):
     """整体进度映射：文件内进度 → 整体百分比，stage 加「第 i/N 个 · 」前缀。
 
-    第 index（0 起，i = index + 1）个文件的文件内进度 p ∈ [0, 100] → 整体
-    percent = (index + p/100) × 100 / total。文件内进度本身单调不降（convert
-    契约），index 逐文件递增，故整体单调不降。
+    文件内进度本身单调不降（convert 契约），index 逐文件递增，故整体单调
+    不降（映射见 overall_percent）。
     """
     if progress_cb is None:
         return None
 
     def report(stage: str, percent: float) -> None:
         progress_cb(f"第 {index + 1}/{total} 个 · {stage}",
-                    (index + percent / 100) / total * 100)
+                    overall_percent(index, total, percent))
 
     return report

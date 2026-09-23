@@ -58,6 +58,21 @@ def resolve(paths, *, progress_cb=None, cancel_cb=None) -> list[Candidate]:
     return candidates
 
 
+def blf_candidate(path: Path) -> Candidate:
+    """单个散 .blf 的候选：输出就在它旁边（`<主名>_t.mdf`），显示名 = 文件名。
+
+    「输出路径在解析期一次算定」对单文件入口同样成立：拖入/浏览单个 .blf
+    不经解析（没有目录要展开），界面就地取这条规则——规则本身只有这一处
+    定义，界面不得自己拼 `_t.mdf`（读不到的条目大小记 0，同条目跳过政策）。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return Candidate(blf=path, output=path.with_name(f"{path.stem}_t.mdf"),
+                     display=path.name, size=size)
+
+
 def _is_blf(path: Path) -> bool:
     """可导入条目：扩展名大小写不敏感（资源管理器拖出的可能是 .BLF/.Blf）。"""
     return path.suffix.lower() == BLF_SUFFIX
@@ -84,12 +99,7 @@ def _entry_candidates(path: Path, cancel_cb) -> Iterator[Candidate]:
         if path.is_dir():
             yield from _folder_candidates(path, cancel_cb)
         elif path.is_file() and _is_blf(path):
-            yield Candidate(
-                blf=path,
-                output=path.with_name(f"{path.stem}_t.mdf"),
-                display=path.name,
-                size=path.stat().st_size,
-            )
+            yield blf_candidate(path)
     except OSError as exc:
         LOGGER.warning("条目跳过（不可读）: %s（%s）", path, exc)
 

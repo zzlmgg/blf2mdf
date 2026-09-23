@@ -8,16 +8,18 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QSize, Qt, QThread, QObject, Signal, Slot
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QFrame, QHBoxLayout,
+    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QListWidgetItem,
 )
 
-from core import blf_reader, project_loader
+from core import blf_reader, project_loader, source_resolver
+from core.batch import BatchCancelled, BatchResult, overall_percent, run_batch
 from core.blf_reader import ConversionCancelled
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
+from core.source_resolver import Candidate
 from gui.binding import (
     STATE_BOUND,
     STATE_NOT_EXPORTED,
@@ -25,6 +27,7 @@ from gui.binding import (
     decide_bindings,
     derive_state,
 )
+from gui.candidate_dialog import CandidateDialog
 from gui.resources import application_icon
 from gui.theme import POSITIVE_COLOR, WINDOW_HEIGHT, WINDOW_WIDTH
 from gui.widgets import (
@@ -41,16 +44,51 @@ from gui.windows_effects import apply_light_glass, sync_rounded_window
 UNBOUND = "不绑定"
 
 
-def _blf_drop_path(event) -> str | None:
-    """拖拽事件中的第一个 .blf 本地文件路径；没有则返回 None。
+def _droppable_paths(event) -> list[str]:
+    """拖拽事件里的可导入条目：本地文件夹或 .blf 文件（其余忽略）。
 
-    拖入多个文件时取第一个 .blf（其余忽略）；扩展名大小写不敏感
-    （Windows 资源管理器拖出的扩展名可能为大写 .BLF）。
+    扩展名大小写不敏感（Windows 资源管理器拖出的扩展名可能为大写 .BLF）；
+    文件夹只是「可能含 .blf」——里面到底有没有，展开（来源解析）后才知道。
     """
+    paths = []
     for url in event.mimeData().urls():
-        if url.isLocalFile() and url.toLocalFile().lower().endswith(".blf"):
-            return url.toLocalFile()
-    return None
+        if not url.isLocalFile():
+            continue
+        local = url.toLocalFile()
+        # 先看扩展名（拖入多个 .blf 时零 stat），非 .blf 条目再问文件系统
+        if local.lower().endswith(source_resolver.BLF_SUFFIX) \
+                or Path(local).is_dir():
+            paths.append(local)
+    return paths
+
+
+def _source_label(paths: list[str]) -> str:
+    """拖入来源的显示名：单个来源用其目录/文件名，多个来源用「N 个来源」。"""
+    names = [Path(path).name for path in paths]
+    return names[0] if len(names) == 1 else f"{len(names)} 个来源"
+
+
+def _total_seconds(result: ConversionResult) -> float:
+    """单文件墙钟总耗时：timings 里的「总耗时」为主，无 timings
+    （测试构造/旧调用方）兜底数据时长。"""
+    return next((t for label, t in result.timings if label == "总耗时"),
+                result.duration_seconds)
+
+
+def _scan_progress_cb(progress_cb, index: int, total: int):
+    """多文件扫描的进度映射：文件内进度 → 整体百分比（刻度归 core，见
+    core.batch.overall_percent——与批量转换同一套「i/N + 文件内进度」）。
+
+    单文件原样透传（与今天的字节级进度逐位一致）；单文件的新旧两条入口
+    都走这里，故 total == 1 必须零改动。
+    """
+    if progress_cb is None or total <= 1:
+        return progress_cb
+
+    def report(percent: float) -> None:
+        progress_cb(overall_percent(index, total, percent))
+
+    return report
 
 
 class DbcCombo(CompactCombo):
@@ -111,34 +149,114 @@ class ConvertWorker(QObject):
             self.error.emit(str(e))
 
 
-class BlfScanWorker(QObject):
-    """BLF 通道探测（worker 线程）：probe_channels 对象头级轻量行走
-    （list_channels 全文件解析 86MB/565 万帧实测 41s，探测 5-20 倍更快），
-    放后台线程避免主界面冻结成「未响应」。
+class ResolveWorker(QObject):
+    """来源解析（worker 线程）：拖入的路径集合 → 候选清单。
 
-    progress 按文件字节位置报真实进度（0-100）；cancel_event 置位后
-    probe 在 1024 对象内抛 ConversionCancelled → cancelled 信号回主线程。
+    目录树遍历可能很慢（大目录、网络盘），放后台线程避免主界面冻结；
+    cancel_event 置位后解析在两个检查点内抛 ConversionCancelled。
+    progress(已发现候选数)：遍历前不知总数，刻度是计数而非百分比（见
+    core/source_resolver.resolve）——界面把它当状态文案，不当进度条刻度。
     """
-    progress = Signal(float)
+    progress = Signal(int)
     done = Signal(object)
     cancelled = Signal()
     error = Signal(str)
 
-    def __init__(self, path, cancel_event):
+    def __init__(self, paths, cancel_event):
         super().__init__()
-        self.path = path
+        self.paths = [str(path) for path in paths]
+        self.source_label = _source_label(self.paths)
         self.cancel_event = cancel_event
 
     @Slot()
     def run(self):
         try:
-            channels = blf_reader.probe_channels(
-                self.path,
-                progress_cb=self.progress.emit,
+            candidates = source_resolver.resolve(
+                self.paths, progress_cb=self.progress.emit,
                 cancel_cb=self.cancel_event.is_set)
-            self.done.emit(channels)
+            self.done.emit(candidates)
         except ConversionCancelled:
             self.cancelled.emit()
+        except Exception as e:  # noqa: BLE001 — 界面层兜底
+            self.error.emit(str(e))
+
+
+class BlfScanWorker(QObject):
+    """BLF 通道探测（worker 线程）：probe_channels 对象头级轻量行走
+    （list_channels 全文件解析 86MB/565 万帧实测 41s，探测 5-20 倍更快），
+    放后台线程避免主界面冻结成「未响应」。
+
+    多个文件时逐个探测并取**通道并集**（批次的行集基准）；progress 按
+    (i + 文件内进度)/N 报整体进度，单文件即文件字节位置（0-100）；
+    cancel_event 置位后 probe 在 1024 对象内抛 ConversionCancelled →
+    cancelled 信号回主线程。error 带出错文件的路径（多文件时得知道是哪个）。
+    """
+    progress = Signal(float)
+    done = Signal(object)
+    cancelled = Signal()
+    error = Signal(str, str)
+
+    def __init__(self, paths, cancel_event):
+        super().__init__()
+        self.paths = [str(path) for path in paths]
+        # 扫描目标路径（单文件入口的兼容面：_on_scan_done 直接读它）
+        self.path = self.paths[0]
+        self.cancel_event = cancel_event
+
+    @Slot()
+    def run(self):
+        total = len(self.paths)
+        channels: set[int] = set()
+        for index, path in enumerate(self.paths):
+            try:
+                channels.update(blf_reader.probe_channels(
+                    path,
+                    progress_cb=_scan_progress_cb(self.progress.emit, index,
+                                                 total),
+                    cancel_cb=self.cancel_event.is_set))
+            except ConversionCancelled:
+                self.cancelled.emit()
+                return
+            except Exception as e:  # noqa: BLE001 — 界面层兜底
+                self.error.emit(path, str(e))
+                return
+        # 并集排序后交出：行集基准要确定性（探测顺序 = 清单顺序，不保证升序）
+        self.done.emit(sorted(channels))
+
+
+class BatchConvertWorker(QObject):
+    """批量转换（worker 线程）：整批交给 core.batch.run_batch。
+
+    「批次」的定义与转换循环都在 core/batch.py——界面只转发配置与回调，
+    不自建循环（stage/percent 由 run_batch 映射好，stage 带「第 i/N 个 · 」）。
+    cancelled 携带已完成结局（BatchCancelled）：界面据此说明产物保留情况。
+    """
+    progress = Signal(str, float)
+    done = Signal(object)
+    cancelled = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, candidates, bindings, cancel_event):
+        super().__init__()
+        self.candidates = list(candidates)
+        self.bindings = bindings
+        self.cancel_event = cancel_event
+
+    @Slot()
+    def run(self):
+        try:
+            # 与单文件 ConvertWorker 同一套开关：文件内并行开、原始帧导出关
+            result = run_batch(
+                self.candidates, self.bindings,
+                progress_cb=lambda s, p: self.progress.emit(s, p),
+                cancel_cb=self.cancel_event.is_set,
+                raw_export=False,
+                parallel=True)
+            self.done.emit(result)
+        except BatchCancelled as exc:
+            self.cancelled.emit(exc.outcomes)
+        except ConversionCancelled:
+            self.cancelled.emit([])
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
 
@@ -154,7 +272,16 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(WINDOW_WIDTH, WINDOW_HEIGHT)
         self._visual_effects_applied = False
         self._native_rounding = False
+        # 单个 BLF 的路径；批次（> 1）时为空——批量的身份是 self.batch
         self.blf_path = None
+        # 已就位可转换的批次（清单顺序 = 转换顺序）；空 = 只有 blf_path 那条路
+        self.batch: list[Candidate] = []
+        # 批次来源显示名（「输入 BLF」行用）
+        self.batch_source = ""
+        # 正在扫描的候选与来源（解析产出的本次扫描输入；扫描收尾即清空，
+        # 否则扫描失败时会与已就位的批次张冠李戴）
+        self.pending: list[Candidate] = []
+        self.pending_source = ""
         # BLF 实际包含的通道（行集基准：通道表 = BLF 通道 ∪ 当前映射通道）
         self.blf_channels: list[int] = []
         self.dbc_list: list[DbcDef] = []
@@ -165,7 +292,10 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
-        # 扫描/转换取消事件：每次加载/转换重建；取消按钮与 closeEvent
+        # 拖入来源的解析线程（文件夹/多条目才用得上；单文件走 _load_blf 捷径）
+        self.resolve_thread: QThread | None = None
+        self.resolve_worker: ResolveWorker | None = None
+        # 解析/扫描/转换取消事件：每次加载/转换重建；取消按钮与 closeEvent
         # 置位，worker 循环检查后抛 ConversionCancelled（threading.Event 跨线程安全）
         self.scan_cancel = threading.Event()
         self.convert_cancel = threading.Event()
@@ -436,26 +566,29 @@ class MainWindow(QMainWindow):
 
     # ---- 文件选择 ----
     def eventFilter(self, obj, event):
-        """BLF 文件行的拖拽导入：.blf 拖入标签/路径框 → _load_blf。
+        """BLF 文件行的拖拽导入：文件夹或多条目拖入标签/路径框 → 解析 → 勾选 → 扫描。
 
-        「浏览…」手动选择功能不变；非 .blf 拖入整行拒绝，且事件被消费、
-        不落到 QLineEdit 默认的文本拖放。扫描进行中拒绝拖入（与浏览按钮
-        禁用一致，避免「接受却无动作」的困惑）。
+        「浏览…」手动选择功能不变；结构性不可导入的拖入（非 .blf 且非文件夹）
+        整行拒绝，且事件被消费、不落到 QLineEdit 默认的文本拖放。解析/扫描/
+        转换进行中拒绝拖入（与浏览按钮禁用一致，避免「接受却无动作」的困惑）。
         """
         if obj in (self.blf_label, self.blf_edit) and event.type() in (
                 QEvent.Type.DragEnter, QEvent.Type.DragMove,
                 QEvent.Type.Drop):
-            busy = (self.scan_thread is not None
-                    and self.scan_thread.isRunning())
-            path = None if busy else _blf_drop_path(event)
-            if path and event.type() == QEvent.Type.Drop:
-                self._load_blf(path)
-            if path:
+            paths = [] if self._input_busy() else _droppable_paths(event)
+            if paths and event.type() == QEvent.Type.Drop:
+                self._start_import(paths)
+            if paths:
                 event.acceptProposedAction()
             else:
                 event.ignore()
             return True  # 消费拖拽事件，控件默认处理不参与
         return super().eventFilter(obj, event)
+
+    def _input_busy(self) -> bool:
+        """输入侧忙碌：解析/扫描/转换任一在跑（拖入与「浏览…」同步拒绝）。"""
+        return any(thread is not None and thread.isRunning() for thread in (
+            self.resolve_thread, self.scan_thread, self.worker_thread))
 
     def _pick_blf(self):
         # 对话框默认打开项目根目录的 inputs\blf（BLF 数据统一存放处）；
@@ -468,23 +601,66 @@ class MainWindow(QMainWindow):
             return
         self._load_blf(path)
 
+    def _start_import(self, paths: list[str]):
+        """一次拖入的统一入口：单个散 .blf 走今天的单文件路径（逐字不变），
+        文件夹/多条目先解析出候选，再按候选数决定是否弹勾选列表。"""
+        if len(paths) == 1 and Path(paths[0]).is_file():
+            self._load_blf(paths[0])
+            return
+        self._start_resolve(paths)
+
     def _load_blf(self, path: str):
-        """加载 BLF（异步）：后台线程探测通道 → 刷新通道表与默认输出路径。
+        """加载单个 BLF（异步）：后台线程探测通道 → 刷新通道表与默认输出路径。
 
         大文件（如 86MB/565 万帧）全文件解析实测耗时 41s，若在主线程
         同步执行窗口会冻结成「未响应」；改为 worker 线程（probe_channels
         对象头级轻量行走，5-20 倍更快）+ 字节级真实进度 + 取消按钮，
         扫描期间界面保持响应，进度条可见推进。
         """
-        if self.scan_thread is not None and self.scan_thread.isRunning():
-            return  # 扫描进行中不接受新文件
+        if self._input_busy():
+            return  # 解析/扫描/转换进行中不接受新文件
         self.scan_cancel = threading.Event()  # 每次加载重建（取消即作废本次尝试）
         self._set_scan_busy(True)
-        self._load_start = time.perf_counter()  # 加载耗时计时（_on_scan_done 记日志）
+        # 单个 .blf 不经解析（没有目录要展开）：就地取候选，路径规则仍归 core
+        self._begin_scan([source_resolver.blf_candidate(Path(path))])
+
+    def _start_resolve(self, paths: list[str]):
+        """解析拖入的来源（后台线程）→ _on_resolve_done 拿到候选清单。
+
+        进度条转不确定态：解析的进度刻度是「已发现候选数」，没有分母
+        （见 core/source_resolver.py）；输入行先显示来源名，解析完再定论。
+        """
+        self.scan_cancel = threading.Event()
+        self._set_scan_busy(True)
+        self.load_progress.setRange(0, 0)
+        self.blf_edit.setText(_source_label(paths))
+        self.blf_edit.setToolTip("\n".join(paths))
+        self.resolve_thread = QThread()
+        self.resolve_worker = ResolveWorker(paths, self.scan_cancel)
+        self.resolve_worker.moveToThread(self.resolve_thread)
+        self.resolve_thread.started.connect(self.resolve_worker.run)
+        self.resolve_worker.progress.connect(self._on_resolve_progress)
+        self.resolve_worker.done.connect(self._on_resolve_done)
+        self.resolve_worker.cancelled.connect(self._on_resolve_cancelled)
+        self.resolve_worker.error.connect(self._on_resolve_error)
+        self.resolve_thread.start()
+
+    def _begin_scan(self, candidates: list[Candidate], source: str = ""):
+        """扫描这批候选的通道（多文件取并集）→ _on_scan_done 提交批次。
+
+        candidates 即本次扫描的输入（pending）：来源解析的产出，或单文件
+        入口就地构造的单个候选。source 是「输入 BLF」行要显示的来源名
+        （批量才有意义；单文件行显示完整路径，故为空）。
+        """
+        self.pending = list(candidates)
+        self.pending_source = source
+        self._load_start = time.perf_counter()  # 耗时计时（_on_scan_done 记日志）
         self.load_progress.setVisible(True)
+        self.load_progress.setRange(0, 100)
         self.load_progress.setValue(0)
         self.scan_thread = QThread()
-        self.scan_worker = BlfScanWorker(path, self.scan_cancel)
+        self.scan_worker = BlfScanWorker([c.blf for c in candidates],
+                                        self.scan_cancel)
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.progress.connect(self._on_scan_progress)
@@ -494,36 +670,129 @@ class MainWindow(QMainWindow):
         self.scan_thread.start()
 
     def _cancel_scan(self):
-        """「取消」按钮：置位取消事件（worker 在 1024 对象内抛 ConversionCancelled）。"""
+        """「取消」按钮：置位取消事件（worker 在 1024 对象内抛 ConversionCancelled）。
+
+        解析与扫描共用本次导入的取消事件，故这一个按钮同时覆盖两个阶段。
+        """
         self.scan_cancel.set()
         self.btn_scan_cancel.setEnabled(False)
 
     def _set_scan_busy(self, busy: bool):
-        """扫描期间禁用文件选择与转换；转换按钮另需已加载 BLF。"""
+        """解析/扫描期间禁用文件选择与转换；转换按钮另需已就位的输入。"""
         self.btn_blf.setEnabled(not busy)
-        self.convert_btn.setEnabled(not busy and self.blf_path is not None)
+        self.convert_btn.setEnabled(not busy and self._can_convert())
         self.load_progress.setVisible(busy)
         self.btn_scan_cancel.setVisible(busy)
         self.btn_scan_cancel.setEnabled(busy)
+
+    @property
+    def _is_batch(self) -> bool:
+        """本批是否涉及多个文件（批次模式的唯一判据，阈值只此一处）。
+
+        批量下产物落位由解析期算定、输出框只读；单文件保持今天「唯一可
+        手改输入框」的地位（手改值优先）——凡按这条分岔的（输出框形态、
+        可用性判定、转换入口）都读这个属性。
+        """
+        return len(self.batch) > 1
+
+    def _can_convert(self) -> bool:
+        """可转换：输入已就位（单个 BLF 或已扫描的批次）且输出非空。
+
+        批量的输出由解析期算定、不参与判定（输出框只读）；单文件沿用
+        今天「路径 + 输出框非空」的判定。
+        """
+        if self._is_batch:
+            return True
+        return bool(self.blf_path and self.out_edit.text().strip())
 
     @Slot(float)
     def _on_scan_progress(self, percent: float):
         self.load_progress.setValue(int(percent))
 
+    @Slot(int)
+    def _on_resolve_progress(self, count: int):
+        """解析期的状态文案：遍历前不知总数，故报「已发现 N 个」（不是百分比）。
+
+        进度条此时是不确定态（setRange(0, 0)）——两种刻度各归各位，界面
+        不假装知道分母。
+        """
+        self.stage_label.setText(f"正在解析来源…已发现 {count} 个 .blf")
+
+    @Slot(object)
+    def _on_resolve_done(self, candidates: list[Candidate]):
+        """候选清单 → 勾选（> 1 个时）→ 扫描选中集。
+
+        候选只有 1 个时不弹列表、直接进入；一个都没有是「拖入的文件夹里
+        没有 .blf」——明确告知并保持原状（不是静默无反应）。
+        """
+        source = self.resolve_worker.source_label
+        self._finish_resolve()
+        if not candidates:
+            self._end_import()
+            QMessageBox.warning(self, "提示", "未找到可导入的 .blf 文件")
+            return
+        if len(candidates) == 1:
+            chosen = candidates
+        else:
+            chosen = self._choose_candidates(candidates)
+            if chosen is None:      # 勾选列表上取消 = 放弃本次导入
+                self._end_import()
+                self._log("输入BLF 已取消", status="已取消")
+                return
+        self._begin_scan(chosen, source)
+
+    @Slot()
+    def _on_resolve_cancelled(self):
+        self._end_import()
+        self._log("输入BLF 已取消", status="输入BLF 已取消")
+
+    @Slot(str)
+    def _on_resolve_error(self, msg: str):
+        self._end_import()
+        self._log(f"输入BLF 读取失败: {msg}", status="输入BLF 读取失败")
+        QMessageBox.critical(self, "BLF 读取失败", msg)
+
+    def _choose_candidates(self, candidates: list[Candidate]):
+        """弹候选勾选列表（可直接调用的接缝）；取消返回 None。"""
+        dialog = CandidateDialog(candidates, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.checked_candidates()
+
     @Slot(object)
     def _on_scan_done(self, channels: list):
+        pending = self.pending
+        source = self.pending_source  # _finish_scan 会清掉本次扫描的输入标识
         self._finish_scan()
         if not channels:
+            # 没有可用通道 = 本次导入无果：界面回到已就位状态（不提交批次）
+            self._sync_blf_row()
             QMessageBox.warning(self, "提示", "文件中未找到有效报文数据")
             return
-        path = self.scan_worker.path
-        self.blf_path = path
-        self.blf_edit.setText(path)
+        self.batch = pending
         self.blf_channels = channels
         self._rebuild_channel_table(channels, prev=self._collect_prev())
-        self._set_default_output()
+        if self._is_batch:
+            # 批量：产物落位由解析期算定，输出行只陈述「几个产物、按来源落位」
+            self.blf_path = None
+            self.batch_source = source
+            self.out_edit.setText(f"{len(pending)} 个输出文件 · 按来源落位")
+            self.out_edit.setToolTip(
+                "\n".join(str(candidate.output) for candidate in pending))
+        else:
+            # 单文件：扫描目标即输入路径（无 pending 时为测试/工具直调）
+            self.blf_path = self.scan_worker.path
+            self.out_edit.setToolTip("")
+            if pending:
+                self.out_edit.setText(str(pending[0].output))
+            else:
+                self._set_default_output()
+        self._sync_blf_row()
+        self._sync_output_mode()
         self.convert_btn.setEnabled(True)
         # 加载耗时记入日志（测试直调 _on_scan_done 时无 _load_start → 不记耗时）
+        path = f"{len(pending)} 个文件" if self._is_batch \
+            else self.scan_worker.path
         t0 = getattr(self, "_load_start", None)
         if t0 is not None:
             elapsed = time.perf_counter() - t0
@@ -532,19 +801,37 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"输入BLF 完成: {path}", status="输入BLF 完成")
 
-    @Slot(str)
-    def _on_scan_error(self, msg: str):
-        self._finish_scan()
+    @Slot(str, str)
+    def _on_scan_error(self, path: str, msg: str):
+        self._end_import()
         self._log(f"输入BLF 读取失败: {msg}", status="输入BLF 读取失败")
-        QMessageBox.critical(self, "BLF 读取失败",
-                             f"{self.scan_worker.path}\n{msg}")
+        QMessageBox.critical(self, "BLF 读取失败", f"{path}\n{msg}")
 
     @Slot()
     def _on_scan_cancelled(self):
         """取消：复位界面但**不应用**结果（blf_path 保持原值——
         无文件保持 None，替换文件保持旧文件）。"""
-        self._finish_scan()
+        self._end_import()
         self._log("输入BLF 已取消", status="输入BLF 已取消")
+
+    def _end_import(self):
+        """本次导入的失败/取消收口：停解析与扫描线程、输入行回到当前已就位
+        的输入（本批次或空），再由调用方记日志或弹窗。
+
+        解析与扫描是接力的一段，任一环节的收尾都是这三步——只写一处，
+        免得漏掉一环（漏了就把界面留在忙碌态）。成功路径不走这里：它由
+        _on_scan_done 提交批次。"""
+        self._finish_resolve()
+        self._finish_scan()
+        self._sync_blf_row()
+
+    def _finish_resolve(self):
+        thread = self.resolve_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            self.resolve_thread = None
+            self.stage_label.setText("就绪")  # 解析期占用的状态文案归还
 
     def _finish_scan(self):
         thread = self.scan_thread
@@ -552,8 +839,34 @@ class MainWindow(QMainWindow):
             thread.quit()
             thread.wait()
             self.scan_thread = None
+        self.pending = []       # 本次扫描的输入已定论，不再留用
+        self.pending_source = ""
+        self.load_progress.setRange(0, 100)     # 解析期的不确定态在此复原
         self.load_progress.setValue(0)
         self._set_scan_busy(False)  # 隐藏 load_progress、恢复按钮
+
+    def _sync_blf_row(self):
+        """「输入 BLF」行 = 当前已就位的输入：单文件路径 / 批量来源与文件数 / 空。"""
+        if self.blf_path:
+            self.blf_edit.setText(self.blf_path)
+            self.blf_edit.setToolTip("")
+        elif self.batch:
+            self.blf_edit.setText(
+                f"{len(self.batch)} 个文件 · 来自 {self.batch_source}")
+            self.blf_edit.setToolTip(
+                "\n".join(str(candidate.blf) for candidate in self.batch))
+        else:
+            self.blf_edit.setText("")
+            self.blf_edit.setToolTip("")
+
+    def _sync_output_mode(self):
+        """批量的产物落位由解析期算定：输出框只读、「浏览…」禁用。
+
+        忙碌态由 _set_busy 全量禁用；本方法只管静止态——否则转换结束时的
+        解锁会把批量的只读输出又放开。
+        """
+        self.out_edit.setReadOnly(self._is_batch)
+        self.btn_out.setEnabled(not self._is_batch)
 
     def _set_default_output(self):
         """默认输出路径：与 BLF 同目录，文件名追加 _t（run001.blf
@@ -781,6 +1094,9 @@ class MainWindow(QMainWindow):
 
     # ---- 转换 ----
     def _start_convert(self):
+        if self._is_batch:
+            self._start_batch_convert()
+            return
         if not self.blf_path:
             return
         out = self.out_edit.text().strip()
@@ -792,11 +1108,7 @@ class MainWindow(QMainWindow):
                 self, "覆盖确认", f"输出文件已存在：\n{out}\n\n是否覆盖？")
             if ans != QMessageBox.StandardButton.Yes:
                 return
-        bindings = {}
-        for r in range(self.table.rowCount()):
-            ch = int(self.table.item(r, 0).text().split()[-1])
-            # userData = DbcDef；UNBOUND 项无 userData → None（零查找、零反查表）
-            bindings[ch] = self.table.cellWidget(r, 1).currentData()
+        bindings = self._collect_bindings()
         self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
         self._set_busy(True)
         self.progress.setValue(0)
@@ -811,6 +1123,49 @@ class MainWindow(QMainWindow):
         self.worker.cancelled.connect(self._on_convert_cancelled)
         self.worker.error.connect(self._on_error)
         self.worker_thread.start()
+
+    def _start_batch_convert(self):
+        """批量转换：整批交给 core.batch.run_batch（界面不自建转换循环）。
+
+        覆盖检查一次做完（对齐单文件那次「输出文件已存在」询问，不是 N 个
+        弹窗）；产物落位用解析期算定的输出路径，界面的输出框不参与。
+        """
+        existing = [c for c in self.batch if c.output.exists()]
+        if existing:
+            listed = "\n".join(str(c.output) for c in existing[:5])
+            if len(existing) > 5:
+                listed += f"\n… 共 {len(existing)} 个"
+            ans = QMessageBox.question(
+                self, "覆盖确认",
+                f"{len(existing)} 个输出文件已存在：\n{listed}\n\n是否全部覆盖？")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        bindings = self._collect_bindings()
+        self.convert_cancel = threading.Event()  # 每次转换重建（取消即作废本次）
+        self._set_busy(True)
+        self.progress.setValue(0)
+        self.summary_status.setText("批量转换中…")
+        self.worker_thread = QThread()
+        self.worker = BatchConvertWorker(list(self.batch), bindings,
+                                        self.convert_cancel)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(self._on_batch_done)
+        self.worker.cancelled.connect(self._on_batch_cancelled)
+        self.worker.error.connect(self._on_error)
+        self.worker_thread.start()
+
+    def _collect_bindings(self) -> dict[int, DbcDef | None]:
+        """绑定表 → {通道: DbcDef | None}（零查找、零反查表）。
+
+        userData = DbcDef；UNBOUND 项无 userData → None。
+        """
+        bindings = {}
+        for r in range(self.table.rowCount()):
+            ch = int(self.table.item(r, 0).text().split()[-1])
+            bindings[ch] = self.table.cellWidget(r, 1).currentData()
+        return bindings
 
     def _cancel_convert(self):
         """「取消」按钮：置位取消事件（worker 在 1024 帧/每桶内抛
@@ -836,8 +1191,10 @@ class MainWindow(QMainWindow):
             self.out_edit,
         ):
             widget.setEnabled(not busy)
-        can_convert = bool(self.blf_path and self.out_edit.text().strip())
-        self.convert_btn.setEnabled(not busy and can_convert)
+        self.convert_btn.setEnabled(not busy and self._can_convert())
+        # 解锁后回到本批次的静止态：批量下输出框仍只读、「浏览…」仍禁用
+        if not busy:
+            self._sync_output_mode()
         self.btn_convert_cancel.setVisible(busy)
         self.btn_convert_cancel.setEnabled(busy)
 
@@ -845,6 +1202,56 @@ class MainWindow(QMainWindow):
     def _on_progress(self, stage: str, percent: float):
         self.stage_label.setText(stage)
         self.progress.setValue(int(percent))
+
+    @Slot(object)
+    def _on_batch_done(self, result: BatchResult):
+        """批次结局：全成功弹「N 个 blf 文件全部转换完成」，部分失败报数并点名。
+
+        逐文件结局（成功记耗时、失败记原因）都进日志——批量下这是唯一能
+        还原「哪个文件怎么了」的地方。失败后**不**回滚已完成的产物（core
+        契约：单个文件失败不中断批次）。
+        """
+        self._finish()
+        lines = []
+        for outcome in result.outcomes:
+            if outcome.ok:
+                lines.append(f"{outcome.candidate.display}: 完成 (总耗时 "
+                             f"{_total_seconds(outcome.result):.1f} s)")
+            else:
+                lines.append(f"{outcome.candidate.display}: 失败 — "
+                             f"{outcome.error}")
+        total = len(result.outcomes)
+        elapsed = sum(_total_seconds(o.result) for o in result.outcomes if o.ok)
+        if result.all_succeeded:
+            status = f"批量转换完成 · {total} 个文件 · 总耗时 {elapsed:.1f} s"
+            notice = f"{total} 个 blf 文件全部转换完成"
+        else:
+            failed = result.failures
+            status = (f"批量转换完成 · {total - len(failed)} 成功 / "
+                      f"{len(failed)} 失败 · 总耗时 {elapsed:.1f} s")
+            notice = (f"{total} 个 blf 文件转换成功 {total - len(failed)} 个，"
+                      f"失败 {len(failed)} 个\n失败文件：\n"
+                      + "\n".join(f"{outcome.candidate.display} — "
+                                  f"{outcome.error}" for outcome in failed))
+        self._log("批量转换完成\n" + "\n".join(lines), status=status)
+        box = QMessageBox(QMessageBox.Icon.Information, "提示", notice,
+                          QMessageBox.StandardButton.Ok, self)
+        box.button(QMessageBox.StandardButton.Ok).setText("确定")
+        box.exec()
+
+    @Slot()
+    def _on_batch_cancelled(self, outcomes: list):
+        """批量取消：已完成文件的产物保留（core 契约），界面据实说明。
+
+        不写「已完成的 X / N 个产物保留」以外的话——取消不是失败，界面
+        不复述 core 的清理细节（见 CONTEXT.md「取消信号」）。
+        """
+        self._finish()
+        kept = [outcome for outcome in outcomes if outcome.ok]
+        text = "转换已取消"
+        if kept:
+            text += f"（已完成的 {len(kept)} 个文件产物保留）"
+        self._log(text, status="已取消")
 
     @Slot(object)
     def _on_done(self, result: ConversionResult):
@@ -858,9 +1265,7 @@ class MainWindow(QMainWindow):
         detail = self._format_summary(result)
         if detail:
             body += "\n转换摘要:\n" + detail
-        # 状态行：墙钟总耗时为主；无 timings（测试构造/旧调用方）兜底数据时长
-        total = next((t for label, t in result.timings if label == "总耗时"),
-                     result.duration_seconds)
+        total = _total_seconds(result)
         warning_count = len(result.warnings) + \
             sum(bool(s.warning) for s in result.summaries)
         status = f"转换完成 · 总耗时 {total:.1f} s"
@@ -966,6 +1371,13 @@ class MainWindow(QMainWindow):
             self._sync_window_shape()
 
     def closeEvent(self, event):
+        thread = self.resolve_thread
+        if thread is not None and thread.isRunning():
+            # 同上：先置位取消事件，解析在目录/候选检查点快速返回
+            self.scan_cancel.set()
+            thread.quit()
+            thread.wait()
+            self.resolve_thread = None
         thread = self.scan_thread
         if thread is not None and thread.isRunning():
             # 先置位取消事件：probe 在 1024 对象内抛 ConversionCancelled 快速返回，

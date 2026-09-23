@@ -97,6 +97,11 @@ QLabel#dialogHeading {
     font-size: 17px;
     font-weight: 600;
 }
+QLabel#dialogHint {
+    color: #64676d;
+    font-size: 12px;
+    background: transparent;
+}
 QPlainTextEdit#summaryView {
     background: #f4f5f6;
     border: 1px solid rgba(32, 35, 40, 28);
@@ -200,6 +205,22 @@ QListWidget#dbcList::item {
 QListWidget#dbcList::item:selected,
 QListWidget#dbcList::item:hover {
     background: #ffffff;
+}
+QListWidget#candidateList {
+    background: #ffffff;
+    border: 1px solid rgba(32, 35, 40, 28);
+    border-radius: 9px;
+    padding: 4px;
+    outline: 0;
+}
+QListWidget#candidateList::item {
+    padding: 3px 6px;
+    border-radius: 6px;
+}
+QListWidget#candidateList::item:hover { background: #f4f5f6; }
+QListWidget#candidateList::item:selected {
+    background: #e8f2fd;
+    color: #1c1d20;
 }
 QTableWidget#channelTable::item {
     background: #ffffff;
