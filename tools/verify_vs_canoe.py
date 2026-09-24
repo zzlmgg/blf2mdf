@@ -15,12 +15,21 @@
 用法：
     python tools/verify_vs_canoe.py [--skip-convert] [--outdir outputs/verify_canoe]
 
---skip-convert：复用 --outdir 下各样例最新的 cmp_*_<项目>.mdf，不重新转换。
+样本从仓库根 canoe_golden/ 发现，不写死 BLF/MDF 路径：
+    canoe_golden/<平台>/<项目>/<BLF 主文件名>/source.blf
+    canoe_golden/<平台>/<项目>/<BLF 主文件名>/canoe.mdf
+平台名对应 DBC 根 inputs/dbc_<平台>（及其中 dbc_对应关系.txt）；项目名即
+load_project 的项目文件夹。空平台不产生样本；样本目录缺 source.blf 或
+canoe.mdf 则本次运行失败。
+
+--skip-convert：复用 --outdir 下各样例最新的
+cmp_<时间戳>_<平台>_<项目>_<样本>.mdf，不重新转换。
 转换产物与报告均写入 --outdir（默认 outputs/verify_canoe/，用户按需管理）。
 """
 import argparse
 import contextlib
 import multiprocessing
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,35 +41,70 @@ from core import blf_reader, converter, project_loader
 from gui.binding import decide_bindings
 from tools.mdf_compare import KNOWN_DIFF_PREFIX, compare_files_reference
 
-CCU3 = ROOT / "inputs/dbc_ccu3.0"
+GOLDEN_ROOT = ROOT / "canoe_golden"
+_SOURCE_NAME = "source.blf"
+_CANOE_NAME = "canoe.mdf"
 # CANoe 参考统计布局（22 项/通道，10 项统计名的组内偏移；probe 实测）
 _STATS_IDX = "StdData:4,StdDataRate:5,ExtData:6,ExtDataRate:7," \
              "StdRemote:8,StdRemoteRate:9,ExtRemote:10,ExtRemoteRate:11," \
              "ErrorFrames:12,ErrorFrameRate:13"
+_TS_RE = re.compile(r"\d{8}_\d{6}")
 
-SAMPLES = [
-    ("A19G1",
-     ROOT / "inputs/blf/A19G1_ACFCAN_00112_20260614_141114.blf",
-     ROOT / "inputs/mdf_canoe/A19G1.mdf"),
-    # A02Y：2026-09-20 CANape 值表信号显示 bug 的原始样例（DCU_HvilSt/VCU_HvilSt），
-    # 纳入固定门防止该类存储形态回归
-    ("A02Y",
-     ROOT / "inputs/blf/A02Y_ACFCANPUB_20260917_221900_59655158-"
-            "ACFCANPUB_20260917_222500_59655170.blf",
-     ROOT / "inputs/mdf_canoe/A02Y.mdf"),
-    ("AHT",
-     ROOT / "inputs/blf/AHT_ACFCANPUB_20260317_210430_59125089-"
-            "ACFCAN_20260317_210930_59125099.blf",
-     ROOT / "inputs/mdf_canoe/AHT.mdf"),
-    # A66T：16 路 CAN 大 BLF（统计 16×22 组），20260917 采集；唯一覆盖「断电→
-    # 上电」全程的样例——391.5s 记录空洞（11 路 CAN + LIN 同时停、两路常电 ECU
-    # 多活 65.7s、13 路瞬时满速率恢复），信号值/时间戳仍逐位一致。该样例统计
-    # t 轴按自产轴契约验收（CANoe 在空洞处重启 1s 网格、长度必然不等，见 README）
-    ("A66T",
-     ROOT / "inputs/blf/A66T_ACFCANPUB_20260917_151500_59654310-"
-            "ACFCANPUB_20260917_154000_59654360.blf",
-     ROOT / "inputs/mdf_canoe/A66T报非预期加速故障.mdf"),
-]
+
+def dbc_root(platform):
+    """平台名 → DBC 根目录（inputs/dbc_<平台>）。"""
+    return ROOT / "inputs" / f"dbc_{platform}"
+
+
+def discover_samples(golden_root=GOLDEN_ROOT):
+    """枚举 canoe_golden/<平台>/<项目>/<样本>/ 下成对的 source.blf 与 canoe.mdf。
+
+    返回 [(platform, project, sample, blf, canoe), ...]，按三层目录名排序。
+    空平台（无项目或项目下无样本目录）不产生条目。第三层目录缺任一固定文件
+    则抛出 FileNotFoundError，不跳过、不返回部分结果。
+    """
+    golden_root = Path(golden_root)
+    if not golden_root.is_dir():
+        raise FileNotFoundError(f"CANoe 金样本根不存在: {golden_root}")
+    samples = []
+    missing = []
+    for platform_dir in sorted(p for p in golden_root.iterdir() if p.is_dir()):
+        for project_dir in sorted(p for p in platform_dir.iterdir() if p.is_dir()):
+            for sample_dir in sorted(p for p in project_dir.iterdir() if p.is_dir()):
+                blf = sample_dir / _SOURCE_NAME
+                canoe = sample_dir / _CANOE_NAME
+                absent = [name for name, path in
+                          ((_SOURCE_NAME, blf), (_CANOE_NAME, canoe))
+                          if not path.is_file()]
+                if absent:
+                    rel = sample_dir.relative_to(golden_root)
+                    missing.append(f"{rel} 缺 {', '.join(absent)}")
+                    continue
+                samples.append((
+                    platform_dir.name, project_dir.name, sample_dir.name, blf, canoe,
+                ))
+    if missing:
+        raise FileNotFoundError(
+            "CANoe 金样本目录不完整，拒绝跳过:\n" + "\n".join(missing))
+    return samples
+
+
+SAMPLES = discover_samples()
+
+
+def artifact_filename(ts, platform, project, sample):
+    """产物名：时间戳 + 平台 + 项目 + 样本目录名，避免同项目多 BLF 撞名。"""
+    return f"cmp_{ts}_{platform}_{project}_{sample}.mdf"
+
+
+def latest_artifact(outdir, platform, project, sample):
+    """按产物名精确匹配该样本最新的 cmp_<YYYYMMDD_HHMMSS>_….mdf。"""
+    pattern = re.compile(
+        rf"^cmp_{_TS_RE.pattern}_{re.escape(platform)}_{re.escape(project)}_"
+        rf"{re.escape(sample)}\.mdf$")
+    hits = [p for p in Path(outdir).glob("cmp_*.mdf") if pattern.fullmatch(p.name)]
+    hits.sort(key=lambda p: p.stat().st_mtime)
+    return hits[-1] if hits else None
 
 _HARD_STATS_PREFIX = "统计 t 轴:"  # stats 维度中属硬门的行前缀
 
@@ -98,15 +142,11 @@ def _stats_layout():
     return 22, offsets
 
 
-def _latest_artifact(outdir, project):
-    hits = sorted(outdir.glob(f"cmp_*_{project}.mdf"), key=lambda p: p.stat().st_mtime)
-    return hits[-1] if hits else None
-
-
-def convert_one(project, blf, out):
+def convert_one(platform, project, blf, out):
     """无头同参链路：与 GUI ConvertWorker.run 逐参一致（raw_export=False, parallel=True）。"""
-    dbcs = project_loader.load_project(CCU3, project)
-    mapping = project_loader.load_mapping(CCU3 / "dbc_对应关系.txt")
+    root = dbc_root(platform)
+    dbcs = project_loader.load_project(root, project)
+    mapping = project_loader.load_mapping(root / "dbc_对应关系.txt")
     auto = project_loader.auto_bindings(dbcs, mapping)
     channels = blf_reader.probe_channels(str(blf))
     rows = decide_bindings(channels, auto, None, [d.path for d in dbcs])
@@ -139,17 +179,19 @@ def compare_one(ours, canoe):
     return meta, val, stat_t, stat_rest
 
 
-def run_sample(project, blf, canoe, outdir, skip_convert, ts):
+def run_sample(platform, project, sample, blf, canoe, outdir, skip_convert, ts):
+    label = f"{platform}/{project}/{sample}"
     if skip_convert:
-        ours = _latest_artifact(outdir, project)
+        ours = latest_artifact(outdir, platform, project, sample)
         if ours is None:
-            print(f"  [SKIP] --skip-convert 但 {outdir} 下无 cmp_*_{project}.mdf，跳过")
+            expect = artifact_filename("<时间戳>", platform, project, sample)
+            print(f"  [SKIP] --skip-convert 但 {outdir} 下无 {expect}，跳过")
             return None
-        print(f"== {project} ==（复用产物 {ours.name}）")
+        print(f"== {label} ==（复用产物 {ours.name}）")
     else:
-        ours = outdir / f"cmp_{ts}_{project}.mdf"
-        print(f"== {project} ==（转换中…）")
-        convert_one(project, blf, ours)
+        ours = outdir / artifact_filename(ts, platform, project, sample)
+        print(f"== {label} ==（转换中…）")
+        convert_one(platform, project, blf, ours)
         print(f"  产物: {ours}")
 
     meta, val, stat_t, stat_rest = compare_one(ours, canoe)
@@ -179,13 +221,13 @@ def run_sample(project, blf, canoe, outdir, skip_convert, ts):
     if len(stat_rest) > 5:
         print(f"      …（其余 {len(stat_rest) - 5} 条见报告文件）")
     print()
-    return (project, ours, canoe, meta, val, stat_t, stat_rest)
+    return (label, ours, canoe, meta, val, stat_t, stat_rest)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="CANoe 参考质量校验（转换+全量对比+需求线判定）")
     p.add_argument("--skip-convert", action="store_true",
-                   help="复用 --outdir 下最新产物，不重新转换")
+                   help="复用 --outdir 下各样本最新产物，不重新转换")
     p.add_argument("--outdir", default="outputs/verify_canoe",
                    help="转换产物与报告目录（默认 outputs/verify_canoe）")
     args = p.parse_args(argv)
@@ -203,12 +245,13 @@ def main(argv=None):
         tee = _Tee(sys.stdout, fp)
         with contextlib.redirect_stdout(tee):
             fails = []
-            for project, blf, canoe in SAMPLES:
-                res = run_sample(project, blf, canoe, outdir, args.skip_convert, ts)
+            for platform, project, sample, blf, canoe in SAMPLES:
+                res = run_sample(platform, project, sample, blf, canoe,
+                                 outdir, args.skip_convert, ts)
                 if res is None:
                     continue
-                _, ours, canoe, meta, val, stat_t, stat_rest = res
-                fp.write(f"\n--- {project} 报告层明细 ---\n")
+                label, ours, canoe, meta, val, stat_t, stat_rest = res
+                fp.write(f"\n--- {label} 报告层明细 ---\n")
                 for d in meta:
                     fp.write(f"- {d}\n")
                 for d in stat_rest:
@@ -217,7 +260,7 @@ def main(argv=None):
                     fp.write("（无）\n")
                 if not val and not stat_t:
                     continue
-                fails.append(project)
+                fails.append(label)
             print(f"=== 汇总: 硬门失败 {'/'.join(fails) if fails else '无'}，"
                   f"退出码 {'1' if fails else '0'} ===")
     print(f"[报告已写入] {report}")

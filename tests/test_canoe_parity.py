@@ -10,23 +10,20 @@ from pathlib import Path
 
 import pytest
 
-from tools.verify_vs_canoe import SAMPLES, compare_one
+from tools.verify_vs_canoe import SAMPLES, artifact_filename, compare_one, latest_artifact
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTDIR = ROOT / "outputs/verify_canoe"
 
 
-def _latest(project):
-    hits = sorted(OUTDIR.glob(f"cmp_*_{project}.mdf"), key=lambda p: p.stat().st_mtime)
-    return hits[-1] if hits else None
-
-
-@pytest.mark.parametrize("project, blf, canoe", SAMPLES)
-def test_canoe_parity_hard_gate(project, blf, canoe):
-    ours = _latest(project)
+@pytest.mark.parametrize("platform, project, sample, blf, canoe", SAMPLES)
+def test_canoe_parity_hard_gate(platform, project, sample, blf, canoe):
+    ours = latest_artifact(OUTDIR, platform, project, sample)
     if ours is None:
-        pytest.skip(f"{OUTDIR} 下无 cmp_*_{project}.mdf，先运行 "
+        expect = artifact_filename("<时间戳>", platform, project, sample)
+        pytest.skip(f"{OUTDIR} 下无 {expect}，先运行 "
                     f"python tools/verify_vs_canoe.py 转换")
+    label = f"{platform}/{project}/{sample}"
     _, val, stat_t, _ = compare_one(ours, canoe)
-    assert not val, f"{project}: 信号值/时间戳 {len(val)} 处差异:\n" + "\n".join(val)
-    assert not stat_t, f"{project}: 统计组 t 轴 {len(stat_t)} 处差异:\n" + "\n".join(stat_t)
+    assert not val, f"{label}: 信号值/时间戳 {len(val)} 处差异:\n" + "\n".join(val)
+    assert not stat_t, f"{label}: 统计组 t 轴 {len(stat_t)} 处差异:\n" + "\n".join(stat_t)
