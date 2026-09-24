@@ -35,9 +35,9 @@ PySide6/QSS 的紧凑 Windows 桌面面板：
 时间基准与 CANoe 逐位一致：时间通道 `t` 为**相对时间**，帧时间戳按**整数 ns
 构造**（BLF 头 SYSTEMTIME 毫秒整数 + 对象头相对整数，`× 1e-9` 一次舍入，与
 CANoe t 轴同构）；t 轴零点 = 测量开始的**整数秒**，头部 `start_time`/
-`abs_time` 保留 SYSTEMTIME 毫秒小数，两者相加可得绝对时间戳。经 A19G1 /
-AHT 两份参考文件全量对比，信号时间戳与值均与 CANoe **逐位一致**（704 +
-925 信号，见 `docs/2026-08-13-mdf-canoe-comparison-v4.md`）。
+`abs_time` 保留 SYSTEMTIME 毫秒小数，两者相加可得绝对时间戳。自动化验收见
+下文 **Golden 测试守卫**（`canoe_golden/` + `pytest -m golden`）；历史对拍记录见
+`docs/2026-08-13-mdf-canoe-comparison-v4.md`。
 
 输出包含与 CANoe 一致的 `1s` 总线统计组（默认开启，10 项 × 全部 16 个通道：
 StdData/ExtData/StdRemote/ExtRemote/ErrorFrames 及各自 Rate，逐秒聚合，
@@ -52,9 +52,9 @@ ChipState 等）未实现；非毫秒网格记录（如 A19G1）的统计计数�
 的**采样时刻**与 CANoe 不同相位——CANoe 在空洞处重启 1s 网格（洞内不出点、洞后
 按洞后首帧重新对齐，A66T 洞后相位差 188ms），本工具按整段连续 1s 网格出点、洞内
 如实输出 0（静默期速率为 0）。同一时刻的计数一致，**客户关心的信号与信号时间轴
-不受影响**（A66T 5,332,820 个对象全量逐位一致）。固定门对该类样例按自产轴契约
-验收（前段一致 + 末点一致 + 网格自洽），已知差异以 `已知差异: ` 前缀落报告层，
-见 `tools/mdf_compare.py`。
+不受影响**（A66T 5,332,820 个对象全量逐位一致）。golden 硬门对该类样例按
+自产轴契约验收（前段一致 + 末点一致 + 网格自洽），已知差异以 `已知差异: `
+前缀落报告层，见 `tools/mdf_compare.py`。
 
 ## 打包发布
 
@@ -122,5 +122,74 @@ ICU（33MB，System32 自带）；不装 UPX 是因为 onefile 内置 zlib 压�
 ## 开发
 
 依赖：`pip install -r requirements.txt`（Python 3.12，conda 环境 blfmdf）
-测试：`C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest`
-金标准对比：`C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest -m golden`
+
+### 测试
+
+```powershell
+# 全量（含 golden，约 2 分钟）
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest
+
+# 日常开发：跳过 golden
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest -m "not golden"
+
+# 仅 golden
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest -m golden
+
+# golden 并显示转换过程打印
+C:\ProgramData\Anaconda3\envs\blfmdf\python.exe -m pytest -m golden -s
+```
+
+`outputs/` 在 `.gitignore` 中，不入库；GUI 与手工转换的落盘目录，可整目录删除。
+
+### Golden 测试守卫（`pytest -m golden`）
+
+实现：`tests/test_canoe_parity.py`（对拍逻辑复用 `tools/verify_vs_canoe.compare_one`，
+不复制判定代码）。每条用例**现场**把 `source.blf` 转成 mdf，再与同目录
+`canoe.mdf` 对比；断言通过后删除本次写出的 mdf，不在 `outputs/verify_canoe/`
+堆积。手工验收脚本 `tools/verify_vs_canoe.py` 仍可用于生成保留产物与
+Markdown 报告（`--skip-convert` 复用 `--outdir` 下最新 `cmp_*.mdf`）。
+
+**金样本目录**（`canoe_golden/`，不入库，需本地自备）：
+
+```
+canoe_golden/
+└── <平台>/                    # 如 ccu3.0 → inputs/dbc_ccu3.0
+    └── <项目>/                # load_project 的项目文件夹名，如 A19G1
+        └── <BLF 主文件名>/    # 样本目录名
+            ├── source.blf     # 原始采集
+            └── canoe.mdf      # CANoe 转换参考（权威对照）
+```
+
+空平台（如 `ccu4.0`）不产生用例；任一样本目录缺 `source.blf` 或 `canoe.mdf`
+则收集/运行失败。
+
+**当前样本（4 条，均在 ccu3.0）**
+
+| 项目 | 样本目录（BLF 主文件名） | 说明 |
+|------|---------------------------|------|
+| A19G1 | `A19G1_ACFCAN_00112_20260614_141114` | 基准样例 |
+| A02Y | `A02Y_ACFCANPUB_20260917_221900_59655158-ACFCANPUB_20260917_222500_59655170` | CANape 值表信号存储形态回归 |
+| A66T | `A66T_ACFCANPUB_20260917_151500_59654310-ACFCANPUB_20260917_154000_59654360` | 16 路 CAN 大文件；含 391.5s 记录空洞，统计 t 轴按自产轴契约验收 |
+| AHT | `AHT_ACFCANPUB_20260317_210430_59125089-ACFCAN_20260317_210930_59125099` | 大文件性能样例 |
+
+**硬门（全部通过才算 PASS）**
+
+- 解码信号值：`isclose`（atol=1e-6，rtol=1e-6，`equal_nan=True`）
+- 解码信号时间戳：逐位一致
+- `1s` 统计组 t 轴：沿用 `tools/mdf_compare.py` 规则（含 A66T 记录空洞的自产轴契约）
+
+文件头、组序、存储形态、统计逐点计数等仅进报告层，**不**决定 golden 成败。
+
+**性能门（整段墙钟）**
+
+转换路径与 GUI 一致（`convert_one`：按平台加载 DBC、`raw_export=False`、
+`parallel=True`、`stats_export=True`）。上限 = 登记墙钟 + `min(2s, 登记墙钟的 10%)`
+（登记值见 `tests/test_canoe_parity.py` 的 `_WALL_S`）。超时失败时 pytest 报
+实际秒数与上限。
+
+| 样本 | 登记墙钟 | 上限 |
+|------|---------:|-----:|
+| A19G1 | 5.01 s | 5.51 s |
+| A02Y | 5.64 s | 6.20 s |
+| A66T | 13.76 s | 15.14 s |
+| AHT | 15.15 s | 16.67 s |
