@@ -322,6 +322,7 @@ def test_busy_state_locks_mutating_controls(window):
         window.btn_add_dbc,
         window.ccu_combo,
         window.project_combo,
+        window.device_combo,
         window.dbc_list_widget,
         window.table,
         window.btn_out,
@@ -334,6 +335,7 @@ def test_busy_state_locks_mutating_controls(window):
     assert window.btn_blf.isEnabled()
     assert window.btn_add_dbc.isEnabled()
     assert window.project_combo.isEnabled()
+    assert window.device_combo.isEnabled()
     assert window.table.isEnabled()
     assert window.btn_out.isEnabled()
     assert window.out_edit.isEnabled()

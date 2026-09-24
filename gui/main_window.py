@@ -486,6 +486,7 @@ class MainWindow(QMainWindow):
         for name in project_loader.DEVICE_PROFILES:
             self.device_combo.addItem(name)
         self.device_combo.setCurrentText(project_loader.DEFAULT_DEVICE_PROFILE)
+        self.device_combo.currentTextChanged.connect(self._on_device_changed)
         channel_header.addWidget(self.device_combo)
         channel_header.addStretch(1)
         self.channel_count_label = QLabel("0 路")
@@ -736,8 +737,9 @@ class MainWindow(QMainWindow):
         self.btn_scan_cancel.setEnabled(False)
 
     def _set_scan_busy(self, busy: bool):
-        """解析/扫描期间禁用文件选择与转换；转换按钮另需已就位的输入。"""
+        """解析/扫描期间禁用文件选择、设备档与转换；转换按钮另需已就位的输入。"""
         self.btn_blf.setEnabled(not busy)
+        self.device_combo.setEnabled(not busy)
         self.convert_btn.setEnabled(not busy and self._can_convert())
         self.load_progress.setVisible(busy)
         self.btn_scan_cancel.setVisible(busy)
@@ -849,15 +851,17 @@ class MainWindow(QMainWindow):
     def _confirm_shared_config(self, count: int) -> bool:
         """共用配置提示（可直接调用的接缝）：继续 → True，返回勾选列表 → False。
 
-        实际参与批量的文件 > 1 个时才弹：这一批只配一次平台（CCU 版本）/项目/
-        CAN-DBC 匹配、切换会同时作用于全部文件；某个文件中不存在的通道不导出，
+        实际参与批量的文件 > 1 个时才弹：这一批只配一次设备映射 / 平台（CCU 版本）/
+        项目 / CAN-DBC 匹配、切换会同时作用于全部文件；某个文件中不存在的通道不导出，
         该文件的产物相应少几组信号（正常情况，不是错误）。没点「继续」一律
         按返回处理——提示期未触碰任何配置，回去的代价为零。
         """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
         box.setWindowTitle("共用一套配置")
-        box.setText(f"本批 {count} 个文件将共用同一套平台 / 项目 / CAN-DBC 匹配。")
+        box.setText(
+            f"本批 {count} 个文件将共用同一套设备映射 / 平台 / 项目 / CAN-DBC 匹配。"
+        )
         box.setInformativeText(
             "这一套配置只配一次，切换会同时作用于全部文件。\n"
             "某个文件中不存在的通道不会被导出，该文件的输出会相应少几组信号。")
@@ -1170,6 +1174,20 @@ class MainWindow(QMainWindow):
         self._rebuild_channel_table(self.blf_channels,
                                     prev=self._collect_prev())
 
+    def _on_device_changed(self, name: str):
+        """切换设备映射档：替换当前表；已加载 DBC 时按新表重算建议并整表重画。
+
+        DBC 列表为空时只记住当前档，不凭空长出映射行。换档与重选项目一样
+        以「无上次选择」重建，丢掉上一档的手工改动。
+        """
+        if not name:
+            return
+        self.mapping = project_loader.mapping_for_profile(name, CCU3_MAPPING_FILE)
+        if not self.dbc_list:
+            return
+        self.auto_bind = project_loader.auto_bindings(self.dbc_list, self.mapping)
+        self._rebuild_channel_table(self.blf_channels, prev=None)
+
     def _select_project(self, name: str):
         """选择 ccu3.0 项目：读入该项目全部 DBC（替换现有列表）→ 按映射自动匹配。
 
@@ -1323,6 +1341,7 @@ class MainWindow(QMainWindow):
             self.btn_add_dbc,
             self.ccu_combo,
             self.project_combo,
+            self.device_combo,
             self.dbc_list_widget,
             self.table,
             self.btn_out,

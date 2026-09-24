@@ -24,6 +24,7 @@ Status: ready-for-agent
 ## Decisions so far
 
 - [01](issues/01-xingyuan-default-profile.md)：取表入口 `mapping_for_profile` + 界面默认「星源」下拉；星源文件优先/回退与今天一致，VCUDebug 进列表不自动绑。
+- [02](issues/02-switch-to-xierta.md)：设备下拉切换希尔塔整表重画（含 VCUDebug→11），空 DBC 只记档；批次提示与忙碌态纳入设备映射。
 ## Not yet specified
 
 ## Out of scope

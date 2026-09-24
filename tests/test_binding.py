@@ -85,6 +85,38 @@ def test_decide_bindings_project_switch_drops_stale_row():
     assert [r.channel for r in rows] == [1]
 
 
+def test_decide_bindings_profile_switch_to_xierta_redraws_rows():
+    """换档 = 新自动建议 + 无上次选择：星源专属空行消失，希尔塔新通道以无数据出现。
+
+    BLF 只有通道 1；星源建议含 3/12/13/15；希尔塔建议含 2/4/5/7/14；
+    通道 11 从 ZFCANT 改绑到 VCUDebug。
+    """
+    zfcant = r"E:\A02\ZFCANT.dbc"
+    vcudbg = r"E:\A02\VCUDebug.dbc"
+    cfcan2 = r"E:\A02\CFCAN2.dbc"
+    paths = [PFCAN1, cfcan2, zfcant, vcudbg, PFCAN2]
+    xingyuan_auto = {
+        1: PFCAN1, 3: cfcan2, 11: zfcant, 12: PFCAN1,
+        13: PFCAN1, 15: PFCAN2,
+    }
+    rows = decide_bindings([1], xingyuan_auto, None, paths)
+    assert {r.channel for r in rows} >= {1, 3, 11, 12, 13, 15}
+    assert next(r for r in rows if r.channel == 11).binding == zfcant
+
+    xierta_auto = {
+        1: cfcan2, 2: PFCAN1, 4: PFCAN1, 5: PFCAN1,
+        7: PFCAN1, 11: vcudbg, 14: PFCAN2,
+    }
+    rows = decide_bindings([1], xierta_auto, None, paths)  # prev=None = 换档
+    chans = {r.channel: r for r in rows}
+    assert 3 not in chans and 12 not in chans and 13 not in chans and 15 not in chans
+    for ch in (2, 4, 5, 7, 14):
+        assert chans[ch].state == STATE_NO_DATA
+    assert chans[11].binding == vcudbg
+    assert chans[1].binding == cfcan2
+    assert chans[1].state == STATE_BOUND
+
+
 def test_decide_bindings_prev_wins_over_auto():
     """项目已选 + 用户微调 + 添加 DBC：prev（用户微调）优先于 auto 建议
     （现状 keep_prev=True 语义：auto 参数仅在选项目时传且此时 prev 为空）。"""

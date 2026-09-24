@@ -250,3 +250,70 @@ def test_mapping_for_profile_default_is_xingyuan():
     assert project_loader.mapping_for_profile(
         project_loader.DEFAULT_DEVICE_PROFILE
     ) == EXPECTED_MAPPING
+
+
+# 规格希尔塔表（独立字面量锚，不引用实现常量）
+EXPECTED_XIERTA_MAPPING = {
+    "CFCAN2": 1,
+    "CFCAN3": 2,
+    "PFCAN1": 4,
+    "IFCAN": 5,
+    "ZFCANT": 6,
+    "ZFCANL": 7,
+    "ZFCANF": 8,
+    "CFCAN1": 9,
+    "ZFCANR": 10,
+    "VCUDebug": 11,
+    "PFCAN2": 14,
+}
+
+
+def test_mapping_for_profile_xierta_builtin_matches_spec():
+    """希尔塔档 = 规格 11 条；通道号唯一；含 VCUDebug→11。"""
+    got = project_loader.mapping_for_profile("希尔塔")
+    assert got == EXPECTED_XIERTA_MAPPING
+    assert len(set(got.values())) == len(got)
+    assert got["VCUDebug"] == 11
+
+
+def test_mapping_for_profile_xierta_ignores_xingyuan_file(tmp_path):
+    """希尔塔只用内置表，不读取星源映射文件（即使文件存在且内容不同）。"""
+    text = "旧——CFCAN2——CAN99\n"
+    p = tmp_path / "map.txt"
+    p.write_text(text, encoding="utf-8")
+    got = project_loader.mapping_for_profile("希尔塔", p)
+    assert got == EXPECTED_XIERTA_MAPPING
+    assert got["CFCAN2"] == 1
+
+
+def test_mapping_for_profile_name_sets_differ_only_by_vcudebug():
+    """两档主名差集只有 VCUDebug。"""
+    xingyuan = set(project_loader.mapping_for_profile("星源", "不存在.txt"))
+    xierta = set(project_loader.mapping_for_profile("希尔塔"))
+    assert xierta - xingyuan == {"VCUDebug"}
+    assert xingyuan - xierta == set()
+
+
+def test_auto_bindings_xierta_moves_channels_and_binds_vcudebug():
+    """希尔塔表：共用主名换通道；通道 11 绑 VCUDebug；路径仍是该 DBC。"""
+    dbcs = [
+        _dbc(r"x\CFCAN2.dbc"),
+        _dbc(r"x\PFCAN1.dbc"),
+        _dbc(r"x\ZFCANT.dbc"),
+        _dbc(r"x\VCUDebug.dbc"),
+    ]
+    got = project_loader.auto_bindings(dbcs, EXPECTED_XIERTA_MAPPING)
+    assert got == {
+        1: r"x\CFCAN2.dbc",
+        4: r"x\PFCAN1.dbc",
+        6: r"x\ZFCANT.dbc",
+        11: r"x\VCUDebug.dbc",
+    }
+
+
+def test_auto_bindings_xierta_missing_vcudebug_omits_channel_11():
+    """希尔塔下缺 VCUDebug.dbc → 通道 11 不出现在自动建议。"""
+    dbcs = [_dbc(r"x\ZFCANT.dbc"), _dbc(r"x\CFCAN2.dbc")]
+    got = project_loader.auto_bindings(dbcs, EXPECTED_XIERTA_MAPPING)
+    assert 11 not in got
+    assert got == {1: r"x\CFCAN2.dbc", 6: r"x\ZFCANT.dbc"}

@@ -311,6 +311,119 @@ def test_project_select_xingyuan_leaves_vcudebug_unbound(window, monkeypatch):
     assert vcudbg.path not in bound_paths
 
 
+def test_device_switch_to_xierta_redraws_and_drops_manual(window, monkeypatch):
+    """已加载 DBC（含 VCUDebug）时切到希尔塔：整表重画、通道 11→VCUDebug，手工改动丢掉。"""
+    import gui.main_window as mw
+
+    pfcan1 = DbcDef(path=r"E:\A02\PFCAN1.dbc", db=None)
+    cfcan2 = DbcDef(path=r"E:\A02\CFCAN2.dbc", db=None)
+    vcudbg = DbcDef(path=r"E:\A02\VCUDebug.dbc", db=None)
+    zfcant = DbcDef(path=r"E:\A02\ZFCANT.dbc", db=None)
+    monkeypatch.setattr(
+        mw.project_loader, "load_project",
+        lambda root, name: [pfcan1, cfcan2, vcudbg, zfcant],
+    )
+    window.blf_channels = [1, 11]
+    window.project_combo.setCurrentText("A19G1")
+    # 星源下手工把通道 1 明确改成「不绑定」——换档后必须丢掉，回到希尔塔自动建议
+    rows = {window.binding_row(r)[0]: r for r in range(window.table.rowCount())}
+    window.table.cellWidget(rows["CAN 1"], 1).setCurrentIndex(0)
+    assert window.binding_row(rows["CAN 1"])[2] is None
+
+    window.device_combo.setCurrentText("希尔塔")
+
+    assert window.mapping == mw.project_loader.mapping_for_profile(
+        "希尔塔", mw.CCU3_MAPPING_FILE
+    )
+    bound = {
+        window.binding_row(r)[0]: window.binding_row(r)[2]
+        for r in range(window.table.rowCount())
+    }
+    assert bound["CAN 1"] == cfcan2.path  # 手工「不绑定」被丢掉
+    assert bound["CAN 11"] == vcudbg.path
+    assert bound["CAN 4"] == pfcan1.path
+    assert "CAN 3" not in bound  # 星源专属且无帧 → 消失
+    assert vcudbg in window.dbc_list
+
+
+def test_device_switch_back_to_xingyuan_restores_zfcant_on_11(window, monkeypatch):
+    """切回星源后通道 11 绑回 ZFCANT；VCUDebug 仍在列表但不占通道。"""
+    import gui.main_window as mw
+
+    pfcan1 = DbcDef(path=r"E:\A02\PFCAN1.dbc", db=None)
+    vcudbg = DbcDef(path=r"E:\A02\VCUDebug.dbc", db=None)
+    zfcant = DbcDef(path=r"E:\A02\ZFCANT.dbc", db=None)
+    monkeypatch.setattr(
+        mw.project_loader, "load_project",
+        lambda root, name: [pfcan1, vcudbg, zfcant],
+    )
+    window.blf_channels = [1, 11]
+    window.project_combo.setCurrentText("A19G1")
+    window.device_combo.setCurrentText("希尔塔")
+    window.device_combo.setCurrentText("星源")
+
+    bound = {
+        window.binding_row(r)[0]: window.binding_row(r)[2]
+        for r in range(window.table.rowCount())
+    }
+    assert bound["CAN 11"] == zfcant.path
+    assert bound["CAN 1"] == pfcan1.path
+    assert vcudbg.path not in bound.values()
+    assert vcudbg in window.dbc_list
+
+
+def test_device_switch_with_empty_dbc_only_remembers_profile(window):
+    """尚未加载 DBC 时切换只记住当前档，通道表不凭空多行。"""
+    from core import project_loader
+
+    assert window.dbc_list == []
+    assert window.table.rowCount() == 0
+    window.device_combo.setCurrentText("希尔塔")
+    assert window.mapping == project_loader.mapping_for_profile("希尔塔")
+    assert window.table.rowCount() == 0
+    assert window.auto_bind is None or window.auto_bind == {}
+
+
+def test_device_switch_manual_choice_preserved_after_add_dbc(window, monkeypatch):
+    """换档之后的手工「不绑定」在添加其他 DBC 时保留。"""
+    import gui.main_window as mw
+
+    pfcan1 = DbcDef(path=r"E:\A02\PFCAN1.dbc", db=None)
+    cfcan2 = DbcDef(path=r"E:\A02\CFCAN2.dbc", db=None)
+    monkeypatch.setattr(
+        mw.project_loader, "load_project",
+        lambda root, name: [pfcan1, cfcan2],
+    )
+    window.blf_channels = [1]
+    window.project_combo.setCurrentText("A19G1")
+    window.device_combo.setCurrentText("希尔塔")
+    rows = {window.binding_row(r)[0]: r for r in range(window.table.rowCount())}
+    # 希尔塔下 CAN 1 默认 CFCAN2；显式改成不绑定
+    window.table.cellWidget(rows["CAN 1"], 1).setCurrentIndex(0)
+    assert window.binding_row(rows["CAN 1"])[2] is None
+
+    extra = DbcDef(path=r"E:\A02\ZFCANT.dbc", db=None)
+    window.dbc_list.append(extra)
+    window._refresh_dbc_items()
+    window._rebuild_channel_table(window.blf_channels, prev=window._collect_prev())
+
+    rows = {window.binding_row(r)[0]: r for r in range(window.table.rowCount())}
+    assert window.binding_row(rows["CAN 1"])[2] is None
+
+
+def test_device_combo_disabled_while_busy(window):
+    """解析/扫描/转换忙碌态下设备下拉不可用。"""
+    window._set_busy(True)
+    assert not window.device_combo.isEnabled()
+    window._set_busy(False)
+    assert window.device_combo.isEnabled()
+
+    window._set_scan_busy(True)
+    assert not window.device_combo.isEnabled()
+    window._set_scan_busy(False)
+    assert window.device_combo.isEnabled()
+
+
 # ---- BLF 拖拽导入 ----
 
 def test_blf_drop_imports_file(window, tmp_path, monkeypatch):

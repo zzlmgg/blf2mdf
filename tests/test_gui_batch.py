@@ -834,7 +834,7 @@ def test_shared_config_notice_states_scope_and_absent_channels(
 
     assert window._confirm_shared_config(3) is True
     text = seen[0].text() + seen[0].informativeText()
-    for word in ("3 个文件", "平台", "项目", "CAN-DBC", "切换", "全部文件"):
+    for word in ("3 个文件", "设备映射", "平台", "项目", "CAN-DBC", "切换", "全部文件"):
         assert word in text
     assert "不存在的通道不会被导出" in text
     assert {button.text() for button in seen[0].buttons()} == {
