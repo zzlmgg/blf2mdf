@@ -1,3 +1,4 @@
+py7zr
 cantools
 python-can>=4.0
 asammdf

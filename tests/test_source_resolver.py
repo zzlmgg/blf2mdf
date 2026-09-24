@@ -320,3 +320,154 @@ def test_zip_extracting_cb_reports_archive_name_before_candidates(tmp_path):
     )
     assert extracting == ["A02.zip"]
     assert counts == [1, 2]
+
+
+def _make_7z(archive_path: Path, members: dict[str, bytes]) -> Path:
+    """合成 7z（py7zr），成员名用包内相对路径。"""
+    import py7zr
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(data, name)
+    return archive_path
+
+
+def test_7z_source_extracts_beside_archive_and_mirrors_output(tmp_path):
+    """7z → 同级解压根 `<主名>/`，候选输出在同级 `<主名>_t/` 镜像树。"""
+    archive = _make_7z(tmp_path / "A02.7z", {
+        "20260917/run001.blf": b"abc",
+        "run000.blf": b"xy",
+        "notes.txt": b"skip",
+    })
+    result = source_resolver.resolve([archive])
+    extract_root = tmp_path / "A02"
+    assert extract_root.is_dir()
+    assert (extract_root / "20260917" / "run001.blf").is_file()
+    assert [(c.display, c.output, c.size) for c in result] == [
+        (r"20260917\run001.blf",
+         tmp_path / "A02_t" / "20260917" / "run001_t.mdf", 3),
+        ("run000.blf", tmp_path / "A02_t" / "run000_t.mdf", 2),
+    ]
+    assert archive.is_file()
+
+
+def _make_rar(archive_path: Path, members: dict[str, bytes]) -> Path:
+    """合成最小 RAR4（仅 store），供无 rar 写入器的环境造夹具；tar 可解。"""
+    import binascii
+    import struct
+
+    def header_crc(data: bytes) -> int:
+        return binascii.crc32(data) & 0xFFFF
+
+    out = bytearray(b"Rar!\x1a\x07\x00")
+    ah_after = (bytes([0x73]) + struct.pack("<H", 0) + struct.pack("<H", 13)
+                + struct.pack("<H", 0) + struct.pack("<I", 0))
+    out += struct.pack("<H", header_crc(ah_after)) + ah_after
+    for name, data in members.items():
+        name_b = name.replace("\\", "/").encode("utf-8")
+        head_size = 32 + len(name_b)
+        after = bytearray()
+        after.append(0x74)
+        after += struct.pack("<H", 0)  # flags
+        after += struct.pack("<H", head_size)
+        after += struct.pack("<I", len(data))
+        after += struct.pack("<I", len(data))
+        after.append(2)  # Windows
+        after += struct.pack("<I", binascii.crc32(data) & 0xFFFFFFFF)
+        after += struct.pack("<I", 0)  # ftime
+        after.append(20)  # unp ver
+        after.append(0x30)  # store
+        after += struct.pack("<H", len(name_b))
+        after += struct.pack("<I", 0x20)
+        after += name_b
+        out += struct.pack("<H", header_crc(after)) + after
+        out += data
+    eh_after = bytes([0x7b]) + struct.pack("<HH", 0, 7)
+    out += struct.pack("<H", header_crc(eh_after)) + eh_after
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(out)
+    return archive_path
+
+
+def test_rar_source_extracts_beside_archive_and_mirrors_output(tmp_path):
+    """rar → 同级解压根 `<主名>/`，候选与镜像输出树规则与 zip 相同。"""
+    archive = _make_rar(tmp_path / "A02.rar", {
+        "20260917/run001.blf": b"abc",
+        "run000.blf": b"xy",
+        "notes.txt": b"skip",
+    })
+    result = source_resolver.resolve([archive])
+    extract_root = tmp_path / "A02"
+    assert extract_root.is_dir()
+    assert (extract_root / "20260917" / "run001.blf").is_file()
+    assert [(c.display, c.output, c.size) for c in result] == [
+        (r"20260917\run001.blf",
+         tmp_path / "A02_t" / "20260917" / "run001_t.mdf", 3),
+        ("run000.blf", tmp_path / "A02_t" / "run000_t.mdf", 2),
+    ]
+    assert archive.is_file()
+
+
+@pytest.mark.parametrize("make_archive,name", [
+    (_make_rar, "A02.rar"),
+    (_make_7z, "A02.7z"),
+])
+def test_rar_or_7z_reextract_keeps_archive_and_output_tree(
+        tmp_path, make_archive, name):
+    """再次拖入同一 rar/7z：删解压根重建；压缩包与已有 `<主名>_t/` 保留。"""
+    archive = make_archive(tmp_path / name, {"keep.blf": b"new"})
+    extract_root = tmp_path / "A02"
+    stale = _touch(extract_root / "stale.blf", b"old")
+    prior = _touch(tmp_path / "A02_t" / "prior_t.mdf", b"keep-me")
+
+    result = source_resolver.resolve([archive])
+
+    assert not stale.exists()
+    assert (extract_root / "keep.blf").read_bytes() == b"new"
+    assert prior.read_bytes() == b"keep-me"
+    assert archive.is_file()
+    assert [c.display for c in result] == ["keep.blf"]
+
+
+@pytest.mark.parametrize("make_archive,name", [
+    (_make_rar, "Data.RAR"),
+    (_make_7z, "Data.7Z"),
+])
+def test_rar_or_7z_extension_case_insensitive(tmp_path, make_archive, name):
+    archive = make_archive(tmp_path / name, {
+        "UPPER.BLF": b"a",
+        "Mixed.Blf": b"bb",
+    })
+    result = source_resolver.resolve([archive])
+    assert sorted(c.blf.name for c in result) == ["Mixed.Blf", "UPPER.BLF"]
+    assert (tmp_path / "Data").is_dir()
+
+
+def test_rar_fails_clearly_when_system_tar_missing(tmp_path, monkeypatch):
+    """缺少 tar 时 rar 条目失败并说明缺少解压组件，不静默丢弃。"""
+    archive = _make_rar(tmp_path / "A02.rar", {"a.blf": b"x"})
+    monkeypatch.setattr(
+        source_resolver, "_system_tar",
+        lambda: tmp_path / "no-such-tar.exe")
+    with pytest.raises(RuntimeError, match=r"缺少系统解压组件"):
+        source_resolver.resolve([archive])
+
+
+def test_mixed_rar_7z_folder_and_loose_each_follow_own_rule(tmp_path):
+    """混合 rar、7z、文件夹、散 .blf：各按各的规则落位。"""
+    folder = tmp_path / "AHT"
+    in_folder = _touch(folder / "sub" / "in_folder.blf", b"f")
+    loose = _touch(tmp_path / "loose.blf", b"l")
+    rar = _make_rar(tmp_path / "pack.rar", {"nested/in_rar.blf": b"r"})
+    seven = _make_7z(tmp_path / "bag.7z", {"nested/in_7z.blf": b"z"})
+
+    result = source_resolver.resolve([folder, loose, rar, seven])
+    by_blf = {c.blf: c.output for c in result}
+
+    assert by_blf[in_folder] == tmp_path / "AHT_t" / "sub" / "in_folder_t.mdf"
+    assert by_blf[loose] == tmp_path / "loose_t.mdf"
+    assert by_blf[tmp_path / "pack" / "nested" / "in_rar.blf"] == (
+        tmp_path / "pack_t" / "nested" / "in_rar_t.mdf")
+    assert by_blf[tmp_path / "bag" / "nested" / "in_7z.blf"] == (
+        tmp_path / "bag_t" / "nested" / "in_7z_t.mdf")

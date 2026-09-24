@@ -58,10 +58,11 @@ PRECHECK_CANCEL = "取消"
 
 
 def _droppable_paths(event) -> list[str]:
-    """拖拽事件里的可导入条目：本地文件夹、.blf 或 zip（其余忽略）。
+    """拖拽事件里的可导入条目：本地文件夹、.blf 或压缩包（其余忽略）。
 
-    扩展名大小写不敏感（Windows 资源管理器拖出的扩展名可能为大写 .BLF/.ZIP）；
-    文件夹/压缩包只是「可能含 .blf」——里面到底有没有，展开（来源解析）后才知道。
+    扩展名大小写不敏感（Windows 资源管理器拖出的扩展名可能为大写
+    .BLF/.ZIP/.RAR/.7Z）；文件夹/压缩包只是「可能含 .blf」——里面到底有没有，
+    展开（来源解析）后才知道。
     """
     paths = []
     for url in event.mimeData().urls():
@@ -69,9 +70,8 @@ def _droppable_paths(event) -> list[str]:
             continue
         local = url.toLocalFile()
         # 先看扩展名（拖入多个文件时零 stat），其余条目再问文件系统
-        lower = local.lower()
-        if lower.endswith(source_resolver.BLF_SUFFIX) \
-                or lower.endswith(source_resolver.ZIP_SUFFIX) \
+        if source_resolver.is_archive_path(local) \
+                or local.lower().endswith(source_resolver.BLF_SUFFIX) \
                 or Path(local).is_dir():
             paths.append(local)
     return paths
@@ -607,9 +607,9 @@ class MainWindow(QMainWindow):
 
     # ---- 文件选择 ----
     def eventFilter(self, obj, event):
-        """BLF 文件行的拖拽导入：文件夹/zip/多条目拖入标签/路径框 → 解析 → 勾选 → 扫描。
+        """BLF 文件行的拖拽导入：文件夹/压缩包/多条目拖入标签/路径框 → 解析 → 勾选 → 扫描。
 
-        「浏览…」手动选择功能不变；结构性不可导入的拖入（非 .blf、非 zip、
+        「浏览…」手动选择功能不变；结构性不可导入的拖入（非 .blf、非压缩包、
         非文件夹）整行拒绝，且事件被消费、不落到 QLineEdit 默认的文本拖放。
         解析/扫描/转换进行中拒绝拖入（与浏览按钮禁用一致，避免「接受却无动作」
         的困惑）。
@@ -645,10 +645,10 @@ class MainWindow(QMainWindow):
 
     def _start_import(self, paths: list[str]):
         """一次拖入的统一入口：单个散 .blf 走今天的单文件路径（逐字不变），
-        文件夹/zip/多条目先解析出候选，再按候选数决定是否弹勾选列表。
+        文件夹/压缩包/多条目先解析出候选，再按候选数决定是否弹勾选列表。
 
         判定必须是「一个条目且是 .blf」，不能是「一个条目且是任意文件」——
-        否则单个 zip 会被误送进单文件加载。
+        否则单个压缩包会被误送进单文件加载。
         """
         if len(paths) == 1:
             only = Path(paths[0])

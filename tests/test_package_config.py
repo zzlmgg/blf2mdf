@@ -11,6 +11,7 @@ def test_qss_spec_builds_named_exe_with_app_icon():
     assert "name='BLF2MDF'" in text
     assert "('assets/blf2mdf_icon.png', 'assets')" in text
     assert "icon='assets/blf2mdf_icon.ico'" in text
+    assert "hiddenimports=['py7zr']" in text
     for dll in (
         "ffi-8.dll",
         "libcrypto-3-x64.dll",

@@ -383,7 +383,7 @@ def test_drop_without_importable_items_warns_and_keeps_state(
 
 
 def test_non_importable_drop_is_rejected_on_the_row(window, qapp, tmp_path):
-    """整行拒绝（沿用今天的拒绝语义）：非 .blf、非 zip、非文件夹的拖入不被接受。"""
+    """整行拒绝（沿用今天的拒绝语义）：非 .blf、非压缩包、非文件夹的拖入不被接受。"""
     note = tmp_path / "note.txt"
     note.write_text("x", encoding="utf-8")
     event = _drop(window, note, cls=QDragEnterEvent)
@@ -396,6 +396,24 @@ def test_zip_drop_enters_resolve_not_single_file_load(window, qapp, tmp_path,
     archive = tmp_path / "A02.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("run001.blf", b"x")
+    loaded = []
+    resolved = []
+    monkeypatch.setattr(window, "_load_blf", lambda path: loaded.append(path))
+    monkeypatch.setattr(window, "_start_resolve",
+                        lambda paths: resolved.append(list(paths)))
+
+    event = _drop(window, archive)
+    assert event.isAccepted()
+    assert loaded == []
+    assert len(resolved) == 1 and Path(resolved[0][0]) == archive
+
+
+@pytest.mark.parametrize("suffix", [".rar", ".RAR", ".7z", ".7Z"])
+def test_rar_or_7z_drop_enters_resolve_not_single_file_load(
+        window, qapp, tmp_path, monkeypatch, suffix):
+    """单个 rar/7z 拖入走解析，不走单个 .blf 的加载。"""
+    archive = tmp_path / f"A02{suffix}"
+    archive.write_bytes(b"not-a-real-archive")  # 只断言接线，不解压
     loaded = []
     resolved = []
     monkeypatch.setattr(window, "_load_blf", lambda path: loaded.append(path))
