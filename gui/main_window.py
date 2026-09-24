@@ -15,7 +15,13 @@ from PySide6.QtWidgets import (
 )
 
 from core import blf_reader, project_loader, source_resolver
-from core.batch import BatchCancelled, BatchResult, overall_percent, run_batch
+from core.batch import (
+    BatchCancelled,
+    BatchResult,
+    FileOutcome,
+    overall_percent,
+    run_batch,
+)
 from core.blf_reader import ConversionCancelled
 from core.converter import ConversionResult, convert
 from core.dbc_loader import DbcDef, load
@@ -80,6 +86,22 @@ def _total_seconds(result: ConversionResult) -> float:
     （测试构造/旧调用方）兜底数据时长。"""
     return next((t for label, t in result.timings if label == "总耗时"),
                 result.duration_seconds)
+
+
+def _outcome_line(outcome: FileOutcome) -> str:
+    """逐文件结局的日志行：批量结束与批量取消**共用**（同一批文件在日志里
+    只该有一套写法——两处各写一遍迟早会漂）。"""
+    if outcome.ok:
+        return (f"{outcome.candidate.display}: 完成 (总耗时 "
+                f"{_total_seconds(outcome.result):.1f} s)")
+    return f"{outcome.candidate.display}: 失败 — {outcome.error}"
+
+
+def _skip_line(candidate: Candidate) -> str:
+    """预检跳过的日志行：与 _outcome_line 同源共用（批量结束与批量取消）。
+    取消时也得点名跳过的文件——只报队列分母而不列它们，用户会拿本批文件
+    总数（含跳过的）对不上那个 N。"""
+    return f"{candidate.display}: 跳过（输出已存在）"
 
 
 def _scan_progress_cb(progress_cb, index: int, total: int):
@@ -236,11 +258,14 @@ class BatchConvertWorker(QObject):
 
     「批次」的定义与转换循环都在 core/batch.py——界面只转发配置与回调，
     不自建循环（stage/percent 由 run_batch 映射好，stage 带「第 i/N 个 · 」）。
-    cancelled 携带已完成结局（BatchCancelled）：界面据此说明产物保留情况。
+    cancelled 携带 (已完成结局, 本次队列文件数)：界面据此说明「已完成 X / N」
+    与产物保留情况。分母随信号交出而不是让界面自己去数——队列是 core 的输入，
+    界面重算一遍就是第二处定义（取消是异步到达的，界面手上的 self.batch 也可能
+    已经不是这一次的了）。
     """
     progress = Signal(str, float)
     done = Signal(object)
-    cancelled = Signal(object)
+    cancelled = Signal(object, int)
     error = Signal(str)
 
     def __init__(self, candidates, bindings, cancel_event):
@@ -251,6 +276,7 @@ class BatchConvertWorker(QObject):
 
     @Slot()
     def run(self):
+        total = len(self.candidates)
         try:
             # 与单文件 ConvertWorker 同一套开关：文件内并行开、原始帧导出关
             result = run_batch(
@@ -261,9 +287,10 @@ class BatchConvertWorker(QObject):
                 parallel=True)
             self.done.emit(result)
         except BatchCancelled as exc:
-            self.cancelled.emit(exc.outcomes)
+            self.cancelled.emit(exc.outcomes, total)
         except ConversionCancelled:
-            self.cancelled.emit([])
+            # 兜底（run_batch 把取消一律包成 BatchCancelled）：无结局可报
+            self.cancelled.emit([], total)
         except Exception as e:  # noqa: BLE001 — 界面层兜底
             self.error.emit(str(e))
 
@@ -1305,14 +1332,9 @@ class MainWindow(QMainWindow):
         lines = []
         for candidate in self.batch:        # 清单顺序；跳过的也留在原位
             if candidate.blf in skipped_blfs:
-                lines.append(f"{candidate.display}: 跳过（输出已存在）")
+                lines.append(_skip_line(candidate))
                 continue
-            outcome = outcome_of[candidate.blf]
-            if outcome.ok:
-                lines.append(f"{candidate.display}: 完成 (总耗时 "
-                             f"{_total_seconds(outcome.result):.1f} s)")
-            else:
-                lines.append(f"{candidate.display}: 失败 — {outcome.error}")
+            lines.append(_outcome_line(outcome_of[candidate.blf]))
         converted = len(result.outcomes)
         skipped = len(self.skipped)
         total = converted + skipped         # 本批文件数 = 转换的 + 预检跳过的
@@ -1341,19 +1363,27 @@ class MainWindow(QMainWindow):
         box.button(QMessageBox.StandardButton.Ok).setText("确定")
         box.exec()
 
-    @Slot()
-    def _on_batch_cancelled(self, outcomes: list):
-        """批量取消：已完成文件的产物保留（core 契约），界面据实说明。
+    @Slot(object, int)
+    def _on_batch_cancelled(self, outcomes: list[FileOutcome], total: int):
+        """批量取消：队列停止、当前在转文件由 core 按其自身契约清理，已完成
+        文件的产物**全部保留**（CONTEXT.md「取消信号」）——取消不等于丢掉
+        前面已完成的工作。
 
-        不写「已完成的 X / N 个产物保留」以外的话——取消不是失败，界面
-        不复述 core 的清理细节（见 CONTEXT.md「取消信号」）。
+        日志报「已完成 X / N」：X = 已定论的文件数（成功与失败都算定论，逐
+        文件照记耗时/原因——取消前已经发生的失败不能因为取消而无声），
+        N = 本次队列文件数（预检跳过的没进队列，与进度条同一分母）。跳过
+        的随后点名（_skip_line）：不列出来，用户会拿本批文件总数对不上 N。
+        与单文件取消「放弃本次转换」（删掉完整产物）相对，两者文案不同源。
         """
         self._finish()
-        kept = [outcome for outcome in outcomes if outcome.ok]
-        text = "转换已取消"
-        if kept:
-            text += f"（已完成的 {len(kept)} 个文件产物保留）"
-        self._log(text, status="已取消")
+        done = len(outcomes)
+        kept_clause = "，已完成文件的产物保留" if done else ""
+        text = f"批量转换已取消（已完成 {done} / {total} 个文件{kept_clause}）"
+        if outcomes:
+            text += "\n" + "\n".join(_outcome_line(o) for o in outcomes)
+        if self.skipped:
+            text += "\n" + "\n".join(_skip_line(c) for c in self.skipped)
+        self._log(text, status=f"已取消 · 已完成 {done} / {total}")
 
     @Slot(object)
     def _on_done(self, result: ConversionResult):
@@ -1432,9 +1462,17 @@ class MainWindow(QMainWindow):
         self.summary_button.setEnabled(True)
 
     def _finish(self):
-        self.worker_thread.quit()
-        self.worker_thread.wait()
-        self.worker_thread = None
+        """收尾一次转换：停 worker 线程 → 界面复位到静止态。
+
+        线程可能已经没了——关窗取消由 closeEvent 自己收的线，而 worker 的
+        结局信号（done/cancelled/error）还在队列里，随后才被投递。这条路上
+        没有线程可收，只做界面复位（没有本方法，迟到的信号会在槽里抛
+        AttributeError，把结局与日志一起吞掉）。
+        """
+        if self.worker_thread is not None:
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+            self.worker_thread = None
         self._set_busy(False)
         self.progress.setValue(0)
         self.stage_label.setText("就绪")
@@ -1490,9 +1528,15 @@ class MainWindow(QMainWindow):
             self.scan_thread = None
         thread = self.worker_thread
         if thread is not None and thread.isRunning():
-            ans = QMessageBox.question(
-                self, "确认关闭",
+            # 批量与单文件的后果不同，如实分开说：单文件是「放弃本次转换」
+            # （完整产物被删），批量是「已完成文件的产物保留」——同一句
+            # 「丢弃结果」在批量下会吓到用户（见 CONTEXT.md「取消信号」）
+            notice = (
+                "批量转换仍在进行中，关闭窗口将取消本批转换"
+                "（已完成文件的产物保留）。\n确定要关闭吗？"
+                if self._is_batch else
                 "转换仍在进行中，关闭窗口将等待其完成后丢弃结果。\n确定要关闭吗？")
+            ans = QMessageBox.question(self, "确认关闭", notice)
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return

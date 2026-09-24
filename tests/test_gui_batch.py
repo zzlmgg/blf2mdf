@@ -13,12 +13,12 @@ from pathlib import Path
 import pytest
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import gui.main_window as mw
 
-from core.batch import BatchResult, FileOutcome
+from core.batch import BatchCancelled, BatchResult, FileOutcome
 from core.dbc_loader import DbcDef, load
 from core.converter import ChannelSummary, ConversionResult
 from core.source_resolver import Candidate
@@ -842,3 +842,270 @@ def test_batch_skip_existing_with_nothing_left_reports_zero_converted(
     assert converted == [[]], "空待转清单交给 core 也是空批：不转任何文件"
     assert notices == ["2 个 blf 文件转换成功 0 个，跳过 2 个已存在"]
     assert "跳过" in window.summary_status.text()
+
+
+# ---- 05：批次生命周期（取消 / 关闭 / 并发拖入） ----
+
+
+def _state_snapshot(window) -> dict:
+    """「界面已就位」快照：输入行、批次清单、通道、输出框、阶段文案。
+
+    05 的「回到原状」判据——被取消/被打断的导入不得在界面留下任何半途痕迹。
+    """
+    return {
+        "row": window.blf_edit.text(),
+        "tooltip": window.blf_edit.toolTip(),
+        "batch": [c.blf for c in window.batch],
+        "channels": list(window.blf_channels),
+        "blf_path": window.blf_path,
+        "out": window.out_edit.text(),
+        "stage": window.stage_label.text(),
+    }
+
+
+def _settle_batch(window, qapp, tmp_path, monkeypatch):
+    """就位一个 2 文件批次（真实解析 + 真实扫描），返回源目录。"""
+    root = tmp_path / "AHT"
+    for index in (1, 2):
+        _write_blf(root / f"run{index:03d}.blf", channels=(1,))
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
+    _, settled = _drop_and_settle(qapp, window, root)
+    assert settled
+    return root
+
+
+def _looping_resolve_until_cancel(count: int, calls: list):
+    """确定性解析桩：报一次「已发现 N 个」后卡住，取消置位即抛 ConversionCancelled。
+
+    calls 记下每次被调用的入参——「拖入被拒绝」的判据是它**只被调用一次**。
+    """
+    from core.blf_reader import ConversionCancelled
+
+    def fake(paths, *, progress_cb=None, cancel_cb=None):
+        calls.append(list(paths))
+        if progress_cb is not None:
+            progress_cb(count)
+        while not (cancel_cb and cancel_cb()):
+            time.sleep(0.001)
+        raise ConversionCancelled()
+
+    return fake
+
+
+def _looping_run_batch_until_cancel():
+    """确定性批量转换桩：等取消置位，置位即抛 BatchCancelled（还没有已完成结局）。"""
+    def fake(candidates, bindings, *, progress_cb=None, cancel_cb=None,
+             **kwargs):
+        while not (cancel_cb and cancel_cb()):
+            time.sleep(0.001)
+        raise BatchCancelled([])
+
+    return fake
+
+
+def test_batch_cancel_stops_queue_and_keeps_finished_products(
+        window, qapp, tmp_path, monkeypatch):
+    """批量转换中点取消：队列停止、当前在转文件不落半成品、已完成文件的产物
+    原样保留（与单独转换逐位一致），日志记「已完成 X / N」。"""
+    import gui.main_window as mw
+    from core import batch as core_batch
+    from tools.mdf_compare import compare_files_identical
+
+    real_run_batch = core_batch.run_batch
+    monkeypatch.setattr(
+        mw, "run_batch",
+        lambda *args, **kwargs: real_run_batch(
+            *args, **{**kwargs, "parallel": False}))
+
+    dbc_path = tmp_path / "t.dbc"
+    dbc_path.write_text(INLINE_DBC, encoding="utf-8")
+    dbc = load(str(dbc_path))
+    window.dbc_list = [dbc]
+    window.auto_bind = {1: dbc.path}
+    root = tmp_path / "AHT"
+    for index in (1, 2):
+        _write_blf(root / "sub" / f"run{index:03d}.blf", channels=(1,))
+    monkeypatch.setattr(window, "_choose_candidates",
+                        lambda candidates, checked=None: candidates)
+    _, settled = _drop_and_settle(qapp, window, root)
+    assert settled
+
+    first, second = window.batch
+    real_convert = core_batch.convert
+    reference = tmp_path / "reference.mdf"      # 判「产物不受影响」的基准
+    real_convert(str(first.blf), window._collect_bindings(), str(reference),
+                 parallel=False)
+
+    started = threading.Event()
+
+    def gated_convert(blf, bindings, out, **kwargs):
+        if Path(blf).name == second.blf.name:   # 第二个文件一开工就等用户点取消
+            started.set()
+            while not window.convert_cancel.is_set():
+                time.sleep(0.005)
+        return real_convert(blf, bindings, out,
+                            **{**kwargs, "parallel": False})
+
+    monkeypatch.setattr(core_batch, "convert", gated_convert)
+
+    window._start_convert()
+    assert _wait_until(qapp, started.is_set), "第二个文件应已开工"
+    window.btn_convert_cancel.click()
+    assert _wait_until(qapp, lambda: window.worker_thread is None, timeout=60)
+
+    assert not second.output.exists(), "当前在转文件不落半成品"
+    assert first.output.is_file(), "已完成文件的产物保留"
+    assert compare_files_identical(str(reference), str(first.output)) == [], \
+        "已完成文件的产物不受取消影响（与单独转换逐位一致）"
+    assert "已完成 1 / 2" in window.summary_text
+    assert window.summary_status.text() == "已取消 · 已完成 1 / 2"
+    assert window.stage_label.text() == "就绪"
+    assert window.convert_btn.isEnabled(), "取消后回可再次转换的静止态"
+    window.close()
+
+
+def test_batch_cancel_reports_the_queue_as_denominator(window, qapp, tmp_path,
+                                                       monkeypatch):
+    """取消报的 N = 本次队列文件数（预检跳过的没进队列，与进度条同一分母）；
+    已完成文件与预检跳过文件的产物都不因取消而被动。"""
+    def fake_run_batch(candidates, bindings, *, progress_cb=None, **kwargs):
+        candidates[0].output.parent.mkdir(parents=True, exist_ok=True)
+        candidates[0].output.write_bytes(b"done")       # 第一个文件的产物
+        raise BatchCancelled([FileOutcome(candidates[0], result=_result())])
+
+    _start_batch_with_fake_run_batch(window, qapp, tmp_path, monkeypatch,
+                                     fake_run_batch, files=3)
+    first, skipped, third = window.batch
+    skipped.output.parent.mkdir(parents=True, exist_ok=True)
+    skipped.output.write_bytes(b"old")
+    monkeypatch.setattr(window, "_choose_overwrite",
+                        lambda existing: mw.PRECHECK_SKIP_EXISTING)
+
+    window._start_convert()
+    assert _wait_until(qapp, lambda: window.worker_thread is None)
+
+    assert first.output.read_bytes() == b"done", "已完成文件的产物保留（取消不删）"
+    assert skipped.output.read_bytes() == b"old", "跳过的文件不转、旧产物原样"
+    assert not third.output.exists()
+    assert f"{first.display}: 完成 (总耗时 1.5 s)" in window.summary_text, \
+        "逐文件结局照记（哪几个已完成）"
+    assert "已完成 1 / 2 个文件" in window.summary_text, "分母 = 队列（3 个里跳过 1 个）"
+    assert f"{skipped.display}: 跳过（输出已存在）" in window.summary_text, \
+        "跳过的照点名（否则本批 3 个文件对不上分母 2）"
+    assert window.summary_status.text() == "已取消 · 已完成 1 / 2"
+
+
+def test_close_during_batch_conversion_asks_first(window, qapp, tmp_path,
+                                                  monkeypatch):
+    """批量转换进行中关窗：先询问；选择不关则转换继续，确认后才取消并收尾。"""
+    import gui.main_window as mw
+
+    _start_batch_with_fake_run_batch(window, qapp, tmp_path, monkeypatch,
+                                     _looping_run_batch_until_cancel())
+    window._start_convert()
+    assert _wait_until(qapp, lambda: window.worker_thread is not None
+                       and window.worker_thread.isRunning())
+
+    asked = []
+    monkeypatch.setattr(
+        mw.QMessageBox, "question",
+        lambda *args, **kwargs: asked.append(args[2])
+        or QMessageBox.StandardButton.No)
+    closing = QCloseEvent()
+    window.closeEvent(closing)
+    assert len(asked) == 1, "关窗前先询问"
+    assert not closing.isAccepted(), "选择不关 → 窗口不关"
+    assert window.worker_thread.isRunning(), "选择不关 → 转换继续"
+    assert not window.convert_cancel.is_set(), "没点确认不置取消"
+    assert "批量" in asked[0], "批量下按批次的后果说明（不是单文件文案）"
+
+    monkeypatch.setattr(
+        mw.QMessageBox, "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    confirmed = QCloseEvent()
+    window.closeEvent(confirmed)
+    assert confirmed.isAccepted(), "确认后关闭"
+    assert window.worker_thread is None, "确认后取消并收尾（不等转换跑完）"
+
+    # 关窗时 closeEvent 已把线程收掉，而 worker 的结局信号还在队列里、随后才
+    # 投递：这条路上槽里的异常会喂给 sys.excepthook（Qt 不吞也不上抛），故
+    # 「没喂给 excepthook」+「结局照常落日志」两条一起钉住收口
+    import sys
+
+    sys_errors = []
+    monkeypatch.setattr(sys, "excepthook",
+                        lambda *args: sys_errors.append(args))
+    qapp.processEvents()
+    assert sys_errors == [], "关窗后到达的结局信号不得在槽里抛异常"
+    assert window.summary_status.text() == "已取消 · 已完成 0 / 2", \
+        "迟到的结局照实收尾（没有线程可收也不吞掉这一次取消）"
+    assert window.batch, "关窗不清批次（窗口即将消失，收尾不越界）"
+
+
+def test_resolve_in_progress_rejects_drops_and_cancel_restores(
+        window, qapp, tmp_path, monkeypatch):
+    """解析进行中：拖入被拒绝且不启动新的加载；取消后回到原状（半途结果不应用）。"""
+    import gui.main_window as mw
+
+    _settle_batch(window, qapp, tmp_path, monkeypatch)
+    before = _state_snapshot(window)
+
+    other = tmp_path / "AHT2"
+    _write_blf(other / "run003.blf", channels=(1,))
+    calls: list = []
+    monkeypatch.setattr(mw.source_resolver, "resolve",
+                        _looping_resolve_until_cancel(count=9, calls=calls))
+    window.show()
+    _drop(window, other)
+    assert _wait_until(qapp, lambda: window.resolve_thread is not None
+                       and window.resolve_thread.isRunning())
+    assert window.btn_scan_cancel.isVisible(), "解析期间显示取消按钮"
+    assert not window.btn_blf.isEnabled(), "与「浏览…」禁用一致"
+    assert _wait_until(
+        qapp,
+        lambda: window.stage_label.text() == "正在解析来源…已发现 9 个 .blf"), \
+        "遍历中的发现数如实上报（状态文案，不是百分比）"
+    assert not _drop(window, other, cls=QDragEnterEvent).isAccepted(), \
+        "解析进行中拒绝新的拖入"
+    assert len(calls) == 1, "拒绝 = 不启动新的加载"
+
+    window.btn_scan_cancel.click()
+    assert _wait_until(qapp, lambda: window.resolve_thread is None)
+    assert _state_snapshot(window) == before, "取消后回到原状（不应用半途结果）"
+    assert window.summary_status.text() == "输入BLF 已取消"
+    window.close()
+
+
+def test_scan_cancel_discards_half_scanned_channels(window, qapp, tmp_path,
+                                                    monkeypatch):
+    """扫描进行中取消：已探到的通道不应用、批次与界面回到扫描前。"""
+    import gui.main_window as mw
+    from core.blf_reader import ConversionCancelled
+
+    _settle_batch(window, qapp, tmp_path, monkeypatch)
+    before = _state_snapshot(window)
+
+    other = tmp_path / "AHT2"
+    _write_blf(other / "run003.blf", channels=(1,))
+    _write_blf(other / "run004.blf", channels=(1,))
+
+    def probe(path, progress_cb=None, cancel_cb=None):
+        if Path(path).name == "run004.blf":     # 第二个文件卡住等取消
+            while not (cancel_cb and cancel_cb()):
+                time.sleep(0.001)
+            raise ConversionCancelled()
+        return [7]                              # 第一个文件的探测结果（半途）
+    monkeypatch.setattr(mw.blf_reader, "probe_channels", probe)
+
+    window.show()
+    _drop(window, other)
+    assert _wait_until(qapp, lambda: window.scan_thread is not None
+                       and window.scan_thread.isRunning())
+    window.btn_scan_cancel.click()
+    assert _wait_until(qapp, lambda: window.scan_thread is None)
+
+    assert 7 not in window.blf_channels, "半途探到的通道不应用（并集不落地）"
+    assert _state_snapshot(window) == before, "取消后回到原状"
+    assert window.summary_status.text() == "输入BLF 已取消"
+    window.close()
