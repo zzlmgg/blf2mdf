@@ -99,6 +99,11 @@ ZFCANT——CAN11
 
 
 
+——————————————
+我预期的测试守卫包含下面这些内容：
+1、canoe_golden 是多个项目的 原始blf(source.blf) 和canoe转换的 mdf(canoe.mdf)，这个最权威的 mdf。我希望测试能够使用我们自己的转换脚本把 canoe_golden中的这些 blf(source.blf) 依次转换为 mdf（也就是我们脚本转的mdf），然后与 canoe_golden 中的 canoe转换结果mdf(canoe.mdf)进行逐帧信号和时间轴一致性的对比；
+
+2、对转换时间有大致的性能下限（每个 blf 的转换都有不能超过的时间上限）；可以先统计当前 canoe_golden 中各个 blf 的转换时间，呈现给我来拍板这些 golden 库的转换时间标准；
 
 
 
