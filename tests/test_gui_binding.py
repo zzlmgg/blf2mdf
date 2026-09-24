@@ -271,6 +271,46 @@ def test_project_select_keeps_custom_output_path(window, monkeypatch):
     assert window.out_edit.text() == custom
 
 
+def test_device_combo_defaults_to_xingyuan(window):
+    """「Channel ⟷ DBC」标题右侧设备下拉：仅星源/希尔塔，默认星源；路数仍在右侧。"""
+    import gui.main_window as mw
+    from core import project_loader
+
+    combo = window.device_combo
+    assert [combo.itemText(i) for i in range(combo.count())] == ["星源", "希尔塔"]
+    assert combo.currentText() == "星源"
+    assert window.mapping == project_loader.mapping_for_profile(
+        "星源", mw.CCU3_MAPPING_FILE
+    )
+    assert "VCUDebug" not in window.mapping
+    assert window.channel_count_label.objectName() == "channelCount"
+
+
+def test_project_select_xingyuan_leaves_vcudebug_unbound(window, monkeypatch):
+    """选项目后自动建议身份仍是路径；VCUDebug 在列表但不占通道。"""
+    import gui.main_window as mw
+
+    pfcan1 = DbcDef(path=r"E:\A02\PFCAN1.dbc", db=None)
+    vcudbg = DbcDef(path=r"E:\A02\VCUDebug.dbc", db=None)
+    zfcant = DbcDef(path=r"E:\A02\ZFCANT.dbc", db=None)
+    monkeypatch.setattr(
+        mw.project_loader, "load_project",
+        lambda root, name: [pfcan1, vcudbg, zfcant],
+    )
+    window.blf_channels = [1, 11]
+    window.project_combo.setCurrentText("A19G1")
+    assert window.dbc_list == [pfcan1, vcudbg, zfcant]
+    assert window.auto_bind == {1: pfcan1.path, 11: zfcant.path}
+    bound_paths = {
+        window.binding_row(r)[2]
+        for r in range(window.table.rowCount())
+        if window.binding_row(r)[2]
+    }
+    assert pfcan1.path in bound_paths
+    assert zfcant.path in bound_paths
+    assert vcudbg.path not in bound_paths
+
+
 # ---- BLF 拖拽导入 ----
 
 def test_blf_drop_imports_file(window, tmp_path, monkeypatch):

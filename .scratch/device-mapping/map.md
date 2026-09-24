@@ -23,6 +23,7 @@ Status: ready-for-agent
 
 ## Decisions so far
 
+- [01](issues/01-xingyuan-default-profile.md)：取表入口 `mapping_for_profile` + 界面默认「星源」下拉；星源文件优先/回退与今天一致，VCUDebug 进列表不自动绑。
 ## Not yet specified
 
 ## Out of scope

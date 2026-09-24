@@ -10,8 +10,12 @@ from core.dbc_loader import DbcDef, _detect_encoding, load
 
 LOGGER = logging.getLogger(__name__)
 
-# 映射文件缺失时的内置回退表（与 dbc_对应关系.txt 前 10 行同步；键 = DBC 文件
-# 主名，值 = CAN 通道号）。改表必须同步 dbc_对应关系.txt 与
+# 设备映射档名（界面文案 = 档名）。默认星源，与今天通道表一致。
+DEVICE_PROFILES = ("星源", "希尔塔")
+DEFAULT_DEVICE_PROFILE = "星源"
+
+# 映射文件缺失时的内置星源回退表（与 dbc_对应关系.txt 前 10 行同步；键 = DBC
+# 文件主名，值 = CAN 通道号）。改表必须同步 dbc_对应关系.txt 与
 # tests/test_project_loader.py 的 EXPECTED_MAPPING（契约测试锚，漂移在 pytest 阶段变响亮）
 DEFAULT_MAPPING = {
     "CFCAN1": 13,
@@ -24,6 +28,21 @@ DEFAULT_MAPPING = {
     "ZFCANL": 9,
     "ZFCANR": 10,
     "ZFCANT": 11,
+}
+
+# 希尔塔内置表（本模块常量；不读星源映射文件）。含 VCUDebug→11。
+XIERTA_MAPPING = {
+    "CFCAN2": 1,
+    "CFCAN3": 2,
+    "PFCAN1": 4,
+    "IFCAN": 5,
+    "ZFCANT": 6,
+    "ZFCANL": 7,
+    "ZFCANF": 8,
+    "CFCAN1": 9,
+    "ZFCANR": 10,
+    "VCUDebug": 11,
+    "PFCAN2": 14,
 }
 
 
@@ -106,6 +125,23 @@ def load_mapping(txt_path: str | Path | None = None) -> dict[str, int]:
             except Exception:  # noqa: BLE001 — 读取/解码异常一律回退
                 LOGGER.warning("映射文件读取失败，回退内置映射: %s", path)
     return dict(DEFAULT_MAPPING)
+
+
+def mapping_for_profile(
+    profile: str,
+    txt_path: str | Path | None = None,
+) -> dict[str, int]:
+    """按设备映射档取 {DBC 主名: 通道号}。
+
+    星源：映射文件优先，缺失/无效回退内置星源表（同 load_mapping）。
+    希尔塔：只返回内置希尔塔表，不读文件。
+    未知档名：抛 ValueError，不静默落到星源。
+    """
+    if profile == "星源":
+        return load_mapping(txt_path)
+    if profile == "希尔塔":
+        return dict(XIERTA_MAPPING)
+    raise ValueError(f"未知设备映射档名: {profile}")
 
 
 def load_project(root: str | Path, project: str) -> list[DbcDef]:

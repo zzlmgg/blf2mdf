@@ -146,7 +146,9 @@ def convert_one(platform, project, blf, out):
     """无头同参链路：与 GUI ConvertWorker.run 逐参一致（raw_export=False, parallel=True）。"""
     root = dbc_root(platform)
     dbcs = project_loader.load_project(root, project)
-    mapping = project_loader.load_mapping(root / "dbc_对应关系.txt")
+    mapping = project_loader.mapping_for_profile(
+        project_loader.DEFAULT_DEVICE_PROFILE, root / "dbc_对应关系.txt"
+    )
     auto = project_loader.auto_bindings(dbcs, mapping)
     channels = blf_reader.probe_channels(str(blf))
     rows = decide_bindings(channels, auto, None, [d.path for d in dbcs])

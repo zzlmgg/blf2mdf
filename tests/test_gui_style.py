@@ -196,8 +196,9 @@ def test_maximize_clears_and_restore_reapplies_fallback_mask(
 def test_workspace_is_two_compact_cards(window, qapp):
     window.show()
     qapp.processEvents()
-    assert 298 <= window.dbc_panel.width() <= 302
-    assert 338 <= window.channel_panel.width() <= 342
+    # 设备下拉紧挨标题后，通道卡略宽、DBC 卡略窄；路数标签仍在右侧
+    assert 290 <= window.dbc_panel.width() <= 302
+    assert 338 <= window.channel_panel.width() <= 355
     assert window.dbc_panel.height() == 350
     assert window.channel_panel.height() == 350
     assert not window.table.horizontalHeader().isVisible()

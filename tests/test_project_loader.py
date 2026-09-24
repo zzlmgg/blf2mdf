@@ -1,4 +1,6 @@
 """project_loader：项目枚举 / 新名—通道映射解析 / 项目加载 / 自动绑定建议。"""
+from pathlib import Path
+
 import pytest
 
 from core import project_loader
@@ -140,10 +142,11 @@ def test_list_projects_real_root():
     root = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
     projects = project_loader.list_projects(root)
     assert projects and "AH8" in projects and "A02" in projects
-    # 每个项目文件夹只含规范命名的 DBC（当前 10 个，AH8 缺 PFCAN2）
+    # 项目可含星源表外主名（如 VCUDebug）；星源十主名仍在表内
     for name in projects:
         stems = {p.stem for p in (root / name).glob("*.dbc")}
-        assert stems <= set(EXPECTED_MAPPING)
+        assert set(EXPECTED_MAPPING) - {"PFCAN2"} <= stems or \
+            set(EXPECTED_MAPPING) <= stems
 
 
 # ---- 项目加载 ----
@@ -161,8 +164,9 @@ def test_load_project_real_ccu3_folder():
     if not folder.exists():
         pytest.skip("缺 inputs/dbc_ccu3.0 数据")
     dbcs = project_loader.load_project(root, "A02")
-    assert [d.path.split("\\")[-1] for d in dbcs] == \
-        [f"{k}.dbc" for k in EXPECTED_MAPPING]
+    stems = {Path(d.path).stem for d in dbcs}
+    assert set(EXPECTED_MAPPING) <= stems
+    assert "VCUDebug" in stems  # 读入列表；星源下不自动绑定（另测）
     assert all(d.messages for d in dbcs)
 
 
@@ -192,3 +196,57 @@ def test_auto_bindings_unknown_dbc_ignored():
     dbcs = [_dbc(r"x\CFCAN1.dbc"), _dbc(r"x\NEWBUS.dbc")]
     got = project_loader.auto_bindings(dbcs, EXPECTED_MAPPING)
     assert got == {13: r"x\CFCAN1.dbc"}
+
+
+def test_auto_bindings_vcudebug_ignored_under_xingyuan():
+    """星源表不含 VCUDebug：文件可在列表里，但不产生自动绑定建议。"""
+    dbcs = [_dbc(r"x\CFCAN1.dbc"), _dbc(r"x\VCUDebug.dbc"), _dbc(r"x\ZFCANT.dbc")]
+    got = project_loader.auto_bindings(dbcs, EXPECTED_MAPPING)
+    assert got == {13: r"x\CFCAN1.dbc", 11: r"x\ZFCANT.dbc"}
+    assert all("VCUDebug" not in p for p in got.values())
+
+
+# ---- 设备映射档（取表入口）----
+
+def test_mapping_for_profile_xingyuan_builtin_matches_spec():
+    """缺文件时星源档 = 规格星源表；通道号唯一且不含 VCUDebug。"""
+    got = project_loader.mapping_for_profile("星源", "不存在的路径.txt")
+    assert got == EXPECTED_MAPPING
+    assert got == project_loader.DEFAULT_MAPPING
+    assert len(set(got.values())) == len(got)
+    assert "VCUDebug" not in got
+
+
+def test_mapping_for_profile_xingyuan_prefers_file(tmp_path):
+    """星源档：映射文件存在且有效时以文件为准。"""
+    text = MAPPING_TEXT.replace("CFCAN1——CAN13", "CFCAN1——CAN7")
+    p = tmp_path / "map.txt"
+    p.write_text(text, encoding="utf-8")
+    got = project_loader.mapping_for_profile("星源", p)
+    assert got["CFCAN1"] == 7
+    assert "VCUDebug" not in got
+
+
+def test_mapping_for_profile_xingyuan_file_has_no_vcudebug():
+    """真实星源映射文件有效行不含 VCUDebug（与内置表一致）。"""
+    root = PROJECT_ROOT / "inputs" / "dbc_ccu3.0"
+    path = root / "dbc_对应关系.txt"
+    if not path.exists():
+        pytest.skip("缺映射文件")
+    got = project_loader.mapping_for_profile("星源", path)
+    assert "VCUDebug" not in got
+    assert got == EXPECTED_MAPPING
+
+
+def test_mapping_for_profile_unknown_raises():
+    """未知档名明确失败，不静默落到星源表。"""
+    with pytest.raises(ValueError, match="未知"):
+        project_loader.mapping_for_profile("不存在的设备")
+
+
+def test_mapping_for_profile_default_is_xingyuan():
+    """默认档名常量是星源，对拍不传档时走同一入口。"""
+    assert project_loader.DEFAULT_DEVICE_PROFILE == "星源"
+    assert project_loader.mapping_for_profile(
+        project_loader.DEFAULT_DEVICE_PROFILE
+    ) == EXPECTED_MAPPING

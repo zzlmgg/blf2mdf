@@ -329,7 +329,9 @@ class MainWindow(QMainWindow):
         # 当前项目的自动绑定建议 {通道: DBC 文件路径}；未选项目为 None。
         # BLF 晚于项目加载时，_rebuild_channel_table 用它补齐默认绑定。
         self.auto_bind: dict[int, str] | None = None
-        self.mapping = project_loader.load_mapping(CCU3_MAPPING_FILE)
+        self.mapping = project_loader.mapping_for_profile(
+            project_loader.DEFAULT_DEVICE_PROFILE, CCU3_MAPPING_FILE
+        )
         self.worker_thread: QThread | None = None
         self.scan_thread: QThread | None = None
         self.scan_worker: BlfScanWorker | None = None
@@ -478,6 +480,13 @@ class MainWindow(QMainWindow):
         channel_title = QLabel("Channel  ⟷  DBC")
         channel_title.setObjectName("panelTitle")
         channel_header.addWidget(channel_title)
+        self.device_combo = CompactCombo()
+        self.device_combo.setObjectName("compactCombo")
+        self.device_combo.setFixedWidth(78)
+        for name in project_loader.DEVICE_PROFILES:
+            self.device_combo.addItem(name)
+        self.device_combo.setCurrentText(project_loader.DEFAULT_DEVICE_PROFILE)
+        channel_header.addWidget(self.device_combo)
         channel_header.addStretch(1)
         self.channel_count_label = QLabel("0 路")
         self.channel_count_label.setObjectName("channelCount")
