@@ -58,18 +58,20 @@ PRECHECK_CANCEL = "取消"
 
 
 def _droppable_paths(event) -> list[str]:
-    """拖拽事件里的可导入条目：本地文件夹或 .blf 文件（其余忽略）。
+    """拖拽事件里的可导入条目：本地文件夹、.blf 或 zip（其余忽略）。
 
-    扩展名大小写不敏感（Windows 资源管理器拖出的扩展名可能为大写 .BLF）；
-    文件夹只是「可能含 .blf」——里面到底有没有，展开（来源解析）后才知道。
+    扩展名大小写不敏感（Windows 资源管理器拖出的扩展名可能为大写 .BLF/.ZIP）；
+    文件夹/压缩包只是「可能含 .blf」——里面到底有没有，展开（来源解析）后才知道。
     """
     paths = []
     for url in event.mimeData().urls():
         if not url.isLocalFile():
             continue
         local = url.toLocalFile()
-        # 先看扩展名（拖入多个 .blf 时零 stat），非 .blf 条目再问文件系统
-        if local.lower().endswith(source_resolver.BLF_SUFFIX) \
+        # 先看扩展名（拖入多个文件时零 stat），其余条目再问文件系统
+        lower = local.lower()
+        if lower.endswith(source_resolver.BLF_SUFFIX) \
+                or lower.endswith(source_resolver.ZIP_SUFFIX) \
                 or Path(local).is_dir():
             paths.append(local)
     return paths
@@ -183,9 +185,10 @@ class ResolveWorker(QObject):
 
     目录树遍历可能很慢（大目录、网络盘），放后台线程避免主界面冻结；
     cancel_event 置位后解析在两个检查点内抛 ConversionCancelled。
-    progress(已发现候选数)：遍历前不知总数，刻度是计数而非百分比（见
-    core/source_resolver.resolve）——界面把它当状态文案，不当进度条刻度。
+    extracting(压缩包名)：解压段文案；progress(已发现候选数)：枚举段计数
+    （见 core/source_resolver.resolve）——界面把它当状态文案，不当进度条刻度。
     """
+    extracting = Signal(str)
     progress = Signal(int)
     done = Signal(object)
     cancelled = Signal()
@@ -202,7 +205,8 @@ class ResolveWorker(QObject):
         try:
             candidates = source_resolver.resolve(
                 self.paths, progress_cb=self.progress.emit,
-                cancel_cb=self.cancel_event.is_set)
+                cancel_cb=self.cancel_event.is_set,
+                extracting_cb=self.extracting.emit)
             self.done.emit(candidates)
         except ConversionCancelled:
             self.cancelled.emit()
@@ -603,11 +607,12 @@ class MainWindow(QMainWindow):
 
     # ---- 文件选择 ----
     def eventFilter(self, obj, event):
-        """BLF 文件行的拖拽导入：文件夹或多条目拖入标签/路径框 → 解析 → 勾选 → 扫描。
+        """BLF 文件行的拖拽导入：文件夹/zip/多条目拖入标签/路径框 → 解析 → 勾选 → 扫描。
 
-        「浏览…」手动选择功能不变；结构性不可导入的拖入（非 .blf 且非文件夹）
-        整行拒绝，且事件被消费、不落到 QLineEdit 默认的文本拖放。解析/扫描/
-        转换进行中拒绝拖入（与浏览按钮禁用一致，避免「接受却无动作」的困惑）。
+        「浏览…」手动选择功能不变；结构性不可导入的拖入（非 .blf、非 zip、
+        非文件夹）整行拒绝，且事件被消费、不落到 QLineEdit 默认的文本拖放。
+        解析/扫描/转换进行中拒绝拖入（与浏览按钮禁用一致，避免「接受却无动作」
+        的困惑）。
         """
         if obj in (self.blf_label, self.blf_edit) and event.type() in (
                 QEvent.Type.DragEnter, QEvent.Type.DragMove,
@@ -640,10 +645,16 @@ class MainWindow(QMainWindow):
 
     def _start_import(self, paths: list[str]):
         """一次拖入的统一入口：单个散 .blf 走今天的单文件路径（逐字不变），
-        文件夹/多条目先解析出候选，再按候选数决定是否弹勾选列表。"""
-        if len(paths) == 1 and Path(paths[0]).is_file():
-            self._load_blf(paths[0])
-            return
+        文件夹/zip/多条目先解析出候选，再按候选数决定是否弹勾选列表。
+
+        判定必须是「一个条目且是 .blf」，不能是「一个条目且是任意文件」——
+        否则单个 zip 会被误送进单文件加载。
+        """
+        if len(paths) == 1:
+            only = Path(paths[0])
+            if only.is_file() and only.suffix.lower() == source_resolver.BLF_SUFFIX:
+                self._load_blf(paths[0])
+                return
         self._start_resolve(paths)
 
     def _load_blf(self, path: str):
@@ -676,6 +687,7 @@ class MainWindow(QMainWindow):
         self.resolve_worker = ResolveWorker(paths, self.scan_cancel)
         self.resolve_worker.moveToThread(self.resolve_thread)
         self.resolve_thread.started.connect(self.resolve_worker.run)
+        self.resolve_worker.extracting.connect(self._on_resolve_extracting)
         self.resolve_worker.progress.connect(self._on_resolve_progress)
         self.resolve_worker.done.connect(self._on_resolve_done)
         self.resolve_worker.cancelled.connect(self._on_resolve_cancelled)
@@ -748,9 +760,14 @@ class MainWindow(QMainWindow):
     def _on_scan_progress(self, percent: float):
         self.load_progress.setValue(int(percent))
 
+    @Slot(str)
+    def _on_resolve_extracting(self, name: str):
+        """解压段状态文案：尚无候选计数，进度条保持不确定态。"""
+        self.stage_label.setText(f"正在解压 {name}…")
+
     @Slot(int)
     def _on_resolve_progress(self, count: int):
-        """解析期的状态文案：遍历前不知总数，故报「已发现 N 个」（不是百分比）。
+        """枚举段状态文案：遍历前不知总数，故报「已发现 N 个」（不是百分比）。
 
         进度条此时是不确定态（setRange(0, 0)）——两种刻度各归各位，界面
         不假装知道分母。

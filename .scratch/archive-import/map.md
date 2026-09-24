@@ -25,7 +25,7 @@ Status: ready-for-agent
 
 ## Decisions so far
 
-<!-- 每张票解决后在此追加一行：gist + 链接 -->
+- [01](issues/01-zip-drop-to-batch.md)：zip 拖入经 `source_resolver` 用系统 tar 强制解压到同级 `<主名>/` 再按文件夹进批次；GUI 认 `.zip` 且单包走解析不走单文件加载。
 
 ## Not yet specified
 

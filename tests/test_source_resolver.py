@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,34 @@ def _touch(path: Path, data: bytes = b"x") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
+
+
+def _make_zip(zip_path: Path, members: dict[str, bytes]) -> Path:
+    """合成 zip（标准库），成员名用包内相对路径。"""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    return zip_path
+
+
+def test_zip_source_extracts_beside_archive_and_mirrors_output(tmp_path):
+    """zip → 同级解压根 `<主名>/`，候选输出在同级 `<主名>_t/` 镜像树。"""
+    archive = _make_zip(tmp_path / "A02.zip", {
+        "20260917/run001.blf": b"abc",
+        "run000.blf": b"xy",
+        "notes.txt": b"skip",
+    })
+    result = source_resolver.resolve([archive])
+    extract_root = tmp_path / "A02"
+    assert extract_root.is_dir()
+    assert (extract_root / "20260917" / "run001.blf").is_file()
+    assert [(c.display, c.output, c.size) for c in result] == [
+        (r"20260917\run001.blf",
+         tmp_path / "A02_t" / "20260917" / "run001_t.mdf", 3),
+        ("run000.blf", tmp_path / "A02_t" / "run000_t.mdf", 2),
+    ]
+    assert archive.is_file()  # 压缩包本身保留
 
 
 def test_loose_blf_outputs_beside_itself(tmp_path):
@@ -207,3 +236,87 @@ def test_symlink_alias_produces_one_candidate(tmp_path):
     assert source_resolver.resolve([real, alias]) \
         == source_resolver.resolve([alias, real])
     assert len(source_resolver.resolve([real, alias])) == 1
+
+
+def test_zip_reextract_replaces_root_but_keeps_archive_and_output_tree(tmp_path):
+    """解压根已存在则整目录重建；压缩包与已有 `<主名>_t/` 保留。"""
+    archive = _make_zip(tmp_path / "A02.zip", {"keep.blf": b"new"})
+    extract_root = tmp_path / "A02"
+    stale = _touch(extract_root / "stale.blf", b"old")
+    output_tree = tmp_path / "A02_t"
+    prior = _touch(output_tree / "prior_t.mdf", b"keep-me")
+
+    result = source_resolver.resolve([archive])
+
+    assert not stale.exists()
+    assert (extract_root / "keep.blf").read_bytes() == b"new"
+    assert prior.read_bytes() == b"keep-me"
+    assert archive.is_file()
+    assert [c.display for c in result] == ["keep.blf"]
+
+
+def test_zip_and_its_extract_root_in_same_drop_uses_only_zip(tmp_path):
+    """同一次拖入同时有 zip 与其解压目录时，只按 zip 处理。"""
+    extract_root = tmp_path / "A02"
+    _touch(extract_root / "old.blf", b"from-folder")
+    archive = _make_zip(tmp_path / "A02.zip", {"from_zip.blf": b"from-zip"})
+
+    result = source_resolver.resolve([extract_root, archive])
+
+    assert [c.display for c in result] == ["from_zip.blf"]
+    assert all(c.blf.is_relative_to(extract_root) for c in result)
+    assert (extract_root / "from_zip.blf").is_file()
+    assert not (extract_root / "old.blf").exists()
+
+
+def test_mixed_zip_folder_and_loose_each_follow_own_rule(tmp_path):
+    """混合 zip、文件夹、散 .blf：三种来源各按各的规则落位。"""
+    folder = tmp_path / "AHT"
+    in_folder = _touch(folder / "sub" / "in_folder.blf", b"f")
+    loose = _touch(tmp_path / "loose.blf", b"l")
+    archive = _make_zip(tmp_path / "pack.zip", {"nested/in_zip.blf": b"z"})
+
+    result = source_resolver.resolve([folder, loose, archive])
+    by_blf = {c.blf: c.output for c in result}
+
+    assert by_blf[in_folder] == tmp_path / "AHT_t" / "sub" / "in_folder_t.mdf"
+    assert by_blf[loose] == tmp_path / "loose_t.mdf"
+    assert by_blf[tmp_path / "pack" / "nested" / "in_zip.blf"] == (
+        tmp_path / "pack_t" / "nested" / "in_zip_t.mdf")
+
+
+def test_zip_without_blf_yields_empty_list(tmp_path):
+    archive = _make_zip(tmp_path / "empty.zip", {"notes.txt": b"x"})
+    assert source_resolver.resolve([archive]) == []
+    assert (tmp_path / "empty").is_dir()
+
+
+def test_zip_extension_and_inner_blf_are_case_insensitive(tmp_path):
+    archive = _make_zip(tmp_path / "Data.ZIP", {
+        "UPPER.BLF": b"a",
+        "Mixed.Blf": b"bb",
+    })
+    result = source_resolver.resolve([archive])
+    assert sorted(c.blf.name for c in result) == ["Mixed.Blf", "UPPER.BLF"]
+    assert sorted(c.output.name for c in result) == ["Mixed_t.mdf", "UPPER_t.mdf"]
+    assert (tmp_path / "Data").is_dir()  # 主名只去掉最后一个扩展名
+
+
+def test_zip_stem_keeps_dots_before_final_extension(tmp_path):
+    archive = _make_zip(tmp_path / "run.2026.zip", {"a.blf": b"x"})
+    [candidate] = source_resolver.resolve([archive])
+    assert (tmp_path / "run.2026" / "a.blf").is_file()
+    assert candidate.output == tmp_path / "run.2026_t" / "a_t.mdf"
+
+
+def test_zip_extracting_cb_reports_archive_name_before_candidates(tmp_path):
+    archive = _make_zip(tmp_path / "A02.zip", {"a.blf": b"x", "b.blf": b"y"})
+    extracting = []
+    counts = []
+    source_resolver.resolve(
+        [archive],
+        progress_cb=counts.append,
+        extracting_cb=extracting.append,
+    )
+    assert extracting == ["A02.zip"]
+    assert counts == [1, 2]

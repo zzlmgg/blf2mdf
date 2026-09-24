@@ -1,26 +1,31 @@
 """来源解析：拖入的路径集合 → 候选清单（BLF 路径 / 输出路径 / 相对显示名 + 大小）。
 
-一次拖入可以是散 .blf、文件夹（下一阶段扩展压缩包）的任意混合。每个候选的三项
-信息在解析期一次算定，下游（界面层、批量编排）不再重算：
+一次拖入可以是散 .blf、文件夹、zip 压缩包的任意混合。每个候选的三项信息在
+解析期一次算定，下游（界面层、批量编排）不再重算：
 
 - **散 .blf**：输出就在该文件旁边（`<主名>_t.mdf`），相对显示名 = 文件名；
 - **文件夹**：输出落在与源**同级**的镜像树 `<源名>_t/` 里（见 CONTEXT.md
-  「镜像输出树」），相对显示名 = 该文件在源内的相对路径。
+  「镜像输出树」），相对显示名 = 该文件在源内的相对路径；
+- **zip**：先强制解压到同级 `<压缩包主名>/`，再按文件夹来源处理（产物在
+  `<主名>_t/`）。同一次拖入里若另有该解压根或其内部路径，跳过那些条目。
 
 本模块只认路径与文件系统，不感知平台/项目/DBC，也不感知转换；无 Qt 依赖。
 """
 import logging
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from core.blf_reader import check_cancel
 
 LOGGER = logging.getLogger(__name__)
 
-# 可导入的扩展名（大小写不敏感：资源管理器拖出的可能是 .BLF/.Blf）
+# 可导入的扩展名（大小写不敏感：资源管理器拖出的可能是 .BLF/.Blf / .ZIP）
 BLF_SUFFIX = ".blf"
+ZIP_SUFFIX = ".zip"
 
 
 @dataclass(frozen=True)
@@ -32,21 +37,29 @@ class Candidate:
     size: int
 
 
-def resolve(paths, *, progress_cb=None, cancel_cb=None) -> list[Candidate]:
+def resolve(paths, *, progress_cb=None, cancel_cb=None,
+            extracting_cb=None) -> list[Candidate]:
     """路径集合 → 候选清单（按相对显示名排序；无 .blf 时为空清单）。
 
     结果只取决于路径集合本身，与拖入顺序无关（条目先排序再解析）。
     同一文件被两条规则命中（拖入文件夹、又单独拖入其内的某个 .blf）时**文件夹规则赢**：
     更外层的来源是其中文件的路径前缀，排序天然在前；改排序键会静默改变赢家。
+    同一次拖入里 zip 与其解压根并存时只按 zip 处理（解压根条目被跳过）。
     progress_cb(已发现候选数: int)：每发现一个候选上报一次（单调不减）——
     遍历前不知总数，本模块的进度刻度是计数而非百分比；
+    extracting_cb(压缩包文件名: str)：开始解压某个 zip 时上报一次（解压段文案）；
     cancel_cb() 置位 → raise ConversionCancelled（沿用「取消信号」契约）。
     """
+    ordered = sorted((Path(raw) for raw in paths), key=_source_key)
+    extract_roots = [_zip_extract_root(path) for path in ordered if _is_zip(path)]
     candidates: list[Candidate] = []
     seen: set[str] = set()
-    for path in sorted((Path(raw) for raw in paths), key=_source_key):
+    for path in ordered:
         check_cancel(cancel_cb)
-        for candidate in _entry_candidates(path, cancel_cb):
+        if extract_roots and _covered_by_extract_root(path, extract_roots):
+            continue
+        for candidate in _entry_candidates(
+                path, cancel_cb, extracting_cb=extracting_cb):
             mark = _identity(candidate.blf)
             if mark in seen:          # 重复拖入 / 软链接别名 → 只留先到的那个
                 continue
@@ -73,9 +86,35 @@ def blf_candidate(path: Path) -> Candidate:
                      display=path.name, size=size)
 
 
+def is_zip_path(path: Path | str) -> bool:
+    """拖入条目是否按 zip 识别（扩展名大小写不敏感；不 stat）。"""
+    return Path(path).suffix.lower() == ZIP_SUFFIX
+
+
 def _is_blf(path: Path) -> bool:
     """可导入条目：扩展名大小写不敏感（资源管理器拖出的可能是 .BLF/.Blf）。"""
     return path.suffix.lower() == BLF_SUFFIX
+
+
+def _is_zip(path: Path) -> bool:
+    """zip 文件条目：扩展名大小写不敏感且确实是文件。"""
+    return is_zip_path(path) and path.is_file()
+
+
+def _zip_extract_root(archive: Path) -> Path:
+    """解压根 = 压缩包同级 / `<主名>`（只去掉最后一个扩展名）。"""
+    return archive.parent / archive.stem
+
+
+def _covered_by_extract_root(path: Path, roots: list[Path]) -> bool:
+    """路径是否就是某解压根、或位于其内部（同一次拖入应跳过，只按 zip 处理）。"""
+    for root in roots:
+        try:
+            Path(_identity(path)).relative_to(Path(_identity(root)))
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _identity(path: Path) -> str:
@@ -88,20 +127,54 @@ def _source_key(path: Path) -> tuple[str, str]:
     return (_identity(path), os.path.normcase(str(path)))
 
 
-def _entry_candidates(path: Path, cancel_cb) -> Iterator[Candidate]:
+def _entry_candidates(path: Path, cancel_cb,
+                      extracting_cb=None) -> Iterator[Candidate]:
     """一个拖入条目 → 它的候选（0..N 个）：条目类型在这里识别。
 
-    文件夹递归进镜像树；散 .blf 就地落位（输出就在它自己旁边，相对显示名 =
-    文件名）；非 .blf 的条目与不存在的路径不是候选（是筛选，不是异常）；
-    读不到的条目跳过并告警——与目录跳过一个政策，都不中断整次解析。
+    zip 先强制解压到同级解压根，再按文件夹来源产出候选；文件夹递归进镜像树；
+    散 .blf 就地落位（输出就在它自己旁边，相对显示名 = 文件名）；非上述类型
+    与不存在的路径不是候选（是筛选，不是异常）；读不到的条目跳过并告警——
+    与目录跳过一个政策，都不中断整次解析。
     """
     try:
-        if path.is_dir():
+        if _is_zip(path):
+            yield from _zip_candidates(path, cancel_cb, extracting_cb)
+        elif path.is_dir():
             yield from _folder_candidates(path, cancel_cb)
         elif path.is_file() and _is_blf(path):
             yield blf_candidate(path)
     except OSError as exc:
         LOGGER.warning("条目跳过（不可读）: %s（%s）", path, exc)
+
+
+def _zip_candidates(archive: Path, cancel_cb,
+                    extracting_cb: Callable[[str], None] | None,
+                    ) -> Iterator[Candidate]:
+    """zip 来源：强制解压到同级 `<主名>/`，再交给文件夹候选逻辑。"""
+    extract_root = _zip_extract_root(archive)
+    if extracting_cb is not None:
+        extracting_cb(archive.name)
+    _extract_zip(archive, extract_root, cancel_cb)
+    yield from _folder_candidates(extract_root, cancel_cb)
+
+
+def _extract_zip(archive: Path, extract_root: Path, cancel_cb) -> None:
+    """强制重新解压：解压根已存在则整目录删除后再解；压缩包与 `<主名>_t/` 不碰。"""
+    check_cancel(cancel_cb)
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+        LOGGER.info("已重新解压: %s → %s", archive.name, extract_root)
+    extract_root.mkdir(parents=True, exist_ok=True)
+    check_cancel(cancel_cb)
+    tar = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "tar.exe"
+    if not tar.is_file():
+        raise RuntimeError("缺少系统解压组件（System32\\tar.exe）")
+    completed = subprocess.run(
+        [str(tar), "-xf", str(archive), "-C", str(extract_root)],
+        capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip() or "未知错误"
+        raise RuntimeError(f"解压失败（{archive.name}）: {detail}")
 
 
 def _folder_candidates(root: Path, cancel_cb) -> Iterator[Candidate]:

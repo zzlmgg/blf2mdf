@@ -8,6 +8,7 @@
 """
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -382,11 +383,85 @@ def test_drop_without_importable_items_warns_and_keeps_state(
 
 
 def test_non_importable_drop_is_rejected_on_the_row(window, qapp, tmp_path):
-    """整行拒绝（沿用今天的拒绝语义）：非 .blf 且非文件夹的拖入不被接受。"""
+    """整行拒绝（沿用今天的拒绝语义）：非 .blf、非 zip、非文件夹的拖入不被接受。"""
     note = tmp_path / "note.txt"
     note.write_text("x", encoding="utf-8")
     event = _drop(window, note, cls=QDragEnterEvent)
     assert not event.isAccepted()
+
+
+def test_zip_drop_enters_resolve_not_single_file_load(window, qapp, tmp_path,
+                                                      monkeypatch):
+    """单个 zip 拖入走解析，不走单个 .blf 的加载。"""
+    archive = tmp_path / "A02.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("run001.blf", b"x")
+    loaded = []
+    resolved = []
+    monkeypatch.setattr(window, "_load_blf", lambda path: loaded.append(path))
+    monkeypatch.setattr(window, "_start_resolve",
+                        lambda paths: resolved.append(list(paths)))
+
+    event = _drop(window, archive)
+    assert event.isAccepted()
+    assert loaded == []
+    assert len(resolved) == 1 and Path(resolved[0][0]) == archive
+
+
+def test_zip_drop_one_candidate_skips_checklist(window, qapp, tmp_path,
+                                                monkeypatch):
+    """包内只有 1 个 .blf → 不弹勾选列表，直接进入批次。"""
+    source = _write_blf(tmp_path / "_src" / "run001.blf", channels=(1,))
+    archive = tmp_path / "A02.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(source, "run001.blf")
+    called = []
+    monkeypatch.setattr(
+        window, "_choose_candidates",
+        lambda candidates, checked=None: called.append(candidates) or candidates)
+
+    _, settled = _drop_and_settle(qapp, window, archive)
+    assert settled
+    assert called == [], "候选只有 1 个时不应弹列表"
+    assert [c.display for c in window.batch] == ["run001.blf"]
+    assert Path(window.out_edit.text()) == tmp_path / "A02_t" / "run001_t.mdf"
+
+
+def test_zip_drop_multiple_candidates_opens_checklist(window, qapp, tmp_path,
+                                                      monkeypatch):
+    """包内多个 .blf → 弹出勾选列表（接线验证）。"""
+    archive = tmp_path / "A02.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name in ("a.blf", "b.blf"):
+            src = _write_blf(tmp_path / "_src" / name, channels=(1,))
+            zf.write(src, name)
+    offered = []
+    monkeypatch.setattr(
+        window, "_choose_candidates",
+        lambda candidates, checked=None: (
+            offered.append(list(candidates)) or candidates[:1]))
+
+    _, settled = _drop_and_settle(qapp, window, archive)
+    assert settled
+    assert [c.display for c in offered[0]] == ["a.blf", "b.blf"]
+    assert [c.display for c in window.batch] == ["a.blf"]
+
+
+def test_resolve_extracting_status_then_discovered_count(window, qapp, tmp_path,
+                                                         monkeypatch):
+    """解压段显示「正在解压」；枚举段切回已发现候选计数。"""
+    gate = threading.Event()
+    monkeypatch.setattr(
+        mw.source_resolver, "resolve",
+        lambda paths, **kwargs: gate.wait(5.0) or [])
+    window._start_resolve([str(tmp_path / "A02.zip")])
+    assert not window.load_progress.isHidden()
+    window.resolve_worker.extracting.emit("A02.zip")
+    assert window.stage_label.text() == "正在解压 A02.zip…"
+    window.resolve_worker.progress.emit(2)
+    assert window.stage_label.text() == "正在解析来源…已发现 2 个 .blf"
+    gate.set()
+    assert _wait_until(qapp, lambda: not window._input_busy())
 
 
 def test_drop_rejected_while_resolving_or_converting(window, qapp, tmp_path,
@@ -882,7 +957,7 @@ def _looping_resolve_until_cancel(count: int, calls: list):
     """
     from core.blf_reader import ConversionCancelled
 
-    def fake(paths, *, progress_cb=None, cancel_cb=None):
+    def fake(paths, *, progress_cb=None, cancel_cb=None, extracting_cb=None):
         calls.append(list(paths))
         if progress_cb is not None:
             progress_cb(count)
