@@ -16,11 +16,13 @@ import logging
 import os
 import shutil
 import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
 import py7zr
+from py7zr.exceptions import PasswordRequired
 
 from core.blf_reader import check_cancel
 
@@ -34,6 +36,7 @@ SEVEN_Z_SUFFIX = ".7z"
 ARCHIVE_SUFFIXES = frozenset({ZIP_SUFFIX, RAR_SUFFIX, SEVEN_Z_SUFFIX})
 # zip/rar 共用系统 tar；7z 不能走 tar（libarchive 未编 LZMA）
 TAR_ARCHIVE_SUFFIXES = frozenset({ZIP_SUFFIX, RAR_SUFFIX})
+ENCRYPTED_ARCHIVE_MSG = "当前版本不支持加密压缩包"
 
 
 @dataclass(frozen=True)
@@ -159,29 +162,61 @@ def _entry_candidates(path: Path, cancel_cb,
 def _archive_candidates(archive: Path, cancel_cb,
                         extracting_cb: Callable[[str], None] | None,
                         ) -> Iterator[Candidate]:
-    """压缩包来源：强制解压到同级 `<主名>/`，再交给文件夹候选逻辑。"""
+    """压缩包来源：强制解压到同级 `<主名>/`，再交给文件夹候选逻辑。
+
+    解压失败或解压/遍历途中取消：清掉本次未完成的解压根；镜像输出树不动。
+    """
     extract_root = _archive_extract_root(archive)
     if extracting_cb is not None:
         extracting_cb(archive.name)
-    _extract_archive(archive, extract_root, cancel_cb)
-    yield from _folder_candidates(extract_root, cancel_cb)
+    touched = [False]  # 单元素：已删过或建过解压根（异常路径也能读到）
+    try:
+        _extract_archive(archive, extract_root, cancel_cb, touched)
+        yield from _folder_candidates(extract_root, cancel_cb)
+    except Exception:
+        if touched[0]:
+            _remove_extract_root(extract_root)
+        raise
 
 
-def _extract_archive(archive: Path, extract_root: Path, cancel_cb) -> None:
-    """强制重新解压：解压根已存在则整目录删除后再解；压缩包与 `<主名>_t/` 不碰。"""
+def _remove_extract_root(extract_root: Path) -> None:
+    """删掉未完成的解压根（取消 / 解压失败收口）；不存在则忽略。"""
+    if extract_root.exists():
+        shutil.rmtree(extract_root, ignore_errors=True)
+
+
+def _extract_archive(archive: Path, extract_root: Path, cancel_cb,
+                     touched: list[bool]) -> None:
+    """强制重新解压：解压根已存在则整目录删除后再解；压缩包与 `<主名>_t/` 不碰。
+
+    touched[0]：已删过或建过解压根时置位，供失败/取消时决定是否清理。
+    """
     check_cancel(cancel_cb)
     if extract_root.exists():
-        shutil.rmtree(extract_root)
+        try:
+            shutil.rmtree(extract_root)
+        except OSError as exc:
+            raise RuntimeError(
+                f"解压目录不可写（{extract_root.parent}）: {exc}") from exc
+        touched[0] = True
         LOGGER.info("已重新解压: %s → %s", archive.name, extract_root)
-    extract_root.mkdir(parents=True, exist_ok=True)
+    try:
+        extract_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"解压目录不可写（{extract_root.parent}）: {exc}") from exc
+    touched[0] = True
     check_cancel(cancel_cb)
-    suffix = archive.suffix.lower()
-    if suffix in TAR_ARCHIVE_SUFFIXES:
-        _extract_with_tar(archive, extract_root)
-    elif suffix == SEVEN_Z_SUFFIX:
-        _extract_with_py7zr(archive, extract_root)
-    else:
-        raise RuntimeError(f"不支持的压缩包格式（{archive.name}）")
+    try:
+        suffix = archive.suffix.lower()
+        if suffix in TAR_ARCHIVE_SUFFIXES:
+            _extract_with_tar(archive, extract_root)
+        elif suffix == SEVEN_Z_SUFFIX:
+            _extract_with_py7zr(archive, extract_root)
+        else:
+            raise RuntimeError(f"不支持的压缩包格式（{archive.name}）")
+    except OSError as exc:
+        raise RuntimeError(f"解压失败（{archive.name}）: {exc}") from exc
 
 
 def _system_tar() -> Path:
@@ -191,6 +226,8 @@ def _system_tar() -> Path:
 
 def _extract_with_tar(archive: Path, extract_root: Path) -> None:
     """zip / rar → System32\\tar.exe（bsdtar）；无额外解压二进制。"""
+    if archive.suffix.lower() == ZIP_SUFFIX:
+        _reject_encrypted_zip(archive)
     tar = _system_tar()
     if not tar.is_file():
         raise RuntimeError("缺少系统解压组件（System32\\tar.exe）")
@@ -199,13 +236,81 @@ def _extract_with_tar(archive: Path, extract_root: Path) -> None:
         capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip() or "未知错误"
+        if _looks_like_password_error(detail):
+            raise RuntimeError(ENCRYPTED_ARCHIVE_MSG)
         raise RuntimeError(f"解压失败（{archive.name}）: {detail}")
+
+
+def _reject_encrypted_zip(archive: Path) -> None:
+    """zip 条目带加密标志则直接拒绝（不弹密码、不调 tar 半截写出）。"""
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            if any(info.flag_bits & 0x1 for info in zf.infolist()):
+                raise RuntimeError(ENCRYPTED_ARCHIVE_MSG)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"解压失败（{archive.name}）: 无法识别的 zip") from exc
+
+
+def _looks_like_password_error(detail: str) -> bool:
+    """后端文案是否在要密码（tar / rar 加密包）。"""
+    lower = detail.casefold()
+    return any(token in lower for token in (
+        "passphrase", "password", "encrypted", "密码"))
 
 
 def _extract_with_py7zr(archive: Path, extract_root: Path) -> None:
     """7z → py7zr（系统 tar 的 libarchive 未编 LZMA，不能解 7z）。"""
-    with py7zr.SevenZipFile(archive, mode="r") as sz:
-        sz.extractall(path=extract_root)
+    try:
+        with py7zr.SevenZipFile(archive, mode="r") as sz:
+            if sz.needs_password():
+                raise RuntimeError(ENCRYPTED_ARCHIVE_MSG)
+            _reject_unsafe_7z_members(sz.getnames(), extract_root)
+            sz.extractall(path=extract_root)
+            _assert_extract_stays_inside(extract_root)
+    except RuntimeError:
+        raise
+    except PasswordRequired as exc:
+        raise RuntimeError(ENCRYPTED_ARCHIVE_MSG) from exc
+    except Exception as exc:
+        # 损坏、越界条目名等：映射成用户可读的一句
+        raise RuntimeError(f"解压失败（{archive.name}）: {exc}") from exc
+
+
+def _reject_unsafe_7z_members(names: list[str], extract_root: Path) -> None:
+    """7z 解压前拒绝 ..、盘符、绝对路径，并确认解析后仍落在解压根内。"""
+    root = extract_root.resolve()
+    for name in names:
+        if _is_unsafe_archive_member(name):
+            raise RuntimeError(
+                f"解压失败：压缩包含越界路径（{name}）")
+        target = (extract_root / name).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"解压失败：压缩包含越界路径（{name}）") from exc
+
+
+def _assert_extract_stays_inside(extract_root: Path) -> None:
+    """解压后抽查：解压根内每条路径 resolve 后仍在根下（防写出后逃逸）。"""
+    root = extract_root.resolve()
+    for path in extract_root.rglob("*"):
+        try:
+            path.resolve().relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"解压失败：写出路径跳出解压根（{path}）") from exc
+
+
+def _is_unsafe_archive_member(name: str) -> bool:
+    """条目名是否含路径穿越或绝对路径（盘符 / 根开头）。"""
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("\\"):
+        return True
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return True
+    parts = normalized.split("/")
+    return any(part == ".." for part in parts)
 
 
 def _folder_candidates(root: Path, cancel_cb) -> Iterator[Candidate]:

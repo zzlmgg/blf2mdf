@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import py7zr
 
 from conftest import PROJECT_ROOT
 from core import source_resolver
@@ -324,8 +325,6 @@ def test_zip_extracting_cb_reports_archive_name_before_candidates(tmp_path):
 
 def _make_7z(archive_path: Path, members: dict[str, bytes]) -> Path:
     """合成 7z（py7zr），成员名用包内相对路径。"""
-    import py7zr
-
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     with py7zr.SevenZipFile(archive_path, "w") as archive:
         for name, data in members.items():
@@ -471,3 +470,188 @@ def test_mixed_rar_7z_folder_and_loose_each_follow_own_rule(tmp_path):
         tmp_path / "pack_t" / "nested" / "in_rar_t.mdf")
     assert by_blf[tmp_path / "bag" / "nested" / "in_7z.blf"] == (
         tmp_path / "bag_t" / "nested" / "in_7z_t.mdf")
+
+
+def test_corrupt_zip_fails_with_readable_reason_and_no_half_root(tmp_path):
+    """损坏 zip：失败并带可读原因；不留下半截解压根。"""
+    archive = tmp_path / "bad.zip"
+    archive.write_bytes(b"not-a-zip-at-all")
+    with pytest.raises(RuntimeError, match=r"解压失败|无法|损坏|识别") as excinfo:
+        source_resolver.resolve([archive])
+    assert str(excinfo.value)  # 用户能读的一句
+    assert not (tmp_path / "bad").exists()
+
+
+def test_corrupt_7z_fails_with_readable_reason_and_no_half_root(tmp_path):
+    """损坏 7z：失败并带可读原因；不留下半截解压根。"""
+    archive = tmp_path / "bad.7z"
+    archive.write_bytes(b"not-a-7z-at-all")
+    with pytest.raises(RuntimeError, match=r"解压失败"):
+        source_resolver.resolve([archive])
+    assert not (tmp_path / "bad").exists()
+
+
+def _make_encrypted_zip(zip_path: Path) -> Path:
+    """合成带加密标志的 zip（flag 置位即可被识别；不依赖真实 ZipCrypto）。"""
+    import struct
+
+    buf_path = zip_path.with_suffix(".plain.zip")
+    _make_zip(buf_path, {"a.blf": b"secret-payload"})
+    data = bytearray(buf_path.read_bytes())
+    buf_path.unlink()
+    for sig, flag_at in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = 0
+        while True:
+            i = data.find(sig, i)
+            if i < 0:
+                break
+            flags = struct.unpack_from("<H", data, i + flag_at)[0]
+            struct.pack_into("<H", data, i + flag_at, flags | 0x1)
+            i += 4
+    zip_path.write_bytes(data)
+    return zip_path
+
+
+def test_encrypted_zip_fails_without_half_root(tmp_path):
+    """加密 zip：说明不支持加密；不留下半截解压根。"""
+    archive = _make_encrypted_zip(tmp_path / "enc.zip")
+    with pytest.raises(RuntimeError, match=r"不支持加密压缩包"):
+        source_resolver.resolve([archive])
+    assert not (tmp_path / "enc").exists()
+
+
+def test_encrypted_7z_fails_without_half_root(tmp_path):
+    """加密 7z：说明不支持加密；不留下半截解压根。"""
+    archive = tmp_path / "enc.7z"
+    with py7zr.SevenZipFile(
+            archive, "w", password="secret", header_encryption=True) as sz:
+        sz.writestr(b"payload", "a.blf")
+    with pytest.raises(RuntimeError, match=r"不支持加密压缩包"):
+        source_resolver.resolve([archive])
+    assert not (tmp_path / "enc").exists()
+
+
+def test_zip_path_traversal_fails_and_writes_nothing_outside(tmp_path):
+    """条目名含 ../：包失败；解压根之外不出现被穿越写出的文件。"""
+    archive = _make_zip(tmp_path / "trav.zip", {
+        "../outside.blf": b"evil",
+        "ok.blf": b"good",
+    })
+    outside = tmp_path / "outside.blf"
+    with pytest.raises(RuntimeError):
+        source_resolver.resolve([archive])
+    assert not outside.exists()
+    assert not (tmp_path / "trav").exists()
+
+
+def test_7z_path_traversal_fails_and_writes_nothing_outside(tmp_path, monkeypatch):
+    """7z 条目含 ../：拒绝；解压根之外无文件。
+
+    py7zr 写入侧本身拒写越界名，故用同级合法包 + getnames 注入越界条目，
+    断言解析接缝仍拒绝且不写出解压根之外。
+    """
+    archive = _make_7z(tmp_path / "trav.7z", {"ok.blf": b"good"})
+    real_cls = py7zr.SevenZipFile
+
+    class _NamesInjected(real_cls):
+        def getnames(self):
+            return ["../outside.blf", "ok.blf"]
+
+    monkeypatch.setattr(source_resolver.py7zr, "SevenZipFile", _NamesInjected)
+    with pytest.raises(RuntimeError, match=r"越界|解压失败"):
+        source_resolver.resolve([archive])
+    assert not (tmp_path / "outside.blf").exists()
+    assert not (tmp_path / "trav").exists()
+
+
+def test_nested_archives_are_not_extracted_or_treated_as_blf(tmp_path):
+    """包内嵌套 zip/rar/7z：只解一层；内层包不当成 .blf，也不再解开。"""
+    inner = _make_zip(tmp_path / "_inner.zip", {"hidden.blf": b"nope"})
+    archive = _make_zip(tmp_path / "outer.zip", {
+        "keep.blf": b"yes",
+        "nested.zip": inner.read_bytes(),
+        "nested.7z": b"not-really-7z",
+        "nested.rar": b"not-really-rar",
+    })
+    inner.unlink()
+    result = source_resolver.resolve([archive])
+    extract_root = tmp_path / "outer"
+    assert [c.display for c in result] == ["keep.blf"]
+    assert (extract_root / "nested.zip").is_file()
+    assert (extract_root / "nested.7z").is_file()
+    assert (extract_root / "nested.rar").is_file()
+    assert not (extract_root / "hidden.blf").exists()
+
+
+def test_cancel_during_archive_traversal_cleans_root_keeps_output_tree(tmp_path):
+    """解压后遍历途中取消：抛取消信号；未完成解压根删除；已有 `_t/` 保留。"""
+    archive = _make_zip(tmp_path / "A02.zip", {
+        "a.blf": b"1",
+        "b.blf": b"2",
+        "c.blf": b"3",
+    })
+    prior = _touch(tmp_path / "A02_t" / "prior_t.mdf", b"keep")
+    stop = threading.Event()
+
+    def progress(_count):
+        stop.set()
+
+    with pytest.raises(ConversionCancelled):
+        source_resolver.resolve(
+            [archive], progress_cb=progress, cancel_cb=stop.is_set)
+    assert not (tmp_path / "A02").exists()
+    assert prior.read_bytes() == b"keep"
+
+
+def test_unwritable_parent_fails_without_extract_elsewhere(tmp_path, monkeypatch):
+    """父目录不可写：失败并说明原因；其他位置不出现解压根。"""
+    archive = _make_zip(tmp_path / "A02.zip", {"a.blf": b"x"})
+    real_mkdir = Path.mkdir
+
+    def deny_extract_root(self, *args, **kwargs):
+        if self.name == "A02":
+            raise PermissionError(13, "拒绝访问", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", deny_extract_root)
+    with pytest.raises(RuntimeError, match=r"不可写"):
+        source_resolver.resolve([archive])
+    assert not (tmp_path / "A02").exists()
+    # 不改解到别处：临时目录旁没有冒出同名解压根
+    assert not list(tmp_path.glob("**/A02/a.blf"))
+
+
+@pytest.mark.parametrize("make_archive,name", [
+    (_make_zip, "A02.zip"),
+    (_make_rar, "A02.rar"),
+    (_make_7z, "A02.7z"),
+])
+def test_reextract_logs_reextracted_for_all_formats(
+        tmp_path, make_archive, name, caplog):
+    """强制重解压在日志中留「已重新解压」，三种格式都成立。"""
+    archive = make_archive(tmp_path / name, {"a.blf": b"x"})
+    _touch(tmp_path / "A02" / "stale.blf", b"old")
+    with caplog.at_level(logging.INFO):
+        source_resolver.resolve([archive])
+    assert "已重新解压" in caplog.text
+
+
+def test_archive_unreadable_subdir_skipped_with_log(tmp_path, monkeypatch, caplog):
+    """解开后的目录里无权限子目录：跳过并记日志，不中断其余候选。"""
+    archive = _make_zip(tmp_path / "pack.zip", {
+        "ok.blf": b"1",
+        "locked/hidden.blf": b"2",
+    })
+    locked = tmp_path / "pack" / "locked"
+    real_scandir = os.scandir
+
+    def deny_locked(path, *args, **kwargs):
+        if os.path.normcase(str(path)) == os.path.normcase(str(locked)):
+            raise PermissionError(13, "拒绝访问")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", deny_locked)
+    with caplog.at_level(logging.WARNING):
+        result = source_resolver.resolve([archive])
+    assert [c.display for c in result] == ["ok.blf"]
+    assert str(locked) in caplog.text

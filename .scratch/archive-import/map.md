@@ -27,6 +27,7 @@ Status: ready-for-agent
 
 - [01](issues/01-zip-drop-to-batch.md)：zip 拖入经 `source_resolver` 用系统 tar 强制解压到同级 `<主名>/` 再按文件夹进批次；GUI 认 `.zip` 且单包走解析不走单文件加载。
 - [02](issues/02-rar-and-7z.md)：rar/7z 并入同一压缩包来源（rar→系统 tar，7z→py7zr），GUI 认扩展名且单包走解析。
+- [03](issues/03-extract-failure-and-cancel.md)：解压失败/取消清理未完成解压根，加密与越界拒绝并给出可读原因，嵌套包只解一层。
 
 ## Not yet specified
 
