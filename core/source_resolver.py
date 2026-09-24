@@ -6,9 +6,9 @@
 - **散 .blf**：输出就在该文件旁边（`<主名>_t.mdf`），相对显示名 = 文件名；
 - **文件夹**：输出落在与源**同级**的镜像树 `<源名>_t/` 里（见 CONTEXT.md
   「镜像输出树」），相对显示名 = 该文件在源内的相对路径；
-- **压缩包**：先强制解压到同级 `<压缩包主名>/`，再按文件夹来源处理（产物在
-  `<主名>_t/`）。同一次拖入里若另有该解压根或其内部路径，跳过那些条目。
-  zip/rar 走系统 tar；7z 走 py7zr。
+- **压缩包**：解压到同级 `<压缩包主名>/`。该路径已存在则不删除，改解到
+  `<主名>_<本地时间戳>/`（仍占用则 `_2`、`_3`…），再按文件夹来源处理。
+  产物在实际解压目录同级的 `<解压目录名>_t/`。zip/rar 走系统 tar；7z 走 py7zr。
 
 本模块只认路径与文件系统，不感知平台/项目/DBC，也不感知转换；无 Qt 依赖。
 """
@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -55,23 +56,26 @@ def resolve(paths, *, progress_cb=None, cancel_cb=None,
     结果只取决于路径集合本身，与拖入顺序无关（条目先排序再解析）。
     同一文件被两条规则命中（拖入文件夹、又单独拖入其内的某个 .blf）时**文件夹规则赢**：
     更外层的来源是其中文件的路径前缀，排序天然在前；改排序键会静默改变赢家。
-    同一次拖入里压缩包与其解压根并存时只按压缩包处理（解压根条目被跳过）。
+    同一次拖入里，已存在因而被避让开的同名文件夹仍按文件夹来源处理。
+    本次将创建的解压目录若也在路径集合里，则跳过，避免扫一个尚未写完的目录。
     progress_cb(已发现候选数: int)：每发现一个候选上报一次（单调不减）——
     遍历前不知总数，本模块的进度刻度是计数而非百分比；
     extracting_cb(压缩包文件名: str)：开始解压某个压缩包时上报一次（解压段文案）；
     cancel_cb() 置位 → raise ConversionCancelled（沿用「取消信号」契约）。
     """
     ordered = sorted((Path(raw) for raw in paths), key=_source_key)
-    extract_roots = [
-        _archive_extract_root(path) for path in ordered if _is_archive(path)]
+    plans = _plan_extract_roots(
+        [path for path in ordered if _is_archive(path)])
+    planned_roots = [root for root, _avoided in plans.values()]
     candidates: list[Candidate] = []
     seen: set[str] = set()
     for path in ordered:
         check_cancel(cancel_cb)
-        if extract_roots and _covered_by_extract_root(path, extract_roots):
+        if planned_roots and _covered_by_extract_root(path, planned_roots):
             continue
         for candidate in _entry_candidates(
-                path, cancel_cb, extracting_cb=extracting_cb):
+                path, cancel_cb, extracting_cb=extracting_cb,
+                plan=plans.get(_identity(path))):
             mark = _identity(candidate.blf)
             if mark in seen:          # 重复拖入 / 软链接别名 → 只留先到的那个
                 continue
@@ -113,13 +117,55 @@ def _is_archive(path: Path) -> bool:
     return is_archive_path(path) and path.is_file()
 
 
+def _extract_stamp() -> str:
+    """避让用的本地时间戳：YYYYMMDD_HHMMSS。"""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def _archive_extract_root(archive: Path) -> Path:
-    """解压根 = 压缩包同级 / `<主名>`（只去掉最后一个扩展名）。"""
+    """首选解压根 = 压缩包同级 / `<主名>`（只去掉最后一个扩展名）。"""
     return archive.parent / archive.stem
 
 
+def _path_is_free(path: Path, reserved: set[str]) -> bool:
+    """路径尚未占用：磁盘上不存在，且本次规划还没把它分给别的压缩包。"""
+    return not path.exists() and _identity(path) not in reserved
+
+
+def _allocate_extract_root(archive: Path, reserved: set[str]) -> tuple[Path, bool]:
+    """选定解压根。返回 (目录, 是否因同名占用而避让)。
+
+    首选名空闲则用它。已存在（文件夹或同名文件）则不删，改用
+    `<主名>_<时间戳>`；该名也占用则 `_2`、`_3`…
+    """
+    preferred = _archive_extract_root(archive)
+    if _path_is_free(preferred, reserved):
+        return preferred, False
+    base = f"{archive.stem}_{_extract_stamp()}"
+    candidate = archive.parent / base
+    if _path_is_free(candidate, reserved):
+        return candidate, True
+    number = 2
+    while True:
+        candidate = archive.parent / f"{base}_{number}"
+        if _path_is_free(candidate, reserved):
+            return candidate, True
+        number += 1
+
+
+def _plan_extract_roots(archives: list[Path]) -> dict[str, tuple[Path, bool]]:
+    """一次解析里为每个压缩包预定解压根（同主名的多个包各得一个空闲名）。"""
+    reserved: set[str] = set()
+    plans: dict[str, tuple[Path, bool]] = {}
+    for archive in archives:
+        root, avoided = _allocate_extract_root(archive, reserved)
+        reserved.add(_identity(root))
+        plans[_identity(archive)] = (root, avoided)
+    return plans
+
+
 def _covered_by_extract_root(path: Path, roots: list[Path]) -> bool:
-    """路径是否就是某解压根、或位于其内部（同一次拖入应跳过，只按压缩包处理）。"""
+    """路径是否就是本次将创建的解压根、或位于其内部（跳过，避免扫未写完的目录）。"""
     for root in roots:
         try:
             Path(_identity(path)).relative_to(Path(_identity(root)))
@@ -140,17 +186,23 @@ def _source_key(path: Path) -> tuple[str, str]:
 
 
 def _entry_candidates(path: Path, cancel_cb,
-                      extracting_cb=None) -> Iterator[Candidate]:
+                      extracting_cb=None, plan=None) -> Iterator[Candidate]:
     """一个拖入条目 → 它的候选（0..N 个）：条目类型在这里识别。
 
-    压缩包先强制解压到同级解压根，再按文件夹来源产出候选；文件夹递归进镜像树；
+    压缩包解到预定的同级目录（同名占用则避让到时间戳目录），再按文件夹来源
+    产出候选；文件夹递归进镜像树；
     散 .blf 就地落位（输出就在它自己旁边，相对显示名 = 文件名）；非上述类型
     与不存在的路径不是候选（是筛选，不是异常）；读不到的条目跳过并告警——
     与目录跳过一个政策，都不中断整次解析。
     """
     try:
         if _is_archive(path):
-            yield from _archive_candidates(path, cancel_cb, extracting_cb)
+            if plan is None:
+                root, avoided = _allocate_extract_root(path, set())
+            else:
+                root, avoided = plan
+            yield from _archive_candidates(
+                path, root, avoided, cancel_cb, extracting_cb)
         elif path.is_dir():
             yield from _folder_candidates(path, cancel_cb)
         elif path.is_file() and _is_blf(path):
@@ -159,19 +211,22 @@ def _entry_candidates(path: Path, cancel_cb,
         LOGGER.warning("条目跳过（不可读）: %s（%s）", path, exc)
 
 
-def _archive_candidates(archive: Path, cancel_cb,
+def _archive_candidates(archive: Path, extract_root: Path, avoided: bool,
+                        cancel_cb,
                         extracting_cb: Callable[[str], None] | None,
                         ) -> Iterator[Candidate]:
-    """压缩包来源：强制解压到同级 `<主名>/`，再交给文件夹候选逻辑。
+    """压缩包来源：解压到预定目录，再交给文件夹候选逻辑。
 
-    解压失败或解压/遍历途中取消：清掉本次未完成的解压根；镜像输出树不动。
+    解压失败或解压/遍历途中取消：只清掉这次新建的解压根。避让前已存在的
+    同名路径和镜像输出树都不动。
     """
-    extract_root = _archive_extract_root(archive)
     if extracting_cb is not None:
         extracting_cb(archive.name)
-    touched = [False]  # 单元素：已删过或建过解压根（异常路径也能读到）
+    touched = [False]  # 单元素：本次已创建解压根（异常路径也能读到）
     try:
         _extract_archive(archive, extract_root, cancel_cb, touched)
+        if avoided:
+            LOGGER.info("已解压到 %s", extract_root)
         yield from _folder_candidates(extract_root, cancel_cb)
     except Exception:
         if touched[0]:
@@ -187,21 +242,13 @@ def _remove_extract_root(extract_root: Path) -> None:
 
 def _extract_archive(archive: Path, extract_root: Path, cancel_cb,
                      touched: list[bool]) -> None:
-    """强制重新解压：解压根已存在则整目录删除后再解；压缩包与 `<主名>_t/` 不碰。
+    """解压到已经选定的空闲目录。不删除任何已存在路径。
 
-    touched[0]：已删过或建过解压根时置位，供失败/取消时决定是否清理。
+    touched[0]：本次已创建解压根时置位，供失败/取消时只清理这个新目录。
     """
     check_cancel(cancel_cb)
-    if extract_root.exists():
-        try:
-            shutil.rmtree(extract_root)
-        except OSError as exc:
-            raise RuntimeError(
-                f"解压目录不可写（{extract_root.parent}）: {exc}") from exc
-        touched[0] = True
-        LOGGER.info("已重新解压: %s → %s", archive.name, extract_root)
     try:
-        extract_root.mkdir(parents=True, exist_ok=True)
+        extract_root.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
         raise RuntimeError(
             f"解压目录不可写（{extract_root.parent}）: {exc}") from exc

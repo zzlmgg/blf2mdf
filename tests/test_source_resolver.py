@@ -239,35 +239,101 @@ def test_symlink_alias_produces_one_candidate(tmp_path):
     assert len(source_resolver.resolve([real, alias])) == 1
 
 
-def test_zip_reextract_replaces_root_but_keeps_archive_and_output_tree(tmp_path):
-    """解压根已存在则整目录重建；压缩包与已有 `<主名>_t/` 保留。"""
-    archive = _make_zip(tmp_path / "A02.zip", {"keep.blf": b"new"})
-    extract_root = tmp_path / "A02"
-    stale = _touch(extract_root / "stale.blf", b"old")
-    output_tree = tmp_path / "A02_t"
-    prior = _touch(output_tree / "prior_t.mdf", b"keep-me")
+_STAMP = "20260924_164105"
+
+
+def _freeze_stamp(monkeypatch, stamp=_STAMP):
+    monkeypatch.setattr(source_resolver, "_extract_stamp", lambda: stamp)
+
+
+@pytest.mark.parametrize("make_archive,name", [
+    (_make_zip, "A02.zip"),
+])
+def test_existing_same_name_folder_is_kept_and_extract_uses_timestamp(
+        tmp_path, monkeypatch, make_archive, name):
+    """同名文件夹已存在：不删它，解到 `<主名>_<时间戳>/`，产物在对应 `_t` 树。"""
+    _freeze_stamp(monkeypatch)
+    archive = make_archive(tmp_path / name, {"keep.blf": b"new"})
+    kept = _touch(tmp_path / "A02" / "stale.blf", b"old")
+    prior = _touch(tmp_path / "A02_t" / "prior_t.mdf", b"keep-me")
 
     result = source_resolver.resolve([archive])
 
-    assert not stale.exists()
-    assert (extract_root / "keep.blf").read_bytes() == b"new"
+    landed = tmp_path / f"A02_{_STAMP}"
+    assert kept.read_bytes() == b"old"
+    assert (landed / "keep.blf").read_bytes() == b"new"
     assert prior.read_bytes() == b"keep-me"
     assert archive.is_file()
-    assert [c.display for c in result] == ["keep.blf"]
+    assert [(c.display, c.blf, c.output) for c in result] == [(
+        "keep.blf", landed / "keep.blf",
+        tmp_path / f"A02_{_STAMP}_t" / "keep_t.mdf",
+    )]
 
 
-def test_zip_and_its_extract_root_in_same_drop_uses_only_zip(tmp_path):
-    """同一次拖入同时有 zip 与其解压目录时，只按 zip 处理。"""
-    extract_root = tmp_path / "A02"
-    _touch(extract_root / "old.blf", b"from-folder")
+def test_existing_same_name_file_is_kept_and_extract_uses_timestamp(
+        tmp_path, monkeypatch):
+    """同名文件（不是文件夹）已存在：不删该文件，解到时间戳目录。"""
+    _freeze_stamp(monkeypatch)
+    blocker = tmp_path / "A02"
+    blocker.write_bytes(b"not-a-dir")
+    archive = _make_zip(tmp_path / "A02.zip", {"keep.blf": b"new"})
+
+    result = source_resolver.resolve([archive])
+
+    landed = tmp_path / f"A02_{_STAMP}"
+    assert blocker.read_bytes() == b"not-a-dir"
+    assert (landed / "keep.blf").read_bytes() == b"new"
+    assert result[0].output == tmp_path / f"A02_{_STAMP}_t" / "keep_t.mdf"
+
+
+def test_timestamp_name_taken_uses_numeric_suffix(tmp_path, monkeypatch):
+    """时间戳名也被占用时用 `_2`；已存在的两个目录都保持原样。"""
+    _freeze_stamp(monkeypatch)
+    _touch(tmp_path / "A02" / "own.txt", b"own")
+    stayed = _touch(tmp_path / f"A02_{_STAMP}" / "stay.txt", b"stay")
+    archive = _make_zip(tmp_path / "A02.zip", {"keep.blf": b"new"})
+
+    result = source_resolver.resolve([archive])
+
+    landed = tmp_path / f"A02_{_STAMP}_2"
+    assert (tmp_path / "A02" / "own.txt").read_bytes() == b"own"
+    assert stayed.read_bytes() == b"stay"
+    assert (landed / "keep.blf").read_bytes() == b"new"
+    assert result[0].output == tmp_path / f"A02_{_STAMP}_2_t" / "keep_t.mdf"
+
+
+def test_same_drop_reads_existing_folder_and_timestamped_extract(
+        tmp_path, monkeypatch):
+    """同一次拖入压缩包和已存在的同名文件夹：两边都读，文件夹内容不删。"""
+    _freeze_stamp(monkeypatch)
+    old = _touch(tmp_path / "A02" / "old.blf", b"from-folder")
     archive = _make_zip(tmp_path / "A02.zip", {"from_zip.blf": b"from-zip"})
 
-    result = source_resolver.resolve([extract_root, archive])
+    result = source_resolver.resolve([tmp_path / "A02", archive])
 
-    assert [c.display for c in result] == ["from_zip.blf"]
-    assert all(c.blf.is_relative_to(extract_root) for c in result)
-    assert (extract_root / "from_zip.blf").is_file()
-    assert not (extract_root / "old.blf").exists()
+    assert old.read_bytes() == b"from-folder"
+    by_display = {c.display: c for c in result}
+    assert set(by_display) == {"old.blf", "from_zip.blf"}
+    assert by_display["old.blf"].output == tmp_path / "A02_t" / "old_t.mdf"
+    landed = tmp_path / f"A02_{_STAMP}"
+    assert by_display["from_zip.blf"].blf == landed / "from_zip.blf"
+    assert by_display["from_zip.blf"].output == (
+        tmp_path / f"A02_{_STAMP}_t" / "from_zip_t.mdf")
+
+
+def test_failed_extract_beside_existing_folder_keeps_that_folder(
+        tmp_path, monkeypatch):
+    """避让后解压失败：清掉这次新建的目录，避让前的同名目录还在。"""
+    _freeze_stamp(monkeypatch)
+    kept = _touch(tmp_path / "bad" / "important.txt", b"keep")
+    archive = tmp_path / "bad.zip"
+    archive.write_bytes(b"not-a-zip-at-all")
+
+    with pytest.raises(RuntimeError):
+        source_resolver.resolve([archive])
+
+    assert kept.read_bytes() == b"keep"
+    assert not (tmp_path / f"bad_{_STAMP}").exists()
 
 
 def test_mixed_zip_folder_and_loose_each_follow_own_rule(tmp_path):
@@ -412,21 +478,10 @@ def test_rar_source_extracts_beside_archive_and_mirrors_output(tmp_path):
     (_make_rar, "A02.rar"),
     (_make_7z, "A02.7z"),
 ])
-def test_rar_or_7z_reextract_keeps_archive_and_output_tree(
-        tmp_path, make_archive, name):
-    """再次拖入同一 rar/7z：删解压根重建；压缩包与已有 `<主名>_t/` 保留。"""
-    archive = make_archive(tmp_path / name, {"keep.blf": b"new"})
-    extract_root = tmp_path / "A02"
-    stale = _touch(extract_root / "stale.blf", b"old")
-    prior = _touch(tmp_path / "A02_t" / "prior_t.mdf", b"keep-me")
-
-    result = source_resolver.resolve([archive])
-
-    assert not stale.exists()
-    assert (extract_root / "keep.blf").read_bytes() == b"new"
-    assert prior.read_bytes() == b"keep-me"
-    assert archive.is_file()
-    assert [c.display for c in result] == ["keep.blf"]
+def test_existing_same_name_folder_rar_and_7z_kept(
+        tmp_path, monkeypatch, make_archive, name):
+    test_existing_same_name_folder_is_kept_and_extract_uses_timestamp(
+        tmp_path, monkeypatch, make_archive, name)
 
 
 @pytest.mark.parametrize("make_archive,name", [
@@ -626,14 +681,16 @@ def test_unwritable_parent_fails_without_extract_elsewhere(tmp_path, monkeypatch
     (_make_rar, "A02.rar"),
     (_make_7z, "A02.7z"),
 ])
-def test_reextract_logs_reextracted_for_all_formats(
-        tmp_path, make_archive, name, caplog):
-    """强制重解压在日志中留「已重新解压」，三种格式都成立。"""
+def test_collision_logs_actual_extract_dir_not_reextract(
+        tmp_path, make_archive, name, caplog, monkeypatch):
+    """避让时日志记下实际解压目录，不再写「已重新解压」。三种格式都成立。"""
+    _freeze_stamp(monkeypatch)
     archive = make_archive(tmp_path / name, {"a.blf": b"x"})
     _touch(tmp_path / "A02" / "stale.blf", b"old")
     with caplog.at_level(logging.INFO):
         source_resolver.resolve([archive])
-    assert "已重新解压" in caplog.text
+    assert "已重新解压" not in caplog.text
+    assert f"A02_{_STAMP}" in caplog.text
 
 
 def test_archive_unreadable_subdir_skipped_with_log(tmp_path, monkeypatch, caplog):
